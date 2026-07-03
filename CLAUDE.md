@@ -10,18 +10,20 @@ A voxel sandbox engine built in **Godot 4** (GDScript) with GPU-accelerated raym
 
 Open the project in Godot 4 and press F5 (or the Play button) to run `world.tscn` as the main scene. There are no CLI build commands — all development is done through the Godot editor. The `@tool` annotation on several scripts means they also run in the editor (ChunkManager, Chunk, TerrainGetter).
 
-## ARCHITECTURE.md — Keep It Current
+## ARCHITECTURE.md / docs/BUG_LOG.md — Keep It Current
 
-**After every code change, update `ARCHITECTURE.md` to match.** This is mandatory, not optional.
+**After every code change, update `ARCHITECTURE.md` (and `docs/BUG_LOG.md` for bugs) to match.** This is mandatory, not optional.
+
+`docs/BUG_LOG.md` was split out of `ARCHITECTURE.md`'s old Section 4 (2026-07-02) once that file grew too large to comfortably read in one sitting. It is the *only* file that moved — everything else stays in `ARCHITECTURE.md`.
 
 What to update:
-- Mark phases/steps as `✅ COMPLETE` when they are finished
-- Add new bugs to **Section 4 — Bug Log & Lessons Learned** with: symptom, root cause, fix, and any rule to remember
+- Mark phases/steps as `✅ COMPLETE` when they are finished (`ARCHITECTURE.md`)
+- Add new bugs to **`docs/BUG_LOG.md`** with: symptom, root cause, fix, and any rule to remember
 - Log failed approaches in the bug log under the relevant bug (so we don't retry them)
-- Update **Section 5 — Current To-Do**: check off completed items, add newly discovered issues
-- Update phase descriptions to reflect what was actually built vs. what was planned
+- Update **Section 5 — Current To-Do** in `ARCHITECTURE.md`: check off completed items, add newly discovered issues
+- Update phase descriptions in `ARCHITECTURE.md` to reflect what was actually built vs. what was planned
 
-ARCHITECTURE.md is the single source of truth for design decisions, completed work, known bugs, and future plans. Claude reads it at the start of each session to reconstruct context.
+Together, `ARCHITECTURE.md` and `docs/BUG_LOG.md` are the single source of truth for design decisions, completed work, known bugs, and future plans. Claude reads both at the start of each session to reconstruct context.
 
 ## Architecture (Current State)
 
