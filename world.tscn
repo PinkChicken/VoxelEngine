@@ -55,10 +55,11 @@ environment = SubResource("Environment_tlwt5")
 
 [node name="Terrain" type="Node" parent="." unique_id=1858831734]
 script = ExtResource("4_aqk2v")
-base_height = -2.0
+base_height = -5.0
 primary_noise = SubResource("FastNoiseLite_wse8f")
-primary_amplitude = 4.0
+primary_amplitude = 0.0
 detail_noise = SubResource("FastNoiseLite_ic0uy")
+detail_amplitude = 0.0
 
 [node name="ChunkManager" type="Node" parent="." unique_id=1418435786 node_paths=PackedStringArray("terrain")]
 script = ExtResource("5_036b0")
@@ -93,16 +94,18 @@ metadata/_custom_type_script = "uid://b3ee10d6jlmm0"
 
 [node name="FluidSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=603403045]
 script = ExtResource("12_fluid")
-watch_enabled = true
-watch_chunk = Vector3i(0, -3, 0)
-watch_local = Vector3i(12, 30, 13)
+watch_chunk = Vector3i(1, -1, -1)
+watch_local = Vector3i(3, 31, 0)
+damp = 0.85
+g_dt = 0.1
+gravity_bias = 1.6
+settle_threshold = 1
 
 [node name="MaterialDB" type="Node" parent="." unique_id=1815152731]
 script = ExtResource("8_udhof")
 
 [node name="RaymarchRenderer" type="Node" parent="." unique_id=234594842]
 script = ExtResource("6_udhof")
-debug_chunk_borders = true
 
 [node name="HotBar" type="CanvasLayer" parent="." unique_id=1070206372]
 script = ExtResource("9_hotbar")

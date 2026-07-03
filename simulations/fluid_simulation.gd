@@ -19,7 +19,7 @@ class_name FluidSimulation extends VoxelSimulation
 
 var _compute
 var _flux_pipeline: Dictionary = {}   # fluid_flux.comp — Accelerate / Scale / Transport
-var _flux_params_buf: RID             # 52-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, gravity_force)
+var _flux_params_buf: RID             # 56-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, gravity_force, settle_threshold)
 var _flux_chunk_list_buf: RID         # active + 6 face neighbours — flux dispatch range
 var _flux_chunk_list_capacity: int = 0
 var _dirty_chunks_buf: RID
@@ -74,16 +74,27 @@ var _frame: int = 0
 @export var watch_chunk: Vector3i = Vector3i(0, -3, -1)
 @export var watch_local: Vector3i = Vector3i(1, 28, 30)
 
-func _debug_print_watch() -> void:
-	if not watch_enabled:
-		return
-	var chunk_pos: Vector3i = watch_chunk
+# Automatic conservation checker toggle (default false, added 2026-07-03) — gates a
+# GPU readback that forces a sync every sub-step; see the in-step() comment for why this
+# was left on by default during the leak investigation and needs to be off otherwise.
+@export var debug_conservation_check: bool = false
+
+# Full per-voxel diagnostic dump (fill, own 3 owned lanes, 3 incoming neighbour-owned
+# lanes) — factored out (2026-07-03) so both the fixed watch target AND the
+# conservation checker's per-tick "biggest gain" location can share it. Watching a
+# fixed cell only helps if the leak happens to recur there; the gain-tracker's flagged
+# location moves every tick (confirmed 2026-07-03: manually retargeting watch_chunk/
+# watch_local after the fact kept missing the actual leaking cell, since the location
+# reported one tick was rarely still the worst offender when the user could react to
+# it), so _debug_print_conservation() below calls this directly on the CURRENT tick's
+# flagged voxel instead of relying on the user to catch up to a moving target.
+func _debug_dump_voxel(label: String, chunk_pos: Vector3i, local: Vector3i) -> void:
 	var slot: int = _orchestrator._chunk_to_slot.get(chunk_pos, -1)
 	var cs := _chunk_manager.chunk_size
 	var vpc := cs * cs * cs
-	var lx := watch_local.x
-	var ly := watch_local.y
-	var lz := watch_local.z
+	var lx := local.x
+	var ly := local.y
+	var lz := local.z
 	var fill_str := "n/a"
 	var mat_str := "n/a"
 	if slot >= 0:
@@ -98,7 +109,38 @@ func _debug_print_watch() -> void:
 		var lane_base := (page * vpc * 3 + local_idx * 3) * 4
 		var fdata: PackedByteArray = _compute.download_range(_flux_buf, lane_base, 12)
 		flux_str = "(fx=%d, fy=%d, fz=%d)" % [fdata.decode_s32(0), fdata.decode_s32(4), fdata.decode_s32(8)]
-	print("[FluidWatch] chunk %s local (%d,%d,%d): mat=%s fill=%s flux=%s" % [chunk_pos, lx, ly, lz, mat_str, fill_str, flux_str])
+
+	# Incoming neighbour-owned lanes (2026-07-03) — the voxel's OWN 3 owned lanes above
+	# only tell half the story: Transport's delta also reads the -axis neighbour's owned
+	# face pointing INTO this voxel (delta += eff_flux(flux_buf[nlane])). A voxel whose
+	# own 3 lanes read all-zero can still have its fill change every tick if a neighbour's
+	# owned face is nonzero — exactly the pattern that motivated this addition (found
+	# 2026-07-03: a watched voxel's fill oscillated 236<->240 forever while fx/fy/fz all
+	# printed 0, meaning the real driver was invisible until now).
+	var world_pos := chunk_pos * cs + local
+	var axis_dir := [Vector3i(1, 0, 0), Vector3i(0, 1, 0), Vector3i(0, 0, 1)]
+	var axis_name := ["X", "Y", "Z"]
+	var incoming_str := ""
+	for axis in range(3):
+		var nb_world: Vector3i = world_pos - axis_dir[axis]
+		var nb_chunk := _chunk_manager.voxel_to_chunk_position(nb_world)
+		var nb_local := _chunk_manager.global_to_local(nb_world)
+		var nb_page: int = _flux_chunk_table.get(nb_chunk, -1)
+		var val_str := "n/a"
+		if nb_page >= 0:
+			var nb_local_idx := nb_local.z * cs * cs + nb_local.y * cs + nb_local.x
+			var nb_lane_base := (nb_page * vpc * 3 + nb_local_idx * 3 + axis) * 4
+			var ndata: PackedByteArray = _compute.download_range(_flux_buf, nb_lane_base, 4)
+			val_str = str(ndata.decode_s32(0))
+		incoming_str += " in_%s(from %s)=%s" % [axis_name[axis], nb_chunk, val_str]
+
+	print("[%s] chunk %s local (%d,%d,%d): mat=%s fill=%s flux=%s%s" % [label, chunk_pos, lx, ly, lz, mat_str, fill_str, flux_str, incoming_str])
+
+
+func _debug_print_watch() -> void:
+	if not watch_enabled:
+		return
+	_debug_dump_voxel("FluidWatch", watch_chunk, watch_local)
 
 # Sub-steps per simulation tick — higher = faster fluid, more GPU cost.
 # Set to 1 for slow lava-like materials; 2-3 for water.
@@ -150,6 +192,19 @@ func _debug_print_watch() -> void:
 # damp/g_dt were tuned to produce.
 @export_range(0.0, 50.0, 0.5) var gravity_force: float = 10.0
 
+# settle_threshold: minimum |applied fill change| (see fluid_flux.comp Transport) for a
+# voxel's change to count toward keeping its chunk in _active_chunks next tick. Separate
+# from and coarser than MIN_FLOW in the shader (which governs conservation correctness —
+# untouched by this). A large settled body of water can slosh at 1-3 units/tick forever
+# (flux_buf intentionally persists across ticks so waves don't instantly damp), which
+# with the old "any nonzero change keeps the chunk active" rule meant a big lake never
+# fully slept even once visually and physically settled. Raising this lets FluidSimulation
+# treat sub-threshold sloshing as "settled enough to sleep" — after 4 idle ticks under
+# this softer rule the chunk's flux page is freed AND zeroed (see _free_flux_page()), so
+# sleep and clearing residual momentum happen together. 1 = old behavior (any nonzero
+# change keeps the chunk awake indefinitely).
+@export_range(1, 20, 1) var settle_threshold: int = 3
+
 const DIRTY_BUF_BYTES := 64
 
 
@@ -161,7 +216,7 @@ func _ready() -> void:
 		_flux_pipeline = _compute.compile_shader(_load_flux_shader(), 4)
 		if _flux_pipeline.is_empty():
 			push_error("FluidSimulation: fluid_flux.comp compile failed")
-		var fp := PackedByteArray(); fp.resize(52); fp.fill(0)  # damp, g_dt, gravity_bias, gravity_force
+		var fp := PackedByteArray(); fp.resize(56); fp.fill(0)  # damp, g_dt, gravity_bias, gravity_force, settle_threshold
 		_flux_params_buf = _compute.buffer_upload(fp)
 		_flux_chunk_list_capacity = 256
 		var fl := PackedByteArray(); fl.resize(_flux_chunk_list_capacity * 12); fl.fill(0)
@@ -388,27 +443,50 @@ func step() -> void:
 			# lost by one voxel is gained by another). A nonzero total is a direct,
 			# quantified leak/gain measurement — only printed when it actually happens, so
 			# this stays silent during normal correct operation.
-			var cons: PackedByteArray = _compute.download_range(_conservation_buf, 0, 4)
-			var cons_delta := cons.decode_s32(0)
-			if cons_delta != 0:
-				print("[Conservation] fill %s this tick: %d" % ["gained" if cons_delta > 0 else "lost", abs(cons_delta)])
+			#
+			# Gated behind debug_conservation_check (default false, added 2026-07-03) —
+			# the download_range() calls below are a GPU readback that forces a sync every
+			# single sub-step regardless of whether anything gets printed, which measurably
+			# hurt performance once the leak investigation was done and this was left
+			# running unconditionally.
+			#
+			# BUG (found 2026-07-03): the reset below used to live INSIDE this gate too —
+			# Transport's atomicAdd into _conservation_buf runs every tick regardless of
+			# this toggle, so leaving the toggle off let the buffer silently accumulate,
+			# unread and unreset, for however long it stayed off. The instant it was
+			# flipped back on, the first read dumped the ENTIRE accumulated backlog as if
+			# it were a single tick's loss (observed: a reported "45814 lost this tick"
+			# that was actually the sum of many quiet ticks, not one real event). Fix: the
+			# reset must always run every tick, independent of whether we're reading/
+			# printing this tick's value — only the (expensive) read+print is gated.
+			if debug_conservation_check:
+				var cons: PackedByteArray = _compute.download_range(_conservation_buf, 0, 4)
+				var cons_delta := cons.decode_s32(0)
+				if cons_delta != 0:
+					print("[Conservation] fill %s this tick: %d" % ["gained" if cons_delta > 0 else "lost", abs(cons_delta)])
 
-				# Location tracker (2026-07-02) — the stale-page fix didn't resolve the leak,
-				# so pinpoint WHERE the single largest gain happened instead of guessing
-				# further. Decode the flat voxel index back into chunk position + local xyz.
-				var gt: PackedByteArray = _compute.download_range(_gain_tracker_buf, 0, 8)
-				var gain_flat := gt.decode_s32(0)
-				var gain_amount := gt.decode_s32(4)
-				if gain_flat >= 0:
-					var cs := _chunk_manager.chunk_size
-					var vpc := cs * cs * cs
-					var slot := gain_flat / vpc
-					var local := gain_flat % vpc
-					var lz := local / (cs * cs)
-					var ly := (local % (cs * cs)) / cs
-					var lx := local % cs
-					var chunk_pos: Variant = _orchestrator._slot_to_chunk.get(slot, null)
-					print("[Conservation]   biggest single gain: %d at chunk %s local (%d,%d,%d)" % [gain_amount, chunk_pos, lx, ly, lz])
+					# Location tracker (2026-07-02) — the stale-page fix didn't resolve the leak,
+					# so pinpoint WHERE the single largest gain happened instead of guessing
+					# further. Decode the flat voxel index back into chunk position + local xyz.
+					var gt: PackedByteArray = _compute.download_range(_gain_tracker_buf, 0, 8)
+					var gain_flat := gt.decode_s32(0)
+					var gain_amount := gt.decode_s32(4)
+					if gain_flat >= 0:
+						var cs := _chunk_manager.chunk_size
+						var vpc := cs * cs * cs
+						var slot := gain_flat / vpc
+						var local := gain_flat % vpc
+						var lz := local / (cs * cs)
+						var ly := (local % (cs * cs)) / cs
+						var lx := local % cs
+						var chunk_pos: Variant = _orchestrator._slot_to_chunk.get(slot, null)
+						print("[Conservation]   biggest single gain: %d at chunk %s local (%d,%d,%d)" % [gain_amount, chunk_pos, lx, ly, lz])
+						# Auto-dump the flagged voxel itself (2026-07-03) — its location moves
+						# every tick, so retargeting watch_chunk/watch_local by hand after
+						# reading a previous tick's log line always lags a step behind the
+						# actual leaking cell. This grabs it live, same tick it's reported.
+						if chunk_pos != null:
+							_debug_dump_voxel("GainVoxel", chunk_pos, Vector3i(lx, ly, lz))
 			_compute.buffer_update(_conservation_buf, 0, zero4)
 			_compute.buffer_update(_gain_tracker_buf, 0, reset_gain)
 
@@ -602,7 +680,7 @@ func _build_flux_uniforms() -> Array:
 
 func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pass_idx: int) -> void:
 	var cs := _chunk_manager.chunk_size
-	var p := PackedByteArray(); p.resize(52)
+	var p := PackedByteArray(); p.resize(56)
 	p.encode_s32(0,  cs)
 	p.encode_s32(4,  grid_min.x)
 	p.encode_s32(8,  grid_min.y)
@@ -616,6 +694,7 @@ func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pa
 	p.encode_float(40, g_dt)
 	p.encode_float(44, gravity_bias)
 	p.encode_float(48, gravity_force)
+	p.encode_s32(52, settle_threshold)
 	_compute.buffer_update(_flux_params_buf, 0, p)
 
 

@@ -76,6 +76,7 @@ layout(set = 0, binding = 2, std430) readonly buffer SimParams {
     float g_dt;  // acceleration per unit of hydrostatic head — tunable, see FluidSimulation.g_dt
     float gravity_bias;   // Y-axis multiplier on the dh*g_dt term — see FluidSimulation.gravity_bias
     float gravity_force;  // Y-axis constant downward nudge — see FluidSimulation.gravity_force
+    int settle_threshold; // scheduling-only floor for mark_dirty — see FluidSimulation.settle_threshold
 } params;
 layout(set = 0, binding = 3, std430) readonly buffer MaterialSim { uint data[256]; } material_sim;
 layout(set = 0, binding = 4, std430)          buffer Changelog {
@@ -704,6 +705,25 @@ void main() {
             changelog.entries[log_slot * 2u]     = uint(my_flat);
             changelog.entries[log_slot * 2u + 1u] = new_voxel;
         }
-        mark_dirty(my_flat, vpc);
+
+        // Voxel sleeping (2026-07-03) — mark_dirty() feeds the CPU-side idle-guard that
+        // decides whether a chunk stays in _active_chunks for next tick's dispatch. A
+        // large, mostly-settled body of water can have long-lived, slowly-decaying
+        // sloshing (intentional — flux_buf persists across ticks specifically so waves
+        // don't instantly damp) that keeps making tiny (1-3 unit) but genuinely nonzero
+        // transfers forever, so the chunk's dirty bit never goes fully quiet and it never
+        // sleeps, even once visually and physically settled. settle_threshold is a
+        // SEPARATE, coarser floor purely for this scheduling decision — every real
+        // transfer, however small, still gets written to voxels_a above regardless of
+        // this check (no new conservation risk, MIN_FLOW/eff_flux already own
+        // correctness); this only controls whether the CHUNK keeps getting re-dispatched.
+        // Once idle 4 ticks under this softer rule, FluidSimulation._free_flux_page()
+        // evicts AND zeroes the chunk's flux page — sleeping and clearing residual
+        // momentum happen together, so a chunk that wakes later (new water added nearby)
+        // starts from a clean zero instead of replaying stale, possibly many-tick-old
+        // flux values.
+        if (abs(applied) >= params.settle_threshold) {
+            mark_dirty(my_flat, vpc);
+        }
     }
 }

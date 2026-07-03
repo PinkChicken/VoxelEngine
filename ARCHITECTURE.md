@@ -1840,6 +1840,7 @@ Ordered by priority. Update this section as work is completed or new items are d
 
 ### Active / Next Up
 
+- [ ] **TOP PRIORITY — fluid never fully settles: undamped standing oscillation + unexplained large-scale "tearing" loss (2026-07-03)** — See `docs/BUG_LOG.md` "UNRESOLVED (2026-07-03)" entry for full details. Confirmed via `FluidWatch`: a settled-looking voxel's own 3 flux lanes read exactly 0 forever, yet its fill keeps oscillating in a non-damping period-2 pattern driven entirely by one incoming neighbour lane. Ruled out: `settle_threshold` (persists at threshold=1), simple underdamping (lowering damp/gravity_force made it *more* chaotic, not less). Leading unconfirmed suspicion: the Y-axis asymmetric `axis_cap` (scaled by `gravity_bias`) interacting badly with the Scale-Outflow/Scale-Inflow split. Needs a careful code-level investigation, not more empirical tuning — sent to Fable 5 for a deep-dive review at the end of this session.
 - [x] **Phase UX-1 — Sphere edit tool + player scale** ✅ — See Phase UX-1 section.
 - [x] **Collision wireframe debug** ✅ — `collision_debug.gd`, yellow ImmediateMesh boxes, toggled via `RaymarchRenderer.debug_collision_shapes` export. C key binding removed.
 - [x] **Immediate collision removal on erase** ✅ — `CollisionSystem.invalidate_sphere()` called from `world.gd` on every remove_sphere event. Box-sphere overlap test strips stale shapes immediately.

@@ -10,6 +10,11 @@ class_name ChunkManager extends Node
 @export var view_distance: int = 3
 @export var terrain: Node
 @export var voxel_scale: float = 0.5
+## Voxels of WATER stacked directly on top of the terrain surface at generation time, in
+## every column. 0 = disabled (old behavior, no water generated). Useful for settling
+## tests — combine with TerrainGetter.primary_amplitude/detail_amplitude = 0 for a
+## perfectly flat rock surface under a perfectly flat water layer.
+@export var water_depth: int = 5
 
 var chunk_class
 var chunks: Dictionary[Vector3i, Chunk] = {}
@@ -137,6 +142,20 @@ func _generate_column(col_x: int, col_z: int) -> Array:
 					var idx     := (z * cs * cs + local_y * cs + x) * Chunk.VOXEL_STRIDE
 					block_data[idx]     = Chunk.Mat.ROCK
 					block_data[idx + 1] = 255
+
+				# Flat water layer directly on top of the rock surface at this column
+				# (2026-07-03) — starts exactly at `height` (the first air voxel above
+				# rock, since the rock fill above stops at height-1), so there's never
+				# overlap with the rock fill regardless of water_depth.
+				if water_depth > 0:
+					var water_start = max(height, offset_y)
+					var water_end    = min(height + water_depth - 1, chunk_maxY)
+					if water_start <= water_end:
+						for wy in range(water_start, water_end + 1):
+							var local_y := wy - offset_y
+							var idx     := (z * cs * cs + local_y * cs + x) * Chunk.VOXEL_STRIDE
+							block_data[idx]     = Chunk.Mat.WATER
+							block_data[idx + 1] = 255
 
 		results.append([chunk_pos, block_data])
 	return results
