@@ -1,7 +1,8 @@
 class_name FluidSimulation extends VoxelSimulation
 
 # GPU dispatcher for liquid simulation (water, oil) — Phase 7e persistent-flux pipeline.
-# Three passes per sub-step, all in fluid_flux.comp: Accelerate -> Scale -> Transport.
+# Four passes per sub-step, all in fluid_flux.comp: Accelerate -> Scale-Outflow ->
+# Scale-Inflow -> Transport.
 # No CAS, no voxels_b scratch buffer — Transport writes the changelog directly, same
 # single-writer discipline as every other simulation.
 #
@@ -336,13 +337,21 @@ func step() -> void:
 	for _s in range(steps_per_tick):
 		_frame += 1
 
-		# Pass A (accelerate) -> Scale (conservation) -> Transport (writes changelog).
-		# Persistent: flux_buf is never zeroed between ticks (see fluid_flux.comp header).
-		# Each pass reads data another workgroup wrote in the previous pass, so all three
-		# need their own submit+sync — a genuine cross-workgroup dependency, not just tidy
-		# separation. Transport is the only pass that touches the changelog, so it gets its
-		# own reset_changelog()/apply_changelog() pair immediately around its dispatch.
-		# Guard: flux_count can be 0 if all active chunks were unloaded since last step().
+		# Pass A (accelerate) -> Scale-Outflow -> Scale-Inflow -> Transport (writes
+		# changelog). Persistent: flux_buf is never zeroed between ticks (see
+		# fluid_flux.comp header). Each pass reads data another workgroup wrote in the
+		# previous pass, so all four need their own submit+sync — a genuine
+		# cross-workgroup dependency, not just tidy separation. Scale-Inflow (added
+		# 2026-07-02) caps a voxel's total INCOMING flux at its remaining capacity
+		# (255-fill), symmetric to Scale-Outflow's existing cap on total OUTGOING flux at
+		# its own fill — without it, multiple donors could each individually stay within
+		# their own outflow budget while overcommitting a shared receiver, silently
+		# losing the excess to Transport's clamp. Must run as its own dispatch AFTER
+		# Scale-Outflow fully completes, not merged into it — see fluid_flux.comp's Scale-
+		# Inflow comment for why merging them would race. Transport is the only pass that
+		# touches the changelog, so it gets its own reset_changelog()/apply_changelog()
+		# pair immediately around its dispatch. Guard: flux_count can be 0 if all active
+		# chunks were unloaded since last step().
 		var flux_bitmask := zero_dirty  # default: no flux changes this sub-step
 		if flux_count > 0:
 			_upload_flux_params(grid_min, grid_span, _frame, 0)  # Pass A
@@ -350,14 +359,19 @@ func step() -> void:
 			_compute.submit()
 			_compute.sync()
 
-			_upload_flux_params(grid_min, grid_span, _frame, 1)  # Scale
+			_upload_flux_params(grid_min, grid_span, _frame, 1)  # Scale-Outflow
+			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+			_compute.submit()
+			_compute.sync()
+
+			_upload_flux_params(grid_min, grid_span, _frame, 2)  # Scale-Inflow
 			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
 			_compute.submit()
 			_compute.sync()
 
 			_orchestrator.reset_changelog()
 			_compute.buffer_update(_dirty_chunks_buf, 0, zero_dirty)
-			_upload_flux_params(grid_min, grid_span, _frame, 2)  # Transport
+			_upload_flux_params(grid_min, grid_span, _frame, 3)  # Transport
 			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
 			_compute.submit()
 			_compute.sync()

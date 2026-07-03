@@ -95,7 +95,7 @@ metadata/_custom_type_script = "uid://b3ee10d6jlmm0"
 script = ExtResource("12_fluid")
 watch_enabled = true
 watch_chunk = Vector3i(0, -3, 0)
-watch_local = Vector3i(0, 10, 0)
+watch_local = Vector3i(12, 30, 13)
 
 [node name="MaterialDB" type="Node" parent="." unique_id=1815152731]
 script = ExtResource("8_udhof")

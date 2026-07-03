@@ -22,23 +22,35 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 // thread writes only its own 3 owned lanes, never a neighbour's, so there is no race to
 // guard against.
 //
-// Phase 7e Step 5 — Scale (params.pass == 1): conservation guard. Pass A computes each
-// owned face independently, so nothing stops requested outflow from exceeding what a
-// voxel actually holds. Scale caps it: s = min(1, fill(p) / total_outflow(p)), then every
-// face representing outflow from p — including neighbour-owned faces with a negative
-// sign — is multiplied by s. See the in-function comment for the sign-based no-double-
-// scale proof. Three separate dispatches (Accelerate → Scale → Transport) are required,
-// each with its own submit/sync: Scale reads faces Pass A wrote in OTHER workgroups
-// (neighbour-owned faces), a genuine cross-workgroup dependency, not just a style choice.
+// Phase 7e Step 5 — Scale-Outflow (params.pass == 1): conservation guard, donor side.
+// Pass A computes each owned face independently, so nothing stops requested outflow
+// from exceeding what a voxel actually holds. This caps it: s = min(1, fill(p) /
+// total_outflow(p)), then every face representing outflow from p — including
+// neighbour-owned faces with a negative sign — is multiplied by s. See the in-function
+// comment for the sign-based no-double-scale proof.
 //
-// Phase 7e Step 6 — Transport (params.pass == 2): fill'(p) = fill(p) − fx(p) − fy(p) −
+// Phase 7e Step 8 (2026-07-02) — Scale-Inflow (params.pass == 2): conservation guard,
+// RECEIVER side. Scale-Outflow alone only bounds what a voxel can GIVE — nothing
+// bounded what a voxel could RECEIVE, so multiple donors could each individually stay
+// within their own outflow budget while their combined delivery to one shared receiver
+// still exceeded 255, silently losing the excess to Transport's clamp with no debit
+// anywhere. This pass mirrors Scale-Outflow from the other direction: s_in = min(1,
+// (255-fill(p)) / total_inflow(p)). Must run as its OWN dispatch, fully synced after
+// Scale-Outflow, not merged into it — see the large in-function comment for why merging
+// them would race two invocations writing the same lane.
+//
+// Four separate dispatches (Accelerate → Scale-Outflow → Scale-Inflow → Transport) are
+// required, each with its own submit/sync: every pass after Pass A reads faces another
+// workgroup wrote, a genuine cross-workgroup dependency, not just a style choice.
+//
+// Phase 7e Step 6 — Transport (params.pass == 3): fill'(p) = fill(p) − fx(p) − fy(p) −
 // fz(p) + fx(p−X) + fy(p−Y) + fz(p−Z), i.e. subtract everything p's own owned faces
 // represent and add everything the −axis neighbours' owned faces represent (sign handles
 // both outflow/inflow cases uniformly). Writes the standard changelog — this shader still
 // never touches _voxel_buf_a directly, same single-writer discipline as every other sim.
 // Air receiving net-positive inbound flux materializes as liquid (scans neighbours for
-// the donor material). This is the pass that finally moves water — Steps 4/5 only built
-// up to a correct, conservation-safe flux field; this is what reads it.
+// the donor material). This is the pass that finally moves water — Steps 4/5/8 only
+// built up to a correct, conservation-safe flux field; this is what reads it.
 //
 // fluid_sim.comp (legacy vertical CAS) has been deleted (Phase 7e Step 7) — it was
 // silently destroying fill via a destructive try_compress "snap low remainder to zero"
@@ -59,7 +71,7 @@ layout(set = 0, binding = 2, std430) readonly buffer SimParams {
     int grid_min_x; int grid_min_y; int grid_min_z;
     int grid_span_x; int grid_span_y; int grid_span_z;
     int frame;
-    int pass;    // 0 = Pass A (accelerate). 1 = Scale. 2 = Transport (writes changelog).
+    int pass;    // 0 = Pass A (accelerate). 1 = Scale-Outflow. 2 = Scale-Inflow. 3 = Transport (writes changelog).
     float damp;  // velocity retained per tick (0–1) — tunable, see FluidSimulation.damp
     float g_dt;  // acceleration per unit of hydrostatic head — tunable, see FluidSimulation.g_dt
     float gravity_bias;   // Y-axis multiplier on the dh*g_dt term — see FluidSimulation.gravity_bias
@@ -439,7 +451,7 @@ void main() {
         return;
     }
 
-    // === Scale: conservation guard (params.pass == 1) ===
+    // === Scale-Outflow: conservation guard, donor side (params.pass == 1) ===
     // Pass A computes each of a voxel's 3 owned faces independently — nothing stops
     // requested outflow from exceeding what the voxel actually holds. This pass fixes
     // that: s = min(1, fill(p) / total_planned_outflow), then every face representing
@@ -511,14 +523,102 @@ void main() {
         return;
     }
 
-    // === Transport: fill' = fill − owned faces + neighbour-owned faces (params.pass == 2) ===
+    // === Scale-Inflow: conservation guard, receiver side (params.pass == 2) ===
+    //
+    // BUG (found 2026-07-02, continuous-pour testing): Scale-Outflow above only bounds
+    // what EACH voxel can GIVE (total outflow <= fill) — it does nothing to bound what a
+    // voxel can RECEIVE. Multiple donors can each independently stay within their own
+    // Scale-Outflow budget while their COMBINED delivery to one shared receiver still
+    // exceeds the 255 fill cap; Transport's clamp(old_fill+delta, 0, 255) then silently
+    // discards the excess with no debit anywhere to balance it — a real, uncorrected
+    // loss. Symptom matched exactly: large, gravity-independent LOSSES concentrated at
+    // flow-convergence points (many donors funneling into one receiver, e.g. under an
+    // active pour), constantly shifting to whichever cell happens to be the current
+    // convergence point rather than sitting on one fixed voxel — never present on
+    // settled/resting water (no convergence, nothing to overcommit).
+    //
+    // Fix: a second, symmetric cap, from the RECEIVER's side instead of the donor's:
+    // s_in = min(1, (255 - fill(p)) / total_planned_inflow), applied to every face
+    // representing inflow TO p.
+    //
+    // Why this must be a SEPARATE dispatch, not merged into Scale-Outflow above: a
+    // single physical lane can be "outflow" from its owner's perspective (positive) and
+    // simultaneously "inflow" to the +axis neighbour's perspective (same positive
+    // value, read via that neighbour's neighbour-face loop) — both perspectives are
+    // legitimate and BOTH may need to shrink that lane (once for the donor's own
+    // outflow budget, again for the receiver's inflow budget). Two different
+    // invocations (potentially different workgroups) writing the same lane in the same
+    // pass would race, with no guarantee both reductions actually apply. Running this
+    // as its own dispatch, fully synced AFTER Scale-Outflow completes, avoids that:
+    // this pass reads the ALREADY-outflow-scaled values, and shrinking a lane further
+    // here can never re-violate Scale-Outflow's already-satisfied guarantee (shrinking
+    // only ever reduces a donor's total requested outflow, never increases it).
+    //
+    // Within THIS pass, the same sign-based mutual exclusion Scale-Outflow already
+    // relies on still holds, with inflow/outflow roles swapped: a POSITIVE
+    // neighbour-owned face is inflow to THIS voxel (claimed in the neighbour-face loop
+    // below) — Scale-Outflow already claimed that same positive value as outflow from
+    // its owner, in ITS OWN owned-face loop, a completely different pass. A NEGATIVE
+    // owned face is inflow to THIS voxel (claimed in the owned-face loop below) —
+    // Scale-Outflow already claimed that same negative value as outflow from the +axis
+    // neighbour. So within this pass, exactly one of "this voxel" and "its neighbour"
+    // ever writes a given lane, decided purely by sign — no race, same proof as above.
+    if (params.pass == 2) {
+        if (my_page < 0) return;  // no page: nothing here to scale
+
+        int owned_lane[3];
+        int neighbour_lane[3];
+        int total_in = 0;
+
+        for (int axis = 0; axis < 3; axis++) {
+            int lane = my_page * vpc * 3 + my_local * 3 + axis;
+            owned_lane[axis] = lane;
+            int f = eff_flux(flux_buf.data[lane]);
+            if (f < 0) total_in += -f;  // negative owned face = inflow to me
+        }
+        for (int axis = 0; axis < 3; axis++) {
+            ivec3 nb = gpos - AXIS_DIR[axis];
+            int lane = flux_lane(nb, axis);
+            neighbour_lane[axis] = lane;
+            if (lane < 0) continue;
+            int f = eff_flux(flux_buf.data[lane]);
+            if (f > 0) total_in += f;  // positive neighbour-owned face = inflow to me
+        }
+
+        if (total_in == 0) return;  // nothing flowing into p — nothing to scale
+
+        int capacity = 255 - int(my_fill);
+        if (capacity < 0) capacity = 0;  // shouldn't happen, but never allow a negative budget
+        float s = min(1.0, float(capacity) / float(total_in));
+        if (s >= 1.0) return;  // inflow already within capacity
+
+        for (int axis = 0; axis < 3; axis++) {
+            int raw = flux_buf.data[owned_lane[axis]];
+            if (eff_flux(raw) < 0) {
+                flux_buf.data[owned_lane[axis]] = int(round(float(raw) * s));
+            }
+        }
+        for (int axis = 0; axis < 3; axis++) {
+            int lane = neighbour_lane[axis];
+            if (lane < 0) continue;
+            int raw = flux_buf.data[lane];
+            if (eff_flux(raw) > 0) {
+                flux_buf.data[lane] = int(round(float(raw) * s));
+            }
+        }
+        return;
+    }
+
+    // === Transport: fill' = fill − owned faces + neighbour-owned faces (params.pass == 3) ===
     // fill'(p) = fill(p) − fx(p) − fy(p) − fz(p) + fx(p−X) + fy(p−Y) + fz(p−Z).
     // Sign-agnostic: whether an owned face is positive (outflow) or negative (reversed —
     // actually inflow from that neighbour), subtracting it produces the right delta either
-    // way, and likewise for the neighbour-owned "+" terms. Scale (pass 1) already
-    // guarantees p can never be asked to give more than fill(p) on the outflow side, so
-    // there is no trace-cell/negative-fill case to special-case here (unlike Phase 7d).
-    if (params.pass == 2) {
+    // way, and likewise for the neighbour-owned "+" terms. Scale-Outflow (pass 1)
+    // guarantees p can never be asked to give more than fill(p); Scale-Inflow (pass 2)
+    // guarantees p can never be asked to receive more than 255-fill(p). Together they
+    // mean new_fill's clamp(0,255) below is a formality confirming the guarantee, not a
+    // silent mass-losing/gaining backstop the way it was before Scale-Inflow existed.
+    if (params.pass == 3) {
         // Every term reads through eff_flux() — the same pure function Scale used to
         // decide what counted toward the donor's outflow budget. A donor's own delta
         // (subtracted below) and a receiver's inflow credit (added below) are therefore
