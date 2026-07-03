@@ -19,7 +19,7 @@ class_name FluidSimulation extends VoxelSimulation
 
 var _compute
 var _flux_pipeline: Dictionary = {}   # fluid_flux.comp — Accelerate / Scale / Transport
-var _flux_params_buf: RID             # 56-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, gravity_force, settle_threshold)
+var _flux_params_buf: RID             # 52-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, settle_threshold)
 var _flux_chunk_list_buf: RID         # active + 6 face neighbours — flux dispatch range
 var _flux_chunk_list_capacity: int = 0
 var _dirty_chunks_buf: RID
@@ -173,24 +173,22 @@ func _debug_print_watch() -> void:
 # proportional instead of collapsing to the clamp ceiling for typical head differences.
 @export_range(0.0, 0.5, 0.01) var g_dt: float = 0.15
 
-# gravity_bias: multiplier on the pressure-driven (dh*g_dt) term, Y-axis only. Without
-# this, Pass A's formula is fully symmetric across axes — a cell's push strength toward
-# an exposed neighbour is identical whether that neighbour is above, below, or to the
-# side, producing octahedral/spherical expansion instead of coherent falling. 1.0 = no
-# bias (original symmetric behavior, useful for regression testing). Range capped at 5.0
-# (was 8.0) for the same oversaturation reason as g_dt above — see its comment.
+# gravity_bias: multiplier on the (dh - elevation) term, Y-axis only (see
+# fluid_flux.comp's elevation-head fix, 2026-07-04). Without this, Pass A's formula is
+# fully symmetric across axes — a cell's push strength toward an exposed neighbour is
+# identical whether that neighbour is above, below, or to the side, producing
+# octahedral/spherical expansion instead of coherent falling. 1.0 = no bias (original
+# symmetric behavior, useful for regression testing). Range capped at 5.0 (was 8.0) for
+# the same oversaturation reason as g_dt above — see its comment.
+#
+# gravity_force (a separate flat downward constant this variable used to be paired
+# with) was removed 2026-07-04 — it broke hydrostatic equilibrium (see docs/BUG_LOG.md
+# "ROOT CAUSE FOUND (2026-07-03)"): head() is pressure head only, so a settled column
+# always has a nonzero head difference across every vertical face (255, not 0), and a
+# flat constant only cancels that by coincidence of tuning. Fixed by using elevation
+# head instead (Y-axis dh is now `dh - FILL_CAP`, computed directly in the shader), which
+# makes rest a genuine fixed point and gives a floating mass its baseline pull for free.
 @export_range(1.0, 5.0, 0.1) var gravity_bias: float = 3.0
-
-# gravity_force: constant downward nudge, Y-axis only, independent of dh. gravity_bias
-# alone only amplifies an EXISTING pressure differential — a perfectly uniform floating
-# mass with near-zero internal head difference wouldn't be pulled down by amplification
-# of ~zero. This guarantees a baseline fall even with no pressure gradient yet, the way
-# real gravity acts on every particle of mass regardless of pressure state. 0.0 = disabled
-# (pure pressure-driven behavior). Keep modest — Scale still caps actual outflow at the
-# cell's fill regardless of this value, but a very large constant will saturate FILL_CAP
-# in a single tick for every liquid voxel, defeating the "gradual pressure build-up" feel
-# damp/g_dt were tuned to produce.
-@export_range(0.0, 50.0, 0.5) var gravity_force: float = 10.0
 
 # settle_threshold: minimum |applied fill change| (see fluid_flux.comp Transport) for a
 # voxel's change to count toward keeping its chunk in _active_chunks next tick. Separate
@@ -216,7 +214,7 @@ func _ready() -> void:
 		_flux_pipeline = _compute.compile_shader(_load_flux_shader(), 4)
 		if _flux_pipeline.is_empty():
 			push_error("FluidSimulation: fluid_flux.comp compile failed")
-		var fp := PackedByteArray(); fp.resize(56); fp.fill(0)  # damp, g_dt, gravity_bias, gravity_force, settle_threshold
+		var fp := PackedByteArray(); fp.resize(52); fp.fill(0)  # damp, g_dt, gravity_bias, settle_threshold
 		_flux_params_buf = _compute.buffer_upload(fp)
 		_flux_chunk_list_capacity = 256
 		var fl := PackedByteArray(); fl.resize(_flux_chunk_list_capacity * 12); fl.fill(0)
@@ -680,7 +678,7 @@ func _build_flux_uniforms() -> Array:
 
 func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pass_idx: int) -> void:
 	var cs := _chunk_manager.chunk_size
-	var p := PackedByteArray(); p.resize(56)
+	var p := PackedByteArray(); p.resize(52)
 	p.encode_s32(0,  cs)
 	p.encode_s32(4,  grid_min.x)
 	p.encode_s32(8,  grid_min.y)
@@ -693,8 +691,7 @@ func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pa
 	p.encode_float(36, damp)
 	p.encode_float(40, g_dt)
 	p.encode_float(44, gravity_bias)
-	p.encode_float(48, gravity_force)
-	p.encode_s32(52, settle_threshold)
+	p.encode_s32(48, settle_threshold)
 	_compute.buffer_update(_flux_params_buf, 0, p)
 
 

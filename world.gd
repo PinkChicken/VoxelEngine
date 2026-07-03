@@ -7,10 +7,45 @@ extends Node3D
 @onready var fluid_simulation: FluidSimulation = $WorldOrchestrator/SimulationRuntime/FluidSimulation
 @onready var raymarch_renderer = $RaymarchRenderer
 
+# Watch-voxel indicator (2026-07-04) — a red wireframe box always rendered at
+# FluidSimulation.watch_chunk/watch_local so it's visible while testing (e.g.
+# disturbing water around the watched voxel) without having to infer the position
+# from log coordinates. Same unshaded/depth_draw_never/cull_disabled trick as
+# player_controller.gd's _cursor_indicator, so it stays visible even submerged under
+# other voxels. Hidden whenever FluidSimulation.watch_enabled is false.
+var _watch_indicator: MeshInstance3D
+
 func _ready() -> void:
 	Engine.max_fps = 60
 	player.add_sphere.connect(func(pos, r, mat): chunk_manager.spawn_sand_sphere(pos, r, mat))
 	player.remove_sphere.connect(func(pos: Vector3i, r: int): chunk_manager.remove_sphere(pos, r))
+
+	var shader := Shader.new()
+	shader.code = "shader_type spatial;
+render_mode unshaded, cull_disabled, blend_mix, depth_draw_never, wireframe;
+void fragment() {
+	ALBEDO = vec3(1.0, 0.1, 0.1);
+	ALPHA = 0.9;
+}"
+	var mat := ShaderMaterial.new()
+	mat.shader = shader
+	var box := BoxMesh.new()
+	box.size = Vector3.ONE * chunk_manager.voxel_scale * 1.02
+	box.material = mat
+	_watch_indicator = MeshInstance3D.new()
+	_watch_indicator.mesh = box
+	_watch_indicator.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_watch_indicator.visible = false
+	add_child(_watch_indicator)
+
+
+func _process(_delta: float) -> void:
+	_watch_indicator.visible = fluid_simulation.watch_enabled
+	if fluid_simulation.watch_enabled:
+		var cs = chunk_manager.chunk_size
+		var vs = chunk_manager.voxel_scale
+		var world_voxel = fluid_simulation.watch_chunk * cs + fluid_simulation.watch_local
+		_watch_indicator.global_position = (Vector3(world_voxel) + Vector3(0.5, 0.5, 0.5)) * vs
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:

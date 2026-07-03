@@ -94,12 +94,13 @@ metadata/_custom_type_script = "uid://b3ee10d6jlmm0"
 
 [node name="FluidSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=603403045]
 script = ExtResource("12_fluid")
-watch_chunk = Vector3i(1, -1, -1)
-watch_local = Vector3i(3, 31, 0)
-damp = 0.85
+watch_enabled = true
+watch_chunk = Vector3i(0, -1, 0)
+watch_local = Vector3i(0, 0, 0)
+debug_conservation_check = true
 g_dt = 0.1
 gravity_bias = 1.6
-settle_threshold = 1
+settle_threshold = 2
 
 [node name="MaterialDB" type="Node" parent="." unique_id=1815152731]
 script = ExtResource("8_udhof")

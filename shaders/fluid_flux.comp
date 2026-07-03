@@ -74,8 +74,7 @@ layout(set = 0, binding = 2, std430) readonly buffer SimParams {
     int pass;    // 0 = Pass A (accelerate). 1 = Scale-Outflow. 2 = Scale-Inflow. 3 = Transport (writes changelog).
     float damp;  // velocity retained per tick (0–1) — tunable, see FluidSimulation.damp
     float g_dt;  // acceleration per unit of hydrostatic head — tunable, see FluidSimulation.g_dt
-    float gravity_bias;   // Y-axis multiplier on the dh*g_dt term — see FluidSimulation.gravity_bias
-    float gravity_force;  // Y-axis constant downward nudge — see FluidSimulation.gravity_force
+    float gravity_bias;   // Y-axis multiplier on the (dh - elevation) term — see FluidSimulation.gravity_bias
     int settle_threshold; // scheduling-only floor for mark_dirty — see FluidSimulation.settle_threshold
 } params;
 layout(set = 0, binding = 3, std430) readonly buffer MaterialSim { uint data[256]; } material_sim;
@@ -381,30 +380,42 @@ void main() {
             // high-head boundary cell (e.g. the bottom pole of a floating sphere, where
             // horizontal cross-section is also thin and thus also exposed to air) pushes
             // with EQUAL strength in every exposed direction at once, producing an
-            // octahedral bulge instead of a coherent fall. Two Y-axis-only terms fix this,
-            // both layered on top of the existing pressure term, neither replacing it:
-            //   gravity_bias  — multiplies the existing dh*g_dt term on Y only, so once
-            //                   ANY pressure differential exists, vertical response wins
-            //                   the race against lateral spreading for the same dh.
-            //   gravity_force — a small constant subtracted from Y-axis accel regardless
-            //                   of dh, since gravity_bias alone only amplifies an EXISTING
-            //                   differential — a perfectly uniform floating mass (~zero dh
-            //                   everywhere internally) needs a baseline pull to start
-            //                   falling at all, the way real gravity acts on every particle
-            //                   of mass whether or not a pressure gradient exists yet.
-            // Neither term bypasses conservation: Scale (pass 1) still caps actual outflow
-            // at my_fill regardless of how large the raw computed accel is, so a low-fill
-            // cell can never be drained disproportionately by either term — that was the
-            // flaw in an earlier, rejected, FILL_CAP-scaled constant-force proposal.
+            // octahedral bulge instead of a coherent fall. gravity_bias multiplies the
+            // pressure term on Y only, so once ANY pressure differential exists, vertical
+            // response wins the race against lateral spreading for the same dh.
+            //
+            // FIX (root cause found 2026-07-03 via Fable 5 deep-dive + an exact
+            // integer-arithmetic Python emulation of all 4 passes; applied 2026-07-04 —
+            // full mechanism in docs/BUG_LOG.md "ROOT CAUSE FOUND (2026-07-03)"): an
+            // earlier version of this line added a flat constant, gravity_force,
+            // subtracted from accel regardless of dh — meant to give a near-zero-dh
+            // floating mass a baseline pull. That constant broke hydrostatic
+            // equilibrium: head() is PRESSURE head only, so two vertically stacked
+            // at-rest full cells always compute head(B)-head(A) = 255 exactly, never 0.
+            // A flat constant only cancels that residual by coincidence of tuning — at
+            // this file's original defaults it didn't, so "rest" was never actually a
+            // fixed point: every interior vertical face requested the same nonzero
+            // forcing every tick forever (Scale-Inflow silently clamped it back to 0 at
+            // interior faces, so the bulk looked quiet while spring-loaded), and the
+            // surface discharged it as a genuine undamped standing oscillation, because
+            // head()'s value jumps discontinuously the instant a full cell drops below
+            // 255 (stops reading as "still submerged", becomes "the surface"), flipping
+            // the force's sign every half-cycle.
+            //
+            // Fix: use elevation/piezometric head instead (h = z + p/ρg in classical
+            // hydraulics) — one cell of elevation is worth exactly FILL_CAP (255) in
+            // fill units, so the Y-axis total head difference is (pressure head) minus
+            // (elevation), not pressure head alone. For a settled column this is
+            // 255 - 255 = 0 exactly: rest is now a genuine fixed point at any
+            // g_dt/gravity_bias, no tuning required. gravity_force's original purpose
+            // (pull a near-zero-dh floating mass down) falls out of this for free: a
+            // floating blob's bottom face sees dh_total = 0 - 255, strongly negative,
+            // so it still falls coherently with no separate constant needed.
             int dh = head(gpos, active_mat) - head(nb, active_mat);
 
-            float axis_bias = (axis == 1) ? params.gravity_bias : 1.0;
-            float accel = float(dh) * params.g_dt * axis_bias;
-            if (axis == 1) {
-                // fy(p) positive = outflow upward (see Transport's fill'(p) formula), so
-                // a constant downward push subtracts here.
-                accel -= params.gravity_force;
-            }
+            float accel = (axis == 1)
+                ? (float(dh) - float(FILL_CAP)) * params.g_dt * params.gravity_bias
+                : float(dh) * params.g_dt;
 
             // FIX (2026-07-02, follow-up to the freezing-columns bug above): narrowing the
             // g_dt/gravity_bias export ranges was NOT enough. head() adds 255 per full cell
