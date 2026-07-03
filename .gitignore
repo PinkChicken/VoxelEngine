@@ -1,0 +1,9 @@
+# Godot 4+ specific ignores
+.godot/
+/android/
+*.tmp
+
+# Large reference material — kept local only, not worth tracking in git history
+Reference.pdf
+Reference_Two.pdf
+Reference_Three.pdf

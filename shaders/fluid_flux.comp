@@ -1,0 +1,609 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Pressure-driven horizontal+vertical fluid flux — persistent virtual-pipe model.
+//
+// Phase 7e Step 4 — Pass A (params.pass == 0): accelerate flux. Every voxel (liquid or
+// air — solid never participates) computes its 3 OWNED faces (+X, +Y, +Z — the -axis face
+// at any position is just the neighbour's owned face, negated: one value per face in the
+// world, one owner, chosen by world position) whenever at least one side of that face is
+// liquid: integrate f' = clamp(f*damp + dh*g_dt, -axis_cap, axis_cap), where dh is the
+// hydrostatic HEAD difference (see head(), not raw fill — a flat fill diff can't see that
+// a deep column pushes harder than a shallow one) and axis_cap is FILL_CAP for X/Z but
+// FILL_CAP*gravity_bias for Y — see the inline "FIX" comments for why a SHARED clamp
+// ceiling across axes silently defeats gravity_bias the moment more than one direction
+// saturates (common — head() adds 255 per full cell, so even a 2-deep column saturates a
+// typical g_dt). Letting AIR cells compute their own owned faces too (not just liquid
+// cells) is what makes flow symmetric in every direction, including downward — see the
+// "FIX (2026-07-02)" comment inline for why the old liquid-only gating made water expand
+// only in +X/+Y/+Z and never fall. flux_buf is NOT
+// zeroed between ticks — persistence across ticks is what turns pure diffusion into a
+// damped oscillator (waves, slosh) instead of monotonic decay to flat. No atomics: each
+// thread writes only its own 3 owned lanes, never a neighbour's, so there is no race to
+// guard against.
+//
+// Phase 7e Step 5 — Scale (params.pass == 1): conservation guard. Pass A computes each
+// owned face independently, so nothing stops requested outflow from exceeding what a
+// voxel actually holds. Scale caps it: s = min(1, fill(p) / total_outflow(p)), then every
+// face representing outflow from p — including neighbour-owned faces with a negative
+// sign — is multiplied by s. See the in-function comment for the sign-based no-double-
+// scale proof. Three separate dispatches (Accelerate → Scale → Transport) are required,
+// each with its own submit/sync: Scale reads faces Pass A wrote in OTHER workgroups
+// (neighbour-owned faces), a genuine cross-workgroup dependency, not just a style choice.
+//
+// Phase 7e Step 6 — Transport (params.pass == 2): fill'(p) = fill(p) − fx(p) − fy(p) −
+// fz(p) + fx(p−X) + fy(p−Y) + fz(p−Z), i.e. subtract everything p's own owned faces
+// represent and add everything the −axis neighbours' owned faces represent (sign handles
+// both outflow/inflow cases uniformly). Writes the standard changelog — this shader still
+// never touches _voxel_buf_a directly, same single-writer discipline as every other sim.
+// Air receiving net-positive inbound flux materializes as liquid (scans neighbours for
+// the donor material). This is the pass that finally moves water — Steps 4/5 only built
+// up to a correct, conservation-safe flux field; this is what reads it.
+//
+// fluid_sim.comp (legacy vertical CAS) has been deleted (Phase 7e Step 7) — it was
+// silently destroying fill via a destructive try_compress "snap low remainder to zero"
+// hack left over from before this redesign existed. Y (vertical) flow is now handled
+// entirely by this shader's Y-axis flux, the same head-driven mechanism as X/Z.
+//
+// FluxBuf layout: 3 signed int lanes per voxel, stride 3, interleaved (fx, fy, fz),
+// indexed through the sparse page table exactly like Step 2's single-lane predecessor —
+// page*vpc*3 + local*3 + axis. A chunk with no page cannot own flux; Pass A simply skips it.
+//
+// Dispatch: same multi-chunk encoding as granular_sim.comp.
+//   groups = (active_count * 4, 4, 4)
+
+layout(set = 0, binding = 0, std430) readonly buffer VoxelBufA { uint data[]; } voxels_a;
+layout(set = 0, binding = 1, std430) readonly buffer ChunkTable { int  data[]; } chunk_table;
+layout(set = 0, binding = 2, std430) readonly buffer SimParams {
+    int chunk_size;
+    int grid_min_x; int grid_min_y; int grid_min_z;
+    int grid_span_x; int grid_span_y; int grid_span_z;
+    int frame;
+    int pass;    // 0 = Pass A (accelerate). 1 = Scale. 2 = Transport (writes changelog).
+    float damp;  // velocity retained per tick (0–1) — tunable, see FluidSimulation.damp
+    float g_dt;  // acceleration per unit of hydrostatic head — tunable, see FluidSimulation.g_dt
+    float gravity_bias;   // Y-axis multiplier on the dh*g_dt term — see FluidSimulation.gravity_bias
+    float gravity_force;  // Y-axis constant downward nudge — see FluidSimulation.gravity_force
+} params;
+layout(set = 0, binding = 3, std430) readonly buffer MaterialSim { uint data[256]; } material_sim;
+layout(set = 0, binding = 4, std430)          buffer Changelog {
+    uint count;
+    uint entries[];
+} changelog;
+layout(set = 0, binding = 5, std430) readonly buffer ChunkList { int data[]; } chunk_list;
+layout(set = 0, binding = 6, std430)          buffer DirtyChunks { uint data[]; } dirty_chunks;
+layout(set = 0, binding = 7, std430) coherent buffer FluxBuf { int data[]; } flux_buf;
+// Phase 7e Step 2 — sparse flux paging. flux_buf is indexed by PAGE, not by voxel slot.
+// This table maps a chunk's grid-flat index (same formula as ChunkTable) to its page
+// index, or -1 if the chunk has no page (zero-flux boundary — most chunks never touch
+// fluid and pay zero flux storage). CPU-owned mirror of FluidSimulation._flux_chunk_table.
+layout(set = 0, binding = 8, std430) readonly buffer FluxPageTable { int data[]; } flux_page_table;
+// Automatic conservation check (2026-07-02) — Transport atomicAdds every real
+// (new_fill - old_fill) it applies here. Zero after a full Transport dispatch means mass
+// conserved exactly across the dispatch range; nonzero is a direct, quantified leak/gain.
+// FluidSimulation zeroes this before each Transport dispatch and reads+reports it after.
+layout(set = 0, binding = 9, std430) buffer ConservationCheck { int delta; } conservation;
+// Location tracker (added 2026-07-02) — the conservation-check fix (stale pages during the
+// idle-guard grace period) didn't resolve the observed leak, so this pinpoints WHERE the
+// single largest gain each tick is actually happening instead of continuing to guess at
+// mechanisms blindly. Plain (non-atomic) write, intentionally not synchronized against
+// races between threads — good enough for "which chunk should I go look at", not meant to
+// be a perfectly deterministic "the" largest value if several qualify in the same tick.
+layout(set = 0, binding = 10, std430) buffer GainTracker { int flat_idx; int amount; } gain_tracker;
+
+const uint SIM_LIQUID    = 2u;
+const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGELOG_ENTRIES
+
+ivec3 world_to_chunk(ivec3 gpos) {
+    float cs = float(params.chunk_size);
+    return ivec3(floor(float(gpos.x) / cs),
+                 floor(float(gpos.y) / cs),
+                 floor(float(gpos.z) / cs));
+}
+
+int world_to_flat(ivec3 gpos) {
+    int cs  = params.chunk_size;
+    int vpc = cs * cs * cs;
+    ivec3 cp  = world_to_chunk(gpos);
+    ivec3 lcp = cp - ivec3(params.grid_min_x, params.grid_min_y, params.grid_min_z);
+    if (lcp.x < 0 || lcp.x >= params.grid_span_x ||
+        lcp.y < 0 || lcp.y >= params.grid_span_y ||
+        lcp.z < 0 || lcp.z >= params.grid_span_z) return -1;
+    int tbl  = lcp.z * params.grid_span_x * params.grid_span_y
+             + lcp.y * params.grid_span_x
+             + lcp.x;
+    int slot = chunk_table.data[tbl];
+    if (slot < 0) return -1;
+    ivec3 lp = gpos - cp * cs;
+    return slot * vpc + lp.z * cs * cs + lp.y * cs + lp.x;
+}
+
+uint read_a(ivec3 gpos) {
+    int idx = world_to_flat(gpos);
+    return (idx >= 0) ? voxels_a.data[idx] : 0u;
+}
+
+// Grid-flat chunk-table index — identical formula to the ChunkTable lookup inline in
+// world_to_flat()/main(), factored out so the flux page table can reuse it.
+int chunk_table_idx(ivec3 chunk_pos) {
+    ivec3 lcp = chunk_pos - ivec3(params.grid_min_x, params.grid_min_y, params.grid_min_z);
+    if (lcp.x < 0 || lcp.x >= params.grid_span_x ||
+        lcp.y < 0 || lcp.y >= params.grid_span_y ||
+        lcp.z < 0 || lcp.z >= params.grid_span_z) return -1;
+    return lcp.z * params.grid_span_x * params.grid_span_y
+         + lcp.y * params.grid_span_x
+         + lcp.x;
+}
+
+// Flux lane index for a world position + axis (0=X, 1=Y, 2=Z), resolved through the
+// sparse page table — works across chunk boundaries, needed by Scale (Step 5) to read/
+// write a neighbour's owned face. Returns -1 if the containing chunk has no flux page
+// (zero-flux boundary) — the caller must treat that exactly like "no flux here".
+int flux_lane(ivec3 gpos, int axis) {
+    int cs  = params.chunk_size;
+    int vpc = cs * cs * cs;
+    ivec3 cp  = world_to_chunk(gpos);
+    int tbl   = chunk_table_idx(cp);
+    if (tbl < 0) return -1;
+    int page  = flux_page_table.data[tbl];
+    if (page < 0) return -1;
+    ivec3 lp = gpos - cp * cs;
+    int local = lp.z * cs * cs + lp.y * cs + lp.x;
+    return page * vpc * 3 + local * 3 + axis;
+}
+
+// Each liquid voxel owns its +X (0), +Y (1), +Z (2) face. The -axis face at any position
+// is the neighbour's owned face, negated — one storage location per face in the world.
+const ivec3 AXIS_DIR[3] = ivec3[3](ivec3(1, 0, 0), ivec3(0, 1, 0), ivec3(0, 0, 1));
+
+void mark_dirty(int flat_idx, int vpc) {
+    int chunk_slot = flat_idx / vpc;
+    atomicOr(dirty_chunks.data[uint(chunk_slot) >> 5u], 1u << (uint(chunk_slot) & 31u));
+}
+
+// Phase 7e Step 3 — hydrostatic head.
+//
+// Two fully-full (fill==255) cells exert different horizontal push if one sits under
+// three more full cells and the other doesn't — raw fill can't see that, only depth can.
+// No pressure byte is stored (a stored value must be invalidated every time a cell above
+// fills, empties, or streams in — a permanent desync surface); instead the column is
+// walked on demand, self-correcting every tick from data already in cache.
+//
+// head(p) = fill(p) + sum of fill for each consecutive FULL (255), same-material liquid
+// cell directly above p, stopping at (and including) the first non-full cell in that
+// liquid, or stopping at (and excluding) the first non-liquid/different-material cell.
+// A partial-fill cell at p is itself the surface — the walk below never needs to look
+// upward past it.
+const int HEAD_MAX_DEPTH = 24;  // "very deep" beyond this reads identically either way
+
+int head(ivec3 p, uint mat_id) {
+    uint v = read_a(p);
+    if ((v & 0xFFu) != mat_id) return 0;  // p isn't this liquid — no head contribution
+    uint f = (v >> 8u) & 0xFFu;
+    int total = int(f);
+    if (f < 255u) return total;  // p is the surface — nothing above it can be submerged
+    ivec3 above = p;
+    for (int i = 0; i < HEAD_MAX_DEPTH; i++) {
+        above.y += 1;
+        uint av = read_a(above);
+        if ((av & 0xFFu) != mat_id) break;      // non-liquid / different liquid: stop, don't add
+        uint af = (av >> 8u) & 0xFFu;
+        total += int(af);
+        if (af < 255u) break;                   // that cell is the surface — include it, then stop
+    }
+    return total;
+}
+
+// Phase 7e — MIN_MATERIALIZE replaced with a read-side deadzone (2026-07-02, Fable 5
+// review). The old floor was a write-side veto: the receiving air cell refused to
+// materialize a sub-threshold transfer, but the donor's own delta computation always
+// subtracted its full outflow regardless — asymmetric, a real leak (measured at ~100% of
+// a droplet's mass over a handful of ticks). eff_flux() fixes this by construction: Scale
+// and Transport both read every flux lane through this same pure function, so a
+// sub-threshold value is invisible to BOTH sides identically — never counted as a donor's
+// outflow, never counted as a receiver's inflow. The raw stored value is left completely
+// untouched (never zeroed, never written by this function).
+//
+// BUG (found 2026-07-02, gravity-fall testing): the "accumulates until it naturally
+// crosses the threshold" claim above is WRONG for any cell whose fill has dropped below
+// MIN_FLOW, and it's a hard structural trap, not a slow drain. Sequence within one tick:
+// Pass A integrates the raw value past the threshold in 1-2 ticks (confirmed: with
+// gravity_force alone, tick 1 lands around -10, tick 2 around -20, already past a
+// threshold of 16). But Scale runs BEFORE Transport in the same tick, and Scale caps a
+// cell's total outflow at my_fill — for a cell with fill=8, Scale re-scales that -20 back
+// down to at most -8 and WRITES it back to flux_buf, every single tick, before Transport
+// ever gets a turn. Transport then reads eff_flux(-8) = 0 (8 < 16) and moves nothing. Next
+// tick, Pass A integrates from that already-shrunk -8, grows past -16 again, Scale caps it
+// back down to -8 again — an oscillating trap, not a threshold that eventually gets
+// crossed. Reported symptom: voxels sitting at fill 1-14, adjacent to more water below,
+// simply never falling no matter how long they're left alone. Every reported value was
+// under the old threshold of 16 — not a coincidence.
+//
+// Fix: lower MIN_FLOW to 1 (any nonzero flux passes). This does NOT reintroduce the
+// asymmetric MIN_MATERIALIZE leak fixed earlier — that leak came from donor and receiver
+// disagreeing about a value, not from the threshold being small. eff_flux() being applied
+// identically on both sides means a low threshold is still leak-free; the only thing a low
+// threshold gives up is the cosmetic "don't spawn dust-speck droplets" protection, which
+// matters much less now that gravity_bias/gravity_force actively consolidate thin films
+// instead of letting them spread indefinitely (the scenario MIN_FLOW=16 was originally
+// sized to prevent).
+const int MIN_FLOW = 1;
+
+int eff_flux(int raw) {
+    return (abs(raw) >= MIN_FLOW) ? raw : 0;
+}
+
+void main() {
+    int cs  = params.chunk_size;
+    int vpc = cs * cs * cs;
+
+    int chunk_idx  = int(gl_WorkGroupID.x) / 4;
+    int wg_x_local = int(gl_WorkGroupID.x) % 4;
+
+    ivec3 local_pos = ivec3(
+        wg_x_local * 8 + int(gl_LocalInvocationID.x),
+        int(gl_WorkGroupID.y) * 8 + int(gl_LocalInvocationID.y),
+        int(gl_WorkGroupID.z) * 8 + int(gl_LocalInvocationID.z)
+    );
+    if (any(greaterThanEqual(local_pos, ivec3(cs)))) return;
+
+    ivec3 chunk_pos = ivec3(
+        chunk_list.data[chunk_idx * 3],
+        chunk_list.data[chunk_idx * 3 + 1],
+        chunk_list.data[chunk_idx * 3 + 2]
+    );
+    ivec3 gpos = chunk_pos * cs + local_pos;
+
+    int tbl     = chunk_table_idx(chunk_pos);
+    int my_slot = (tbl >= 0) ? chunk_table.data[tbl] : -1;
+    if (my_slot < 0) return;
+
+    int my_local = local_pos.z * cs * cs + local_pos.y * cs + local_pos.x;
+    int my_flat  = my_slot * vpc + my_local;  // voxel indexing — voxels_a / changelog / dirty bitmask
+
+    // Flux indexing is per-axis now (Phase 7e Step 4 — 3 owned lanes per voxel, stride 3).
+    // -1 means this chunk has no flux page: a valid state (zero-flux boundary), not an error.
+    int my_page = (tbl >= 0) ? flux_page_table.data[tbl] : -1;
+
+    uint my_voxel = voxels_a.data[my_flat];
+    uint mat_id   = my_voxel & 0xFFu;
+    uint my_fill  = (my_voxel >> 8u) & 0xFFu;
+
+    const int FILL_CAP = 255;  // one flux tick can move at most one full voxel's worth of fill
+
+    // === Pass A: accelerate flux (params.pass == 0) ===
+    //
+    // FIX (2026-07-02): a voxel only ever computed accel for its OWN 3 owned (+X/+Y/+Z)
+    // faces, and only when IT was liquid. That's exactly half the physics: for water at p
+    // to flow into its -X neighbour q, it's q's owned +X face (the shared face) that needs
+    // a negative value — and q owns that face, not p. If q is air, the old code zeroed q's
+    // lanes and returned before ever computing it. Net effect: water could only ever push
+    // outward from a liquid cell into its +X/+Y/+Z neighbours — never -X/-Y/-Z, and
+    // critically never fall (gravity is -Y). Confirmed by report: a placed sphere expanded
+    // only up/right/forward, floating in place, never down or backward/left.
+    //
+    // Fix: gate per-axis, symmetrically, on whether EITHER side of the face is liquid —
+    // not on whether the current thread's own voxel is liquid. A solid cell never
+    // participates (zeroed, no flow ever possible there); two different liquids never
+    // exchange directly (kept separate, same as before); air adjacent to liquid now
+    // computes its own owned face exactly like a liquid cell would, using the SAME head()
+    // formula for every axis including Y — so gravity isn't a special case or a constant
+    // force, it falls out naturally (a liquid cell has head > 0, empty air below always
+    // reads head 0, so dh is always negative = pulls down, proportional to actual pressure).
+    if (params.pass == 0) {
+        if (my_page < 0) return;  // nowhere to store flux for this chunk at all
+
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        bool my_is_air    = (mat_id == 0u);
+
+        for (int axis = 0; axis < 3; axis++) {
+            ivec3 nb = gpos + AXIS_DIR[axis];
+            uint nv  = read_a(nb);
+            uint nm  = nv & 0xFFu;
+
+            int lane = my_page * vpc * 3 + my_local * 3 + axis;
+
+            bool nb_is_liquid = (nm != 0u && material_sim.data[nm] == SIM_LIQUID);
+            bool nb_is_air    = (nm == 0u);
+
+            // BUG (found 2026-07-02, GainTracker location data): reading a neighbour's
+            // real voxel data via read_a() above always succeeds regardless of paging or
+            // dispatch status — but if the neighbour's CHUNK isn't part of THIS TICK's
+            // dispatch range (flux_list), no invocation ever runs for its voxels this
+            // tick, so it can never process the debit/credit side of any transfer we
+            // compute here. Without this check, a dispatched boundary voxel materializes
+            // or drains fill against an un-dispatched neighbour with zero corresponding
+            // effect on the other side — a real, unbounded, one-sided leak. Symptom
+            // matched exactly: GainTracker showed every large gain sitting at local
+            // Y=30/31, the very edge of the paged/dispatched region, growing without
+            // bound because each phantom materialization creates a new active voxel,
+            // which pulls the dispatch frontier one ring further out next tick, repeating
+            // forever. Independent of gravity_force (confirmed: leak persisted with
+            // gravity_force=0) — this is a dispatch-range bug, not a gravity bug.
+            // flux_page_table is rebuilt every tick by FluidSimulation.step() to reflect
+            // current dispatch membership (not just "chunk has ever had a page
+            // allocated"), specifically so this check is meaningful on a per-tick basis.
+            int nb_cp_tbl = chunk_table_idx(world_to_chunk(nb));
+            int nb_page   = (nb_cp_tbl >= 0) ? flux_page_table.data[nb_cp_tbl] : -1;
+            if (nb_page < 0) {
+                flux_buf.data[lane] = 0;
+                continue;
+            }
+
+            // Solid on either side of this face: no flow is possible here, ever, until
+            // that changes. Also covers "I died since last tick" (I'm now air/solid) and
+            // "my neighbour changed" — both self-heal automatically every tick since this
+            // reads current state, no separate invalidation branch needed (Step 6b).
+            if ((!my_is_liquid && !my_is_air) || (!nb_is_liquid && !nb_is_air)) {
+                flux_buf.data[lane] = 0;
+                continue;
+            }
+            // Both air: nothing to move.
+            if (!my_is_liquid && !nb_is_liquid) {
+                flux_buf.data[lane] = 0;
+                continue;
+            }
+            // Two different liquids: never exchange pressure directly through this face —
+            // keeps them separated at a shared boundary with no explicit "don't mix" logic.
+            if (my_is_liquid && nb_is_liquid && mat_id != nm) {
+                flux_buf.data[lane] = 0;
+                continue;
+            }
+
+            // Exactly one side holds a liquid (or both hold the same one) — active_mat is
+            // whichever material is actually present, so head() reads the right column
+            // regardless of which side of the face this thread's voxel is on.
+            uint active_mat = my_is_liquid ? mat_id : nm;
+
+            // Hydrostatic head, not raw fill — a flat fill difference can't tell a deep
+            // column from a shallow one (see head()). Air always reads as head 0. A liquid
+            // cell has head > 0, empty air below always reads head 0, so dh is always
+            // negative (pulls down) proportional to actual pressure — this alone already
+            // makes gravity fall out of the same formula used for X/Z, no special case
+            // needed for basic correctness.
+            //
+            // FIX (2026-07-02, gravity dominance): pure pressure-difference flow is NOT
+            // enough to make an unsupported mass fall coherently instead of spreading —
+            // head() is a single scalar per cell reused identically for all 3 axes, so a
+            // high-head boundary cell (e.g. the bottom pole of a floating sphere, where
+            // horizontal cross-section is also thin and thus also exposed to air) pushes
+            // with EQUAL strength in every exposed direction at once, producing an
+            // octahedral bulge instead of a coherent fall. Two Y-axis-only terms fix this,
+            // both layered on top of the existing pressure term, neither replacing it:
+            //   gravity_bias  — multiplies the existing dh*g_dt term on Y only, so once
+            //                   ANY pressure differential exists, vertical response wins
+            //                   the race against lateral spreading for the same dh.
+            //   gravity_force — a small constant subtracted from Y-axis accel regardless
+            //                   of dh, since gravity_bias alone only amplifies an EXISTING
+            //                   differential — a perfectly uniform floating mass (~zero dh
+            //                   everywhere internally) needs a baseline pull to start
+            //                   falling at all, the way real gravity acts on every particle
+            //                   of mass whether or not a pressure gradient exists yet.
+            // Neither term bypasses conservation: Scale (pass 1) still caps actual outflow
+            // at my_fill regardless of how large the raw computed accel is, so a low-fill
+            // cell can never be drained disproportionately by either term — that was the
+            // flaw in an earlier, rejected, FILL_CAP-scaled constant-force proposal.
+            int dh = head(gpos, active_mat) - head(nb, active_mat);
+
+            float axis_bias = (axis == 1) ? params.gravity_bias : 1.0;
+            float accel = float(dh) * params.g_dt * axis_bias;
+            if (axis == 1) {
+                // fy(p) positive = outflow upward (see Transport's fill'(p) formula), so
+                // a constant downward push subtracts here.
+                accel -= params.gravity_force;
+            }
+
+            // FIX (2026-07-02, follow-up to the freezing-columns bug above): narrowing the
+            // g_dt/gravity_bias export ranges was NOT enough. head() adds 255 per full cell
+            // in a column — even a 2-deep column already produces dh=510, which saturates
+            // at any g_dt*bias product above ~0.5. Saturation isn't a rare edge case here,
+            // it's the NORMAL case for anything but a single shallow puddle voxel. Clamping
+            // every axis to the identical +-FILL_CAP means X/Y/Z all tie at the same
+            // ceiling the moment more than one direction saturates — which collapses
+            // gravity_bias's whole purpose right back to symmetric spreading, just
+            // triggered by ordinary saturation instead of an oversized slider value.
+            //
+            // Real fix: give Y a LARGER clamp ceiling than X/Z, scaled by gravity_bias,
+            // instead of sharing FILL_CAP. Scale (pass 1) applies ONE proportional factor s
+            // to every lane's raw stored value — if Y's raw value can legitimately grow
+            // past what X/Z are capped at, Y keeps a proportionally bigger share of the
+            // outflow budget even when every axis is fully saturated, instead of losing
+            // that distinction the instant they tie.
+            float axis_cap = (axis == 1) ? float(FILL_CAP) * params.gravity_bias : float(FILL_CAP);
+
+            // FIX (2026-07-02, "water never settles" bug): round(old_f * damp) has a fixed
+            // point for damp=0.97 and small integer magnitudes -- round(n * 0.97) == n for
+            // EVERY integer n from 1 to 16, meaning decay alone can never reach exactly 0;
+            // a settled cell's residual flux gets stuck at a small nonzero value forever
+            // and keeps being read (and applied, however trivially) by Scale/Transport
+            // every tick, on already-flat water with no real pressure differential. This
+            // was invisible while MIN_FLOW was 16 (the stuck range 1-16 was filtered out
+            // entirely) -- lowering MIN_FLOW to 1 (fixing the low-fill-cell trap) unmasked
+            // it across every settled body of water at once, which is why it got WORSE
+            // right after that fix, not better. Symptom: water on flat ground perpetually
+            // shuffling by tiny amounts, never settling, flooding the changelog with real
+            // (not spurious) but pointless tick-after-tick fill churn.
+            //
+            // Fix: truncate the DECAY term toward zero instead of rounding it, guaranteeing
+            // strict monotonic progress toward 0 every tick (int(1.0*0.97) = int(0.97) = 0,
+            // fully resolved in one step; int(16.0*0.97) = int(15.52) = 15, still shrinking
+            // every tick instead of sticking). The freshly-computed accel (genuinely new
+            // forcing this tick, not decay) still gets normal rounding on the final sum --
+            // only the carried-over persistence term needed the fix.
+            float old_f = float(flux_buf.data[lane]);
+            int decayed = int(old_f * params.damp);
+            float new_f = float(decayed) + accel;
+            new_f = clamp(new_f, -axis_cap, axis_cap);
+            flux_buf.data[lane] = int(round(new_f));
+        }
+        return;
+    }
+
+    // === Scale: conservation guard (params.pass == 1) ===
+    // Pass A computes each of a voxel's 3 owned faces independently — nothing stops
+    // requested outflow from exceeding what the voxel actually holds. This pass fixes
+    // that: s = min(1, fill(p) / total_planned_outflow), then every face representing
+    // outflow FROM p (not just p's own owned faces — see below) is scaled by s.
+    //
+    // A voxel's total outflow is NOT just its 3 owned faces. Faces are shared: p's -X
+    // face is (p-X)'s owned +X face, fx(p-X). Per the Pass B transport formula
+    // (fill'(p) = fill(p) - fx(p) - fy(p) - fz(p) + fx(p-X) + fy(p-Y) + fz(p-Z)), a
+    // NEGATIVE fx(p-X) subtracts from p — i.e. it's outflow from p, even though p-X owns
+    // that storage. So p's outflow is: max(0, its 3 owned faces) + max(0, -(its 3
+    // neighbour-owned faces)).
+    //
+    // Scaling never double-touches a face: a face is scaled by whichever cell's outflow
+    // it represents, decided purely by sign (positive → the face's owner scales it in its
+    // own owned-face loop below; negative → the -axis neighbour scales it in its
+    // neighbour-face loop). Exactly one of "owner" and "neighbour" ever writes to a given
+    // face this pass, so there is no race regardless of dispatch/thread order (sign is
+    // fixed for the whole pass since Pass A already completed and synced before Scale
+    // begins).
+    if (params.pass == 1) {
+        if (my_page < 0) return;  // no page: nothing here to scale
+
+        int owned_lane[3];
+        int neighbour_lane[3];
+        int total_out = 0;
+
+        // total_out is built from eff_flux() reads — a sub-threshold lane never counts
+        // toward the outflow budget, so the donor is never asked to give it away, and
+        // (symmetrically, in Transport below) the receiver never gets credited for it
+        // either. Both sides agree by construction, not by careful bookkeeping.
+        for (int axis = 0; axis < 3; axis++) {
+            int lane = my_page * vpc * 3 + my_local * 3 + axis;
+            owned_lane[axis] = lane;
+            int f = eff_flux(flux_buf.data[lane]);
+            if (f > 0) total_out += f;
+        }
+        for (int axis = 0; axis < 3; axis++) {
+            ivec3 nb = gpos - AXIS_DIR[axis];
+            int lane = flux_lane(nb, axis);
+            neighbour_lane[axis] = lane;
+            if (lane < 0) continue;
+            int f = eff_flux(flux_buf.data[lane]);
+            if (f < 0) total_out += -f;
+        }
+
+        if (total_out == 0) return;  // nothing flowing out of p — nothing to scale
+
+        float s = min(1.0, float(my_fill) / float(total_out));
+        if (s >= 1.0) return;  // outflow already within budget
+
+        // Scale only the lanes that counted toward total_out (effective magnitude above
+        // MIN_FLOW). Sub-threshold lanes are left completely untouched — no write at all —
+        // so they keep accumulating under Pass A's integration instead of being nudged
+        // further toward zero by a budget cap they were never part of.
+        for (int axis = 0; axis < 3; axis++) {
+            int raw = flux_buf.data[owned_lane[axis]];
+            if (eff_flux(raw) > 0) {
+                flux_buf.data[owned_lane[axis]] = int(round(float(raw) * s));
+            }
+        }
+        for (int axis = 0; axis < 3; axis++) {
+            int lane = neighbour_lane[axis];
+            if (lane < 0) continue;
+            int raw = flux_buf.data[lane];
+            if (eff_flux(raw) < 0) {
+                flux_buf.data[lane] = int(round(float(raw) * s));
+            }
+        }
+        return;
+    }
+
+    // === Transport: fill' = fill − owned faces + neighbour-owned faces (params.pass == 2) ===
+    // fill'(p) = fill(p) − fx(p) − fy(p) − fz(p) + fx(p−X) + fy(p−Y) + fz(p−Z).
+    // Sign-agnostic: whether an owned face is positive (outflow) or negative (reversed —
+    // actually inflow from that neighbour), subtracting it produces the right delta either
+    // way, and likewise for the neighbour-owned "+" terms. Scale (pass 1) already
+    // guarantees p can never be asked to give more than fill(p) on the outflow side, so
+    // there is no trace-cell/negative-fill case to special-case here (unlike Phase 7d).
+    if (params.pass == 2) {
+        // Every term reads through eff_flux() — the same pure function Scale used to
+        // decide what counted toward the donor's outflow budget. A donor's own delta
+        // (subtracted below) and a receiver's inflow credit (added below) are therefore
+        // reading the identical stored value through the identical threshold: if a lane
+        // was too small to count as outflow, it's equally too small to count as inflow,
+        // on both sides, every tick. No asymmetry possible.
+        int delta = 0;
+        for (int axis = 0; axis < 3; axis++) {
+            if (my_page >= 0) {
+                delta -= eff_flux(flux_buf.data[my_page * vpc * 3 + my_local * 3 + axis]);
+            }
+            ivec3 nb = gpos - AXIS_DIR[axis];
+            int nlane = flux_lane(nb, axis);
+            if (nlane >= 0) {
+                delta += eff_flux(flux_buf.data[nlane]);
+            }
+        }
+        if (delta == 0) return;
+
+        bool is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        bool is_air    = (mat_id == 0u);
+        if (!is_liquid && !is_air) return;  // solid: transport never touches it
+
+        if (is_air && delta <= 0) return;              // air with net outflow: nothing to move
+        if (is_liquid && my_fill == 0u && delta <= 0) return;
+
+        // Air receiving inbound flux materializes as liquid — scan all 6 neighbours for
+        // the donor's material (mirrors the same scan proven correct in Phase 7d's Pass 1;
+        // the source design's pseudocode omits this — see ARCHITECTURE.md Step 6 note).
+        uint fill_mat = mat_id;
+        if (is_air) {
+            ivec3 scan[6];
+            scan[0] = gpos + AXIS_DIR[0]; scan[1] = gpos - AXIS_DIR[0];
+            scan[2] = gpos + AXIS_DIR[1]; scan[3] = gpos - AXIS_DIR[1];
+            scan[4] = gpos + AXIS_DIR[2]; scan[5] = gpos - AXIS_DIR[2];
+            for (int i = 0; i < 6; i++) {
+                uint nv = read_a(scan[i]);
+                uint nm = nv & 0xFFu;
+                if (nm != 0u && material_sim.data[nm] == SIM_LIQUID) {
+                    fill_mat = nm;
+                    break;
+                }
+            }
+            if (fill_mat == 0u) return;  // no liquid neighbour found — spurious delta, skip
+        }
+
+        int old_fill = int(is_liquid ? my_fill : 0u);
+        int new_fill = clamp(old_fill + delta, 0, 255);
+        if (new_fill == old_fill) return;
+
+        // No receiver-side floor needed (removed 2026-07-02, see MIN_FLOW/eff_flux above).
+        // delta is built entirely from eff_flux() reads, so any single-donor contribution
+        // to it already has magnitude >= MIN_FLOW — a materializing cell's new_fill is a
+        // real, meaningful transfer by construction, not a trace amount that needs a
+        // second gate to filter out. (Narrow edge case: multiple donors with opposing
+        // signs, each individually >= MIN_FLOW, could in principle sum to a small net
+        // delta — e.g. +17 and -16 — producing a small materialized fill. Rare, requires
+        // simultaneous opposing flows from different neighbours, and self-limiting rather
+        // than runaway; not worth a second check for.)
+
+        uint new_voxel;
+        if (new_fill == 0) {
+            new_voxel = 0u;  // destroyed
+        } else if (is_air) {
+            new_voxel = fill_mat | (uint(new_fill) << 8u);
+        } else {
+            new_voxel = (my_voxel & 0xFFFF00FFu) | (uint(new_fill) << 8u);
+        }
+
+        // Automatic conservation check: record the REAL applied change (post-clamp), not
+        // the raw delta — clamping at the 0/255 boundary is itself a legitimate, if rare,
+        // source of gain/loss (e.g. multiple donors overfilling a cell past 255 loses the
+        // excess here), and that's exactly the kind of thing this check exists to catch.
+        int applied = new_fill - old_fill;
+        atomicAdd(conservation.delta, applied);
+        if (applied > gain_tracker.amount) {
+            gain_tracker.amount   = applied;
+            gain_tracker.flat_idx = my_flat;
+        }
+
+        uint log_slot = atomicAdd(changelog.count, 1u);
+        if (log_slot < MAX_CHANGELOG) {
+            changelog.entries[log_slot * 2u]     = uint(my_flat);
+            changelog.entries[log_slot * 2u + 1u] = new_voxel;
+        }
+        mark_dirty(my_flat, vpc);
+    }
+}

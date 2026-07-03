@@ -1,0 +1,9 @@
+[gd_scene format=3 uid="uid://dwq61bbhmdwpj"]
+
+[ext_resource type="Script" uid="uid://bmmi0isehaaq3" path="res://Chunks/chunk_instance.gd" id="1_kdh3y"]
+
+[node name="Chunk" type="StaticBody3D" unique_id=1333988555]
+script = ExtResource("1_kdh3y")
+voxel_scale = 0.125
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="." unique_id=871112800]

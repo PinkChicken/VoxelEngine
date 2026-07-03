@@ -1,0 +1,81 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Batch surface extractor: processes N chunks in one dispatch.
+// Dispatch: (N * 4, 4, 4) workgroups -- identical encoding to granular_sim.comp.
+// Each thread derives its chunk from gl_WorkGroupID.x / 4.
+//
+// Output buffer is a flat uint[] split into per-chunk sub-ranges of stride
+// (1 + max_per_chunk) u32 words each:
+//   data[chunk_idx * stride + 0]             = per-chunk count (atomicAdd target)
+//   data[chunk_idx * stride + 1 .. stride-1] = packed entries
+//     entry bits[15:0] = local_flat_idx, bits[23:16] = mat_id
+//
+// Chunk-edge voxels are treated as exposed (no cross-chunk lookup).
+
+layout(set = 0, binding = 0, std430) readonly buffer VoxelBuf    { uint data[]; } voxels;
+layout(set = 0, binding = 1, std430)          buffer SurfaceOut   { uint data[]; } surface_out;
+layout(set = 0, binding = 2, std430) readonly buffer ExtractParams {
+    int chunk_size;
+    int max_per_chunk;
+    int chunk_count;
+    int _pad;
+} params;
+layout(set = 0, binding = 3, std430) readonly buffer MaterialSim  { uint data[256]; } material_sim;
+layout(set = 0, binding = 4, std430) readonly buffer SimActiveBuf { uint data[]; } sim_active;
+layout(set = 0, binding = 5, std430) readonly buffer SlotList     { int  data[]; } slot_list;
+
+const uint SIM_GRANULAR = 1u;
+
+void main() {
+    int chunk_idx  = int(gl_WorkGroupID.x) / 4;
+    int wg_x_local = int(gl_WorkGroupID.x) % 4;
+    if (chunk_idx >= params.chunk_count) return;
+
+    int cs = params.chunk_size;
+    ivec3 local_pos = ivec3(
+        wg_x_local * 8 + int(gl_LocalInvocationID.x),
+        int(gl_WorkGroupID.y) * 8 + int(gl_LocalInvocationID.y),
+        int(gl_WorkGroupID.z) * 8 + int(gl_LocalInvocationID.z)
+    );
+    if (any(greaterThanEqual(local_pos, ivec3(cs)))) return;
+
+    int slot = slot_list.data[chunk_idx];
+    if (slot < 0) return;
+
+    int vpc        = cs * cs * cs;
+    int local_flat = local_pos.z * cs * cs + local_pos.y * cs + local_pos.x;
+    uint voxel     = voxels.data[slot * vpc + local_flat];
+    uint mat_id    = voxel & 0xFFu;
+    if (mat_id == 0u) return;
+
+    // Granular voxels that moved this simulation tick are in-flight particles -- skip.
+    if (material_sim.data[mat_id] == SIM_GRANULAR) {
+        if (sim_active.data[slot * vpc + local_flat] != 0u)
+            return;
+    }
+
+    bool exposed = false;
+    int ndx[6] = int[6]( 1,-1, 0, 0, 0, 0);
+    int ndy[6] = int[6]( 0, 0, 1,-1, 0, 0);
+    int ndz[6] = int[6]( 0, 0, 0, 0, 1,-1);
+    for (int i = 0; i < 6 && !exposed; ++i) {
+        int nx = local_pos.x + ndx[i];
+        int ny = local_pos.y + ndy[i];
+        int nz = local_pos.z + ndz[i];
+        if (nx < 0 || nx >= cs || ny < 0 || ny >= cs || nz < 0 || nz >= cs) {
+            exposed = true;
+        } else {
+            int nflat = nz * cs * cs + ny * cs + nx;
+            if ((voxels.data[slot * vpc + nflat] & 0xFFu) == 0u)
+                exposed = true;
+        }
+    }
+    if (!exposed) return;
+
+    int stride   = 1 + params.max_per_chunk;
+    int out_base = chunk_idx * stride;
+    uint out_idx = atomicAdd(surface_out.data[out_base], 1u);
+    if (int(out_idx) < params.max_per_chunk)
+        surface_out.data[out_base + 1 + int(out_idx)] = uint(local_flat) | (mat_id << 16u);
+}

@@ -1,0 +1,56 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Zeros voxels_b for every active chunk slot before each granular sim dispatch.
+// Required so atomicCompSwap(voxels_b[dest], 0u, my_voxel) in granular_sim.comp
+// correctly treats 0u as "unclaimed" rather than comparing against stale frame data.
+// Dispatch dimensions match granular_sim: (active_count * 4, 4, 4) workgroups.
+
+layout(set = 0, binding = 1, std430) buffer VoxelBufB { uint data[]; } voxels_b;
+layout(set = 0, binding = 2, std430) readonly buffer ChunkTable { int data[]; } chunk_table;
+layout(set = 0, binding = 3, std430) readonly buffer SimParams {
+    int chunk_size;
+    int grid_min_x; int grid_min_y; int grid_min_z;
+    int grid_span_x; int grid_span_y; int grid_span_z;
+    int frame;
+} params;
+layout(set = 0, binding = 4, std430) buffer SimActiveBuf { uint data[]; } sim_active;
+layout(set = 0, binding = 6, std430) readonly buffer ChunkList {
+    int data[];
+} chunk_list;
+
+void main() {
+    int cs  = params.chunk_size;
+    int vpc = cs * cs * cs;
+
+    int chunk_idx  = int(gl_WorkGroupID.x) / 4;
+    int wg_x_local = int(gl_WorkGroupID.x) % 4;
+
+    ivec3 local_pos = ivec3(
+        wg_x_local * 8 + int(gl_LocalInvocationID.x),
+        int(gl_WorkGroupID.y) * 8 + int(gl_LocalInvocationID.y),
+        int(gl_WorkGroupID.z) * 8 + int(gl_LocalInvocationID.z)
+    );
+    if (any(greaterThanEqual(local_pos, ivec3(cs)))) return;
+
+    ivec3 chunk_pos = ivec3(
+        chunk_list.data[chunk_idx * 3],
+        chunk_list.data[chunk_idx * 3 + 1],
+        chunk_list.data[chunk_idx * 3 + 2]
+    );
+
+    ivec3 lcp = chunk_pos - ivec3(params.grid_min_x, params.grid_min_y, params.grid_min_z);
+    if (lcp.x < 0 || lcp.x >= params.grid_span_x ||
+        lcp.y < 0 || lcp.y >= params.grid_span_y ||
+        lcp.z < 0 || lcp.z >= params.grid_span_z) return;
+
+    int tbl  = lcp.z * params.grid_span_x * params.grid_span_y
+             + lcp.y * params.grid_span_x
+             + lcp.x;
+    int slot = chunk_table.data[tbl];
+    if (slot < 0) return;
+
+    int local_flat = local_pos.z * cs * cs + local_pos.y * cs + local_pos.x;
+    voxels_b.data[slot * vpc + local_flat]    = 0u;
+    sim_active.data[slot * vpc + local_flat]  = 0u;
+}

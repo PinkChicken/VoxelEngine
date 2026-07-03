@@ -1,0 +1,108 @@
+[gd_scene format=3 uid="uid://ba1kr3sge0ly8"]
+
+[ext_resource type="Script" uid="uid://c2u3ym3jbtb6p" path="res://world.gd" id="1_f3sb7"]
+[ext_resource type="PackedScene" uid="uid://dslr7dp27btmf" path="res://Player/player.tscn" id="2_aqk2v"]
+[ext_resource type="Script" uid="uid://dyny60i3gp4g4" path="res://Utils/terrain_getter.gd" id="4_aqk2v"]
+[ext_resource type="Script" uid="uid://bj1af4npflt6d" path="res://Chunks/chunk_manager.gd" id="5_036b0"]
+[ext_resource type="Script" uid="uid://cr3l7c1h1fgbk" path="res://RaymarchRenderer.gd" id="6_udhof"]
+[ext_resource type="Script" uid="uid://omgbilnjorqk" path="res://material_db.gd" id="8_udhof"]
+[ext_resource type="Script" uid="uid://bvhm71jy51ba6" path="res://HUD/hot_bar.gd" id="9_hotbar"]
+[ext_resource type="Script" uid="uid://d2v6l0q3qshsc" path="res://simulations/simulation_runtime.gd" id="9_wse8f"]
+[ext_resource type="Script" uid="uid://b3ee10d6jlmm0" path="res://simulations/granular_simulation.gd" id="10_ic0uy"]
+[ext_resource type="Script" uid="uid://dotkgnjtfs2ma" path="res://WorldOrchestrator.gd" id="10_orch"]
+[ext_resource type="Script" uid="uid://cq6mfktou74w" path="res://simulations/fluid_simulation.gd" id="12_fluid"]
+
+[sub_resource type="Environment" id="Environment_tlwt5"]
+background_color = Color(0.59273976, 0.6228167, 0.9117132, 1)
+ambient_light_source = 1
+ambient_light_color = Color(0.7750634, 0.7750634, 0.7750634, 1)
+ssao_radius = 0.91
+ssao_intensity = 2.61
+ssao_horizon = 0.15
+ssao_sharpness = 0.29
+ssil_enabled = true
+ssil_radius = 1.55
+ssil_intensity = 0.0
+sdfgi_enabled = true
+sdfgi_use_occlusion = true
+sdfgi_bounce_feedback = 0.25
+fog_mode = 1
+fog_density = 0.245
+fog_height_density = -0.32
+
+[sub_resource type="FastNoiseLite" id="FastNoiseLite_wse8f"]
+noise_type = 3
+frequency = 0.0215
+
+[sub_resource type="FastNoiseLite" id="FastNoiseLite_ic0uy"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_aqk2v"]
+emission_enabled = true
+emission = Color(0.29037607, 0.54563767, 0.9603248, 1)
+emission_energy_multiplier = 8.91
+
+[sub_resource type="SphereMesh" id="SphereMesh_036b0"]
+material = SubResource("StandardMaterial3D_aqk2v")
+
+[node name="world" type="Node3D" unique_id=1581475882]
+script = ExtResource("1_f3sb7")
+
+[node name="CharacterBody3D" parent="." unique_id=56992831 instance=ExtResource("2_aqk2v")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 22, 0)
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1316435791]
+environment = SubResource("Environment_tlwt5")
+
+[node name="Terrain" type="Node" parent="." unique_id=1858831734]
+script = ExtResource("4_aqk2v")
+base_height = -2.0
+primary_noise = SubResource("FastNoiseLite_wse8f")
+primary_amplitude = 4.0
+detail_noise = SubResource("FastNoiseLite_ic0uy")
+
+[node name="ChunkManager" type="Node" parent="." unique_id=1418435786 node_paths=PackedStringArray("terrain")]
+script = ExtResource("5_036b0")
+terrain = NodePath("../Terrain")
+metadata/_custom_type_script = "uid://bj1af4npflt6d"
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=387717411]
+transform = Transform3D(0.3544869, 0.9350609, 1.483925e-07, -0.62446433, 0.2367377, 0.7443116, 0.6959766, -0.26384878, 0.6678325, 0, 0, 0)
+shadow_enabled = true
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=1977860028]
+transform = Transform3D(50, 0, 0, 0, 50, 0, 0, 0, 50, 163.35631, 236.48177, 163.90773)
+gi_mode = 2
+mesh = SubResource("SphereMesh_036b0")
+
+[node name="OmniLight3D" type="OmniLight3D" parent="MeshInstance3D" unique_id=525227257]
+light_energy = 5.963
+light_size = 0.032
+shadow_enabled = true
+omni_range = 15.19157
+
+[node name="WorldOrchestrator" type="Node" parent="." unique_id=2081347621]
+script = ExtResource("10_orch")
+
+[node name="SimulationRuntime" type="Node" parent="WorldOrchestrator" unique_id=1047747846]
+script = ExtResource("9_wse8f")
+metadata/_custom_type_script = "uid://d2v6l0q3qshsc"
+
+[node name="GranularSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=603403044]
+script = ExtResource("10_ic0uy")
+metadata/_custom_type_script = "uid://b3ee10d6jlmm0"
+
+[node name="FluidSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=603403045]
+script = ExtResource("12_fluid")
+watch_enabled = true
+watch_chunk = Vector3i(0, -3, 0)
+watch_local = Vector3i(0, 10, 0)
+
+[node name="MaterialDB" type="Node" parent="." unique_id=1815152731]
+script = ExtResource("8_udhof")
+
+[node name="RaymarchRenderer" type="Node" parent="." unique_id=234594842]
+script = ExtResource("6_udhof")
+debug_chunk_borders = true
+
+[node name="HotBar" type="CanvasLayer" parent="." unique_id=1070206372]
+script = ExtResource("9_hotbar")

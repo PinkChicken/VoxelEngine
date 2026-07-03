@@ -1,0 +1,321 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Raymarch compute shader: DDA traversal through a voxel slab.
+// For each pixel, casts a ray using Amanatides & Woo's grid traversal,
+// finds the first solid voxel, computes face-normal lighting and depth.
+// Outputs debug info for the pixel under the cursor (binding 7).
+
+layout(set = 0, binding = 0, std430) buffer VoxelBuffer  { uint data[]; } voxels;
+layout(set = 0, binding = 1, std430) buffer Params {
+    int chunk_size;
+    int screen_width;
+    int screen_height;
+    int span_x;
+    int min_chunk_x;
+    int min_chunk_y;
+    int min_chunk_z;
+    int data_count;
+    int span_y;
+    int span_z;
+    float voxel_scale;
+    float slab_min_x;
+    float slab_min_y;
+    float slab_min_z;
+    float slab_max_x;
+    float slab_max_y;
+    float slab_max_z;
+    int debug_pixel_x;
+    int debug_pixel_y;
+    int debug_chunk_flags; // bit 0 = chunk borders, bit 1 = active chunk tint
+} params;
+layout(set = 0, binding = 2, std430) buffer OutputBuffer { uint pixels[]; } output_buf;
+layout(set = 0, binding = 3, std430) buffer CameraData {
+    float origin_x, origin_y, origin_z;
+    float lower_left_x, lower_left_y, lower_left_z;
+    float horizontal_x, horizontal_y, horizontal_z;
+    float vertical_x, vertical_y, vertical_z;
+} camera;
+layout(set = 0, binding = 4, std430) buffer ChunkGridBuffer { int grid[]; } chunk_grid;
+layout(set = 0, binding = 5, std430) buffer ViewProjBuffer {
+    float vp00, vp01, vp02, vp03;
+    float vp10, vp11, vp12, vp13;
+    float vp20, vp21, vp22, vp23;
+    float vp30, vp31, vp32, vp33;
+} view_proj;
+layout(set = 0, binding = 6, std430) buffer MaterialBuffer { uint data[]; } materials;
+// Debug output: 32 bytes (8 uint32s) written by the pixel matching debug_pixel_x/y.
+// [0-2]=voxel_xyz, [3]=packed voxel (mat_id|fill|temp|flags), [4]=material_type, [5]=density floatBits, [6]=friction floatBits, [7]=ignition_temp floatBits
+layout(set = 0, binding = 7, std430) buffer DebugOutput {
+    uint debug_x;
+    uint debug_y;
+    uint debug_z;
+    uint debug_voxel;     // mat_id(0-7) | fill(8-15) | temp(16-23) | flags(24-31)
+    uint debug_type;      // material_type
+    uint debug_density;   // floatBits
+    uint debug_friction;  // floatBits
+    uint debug_ign_temp;  // ignition_temperature floatBits
+} debug;
+// Cursor output: 32 bytes written by the mouse-cursor pixel.
+// remove_pos = hit voxel (sentinel 0x7FFFFFFF = no hit), add_pos = adjacent voxel on entry face.
+layout(set = 0, binding = 8, std430) buffer CursorOutput {
+    int remove_x; int remove_y; int remove_z; int _pad0;
+    int add_x;    int add_y;    int add_z;    int _pad1;
+} cursor_out;
+// Active chunks for debug overlay. count + xyz triplets (3 ints per chunk).
+layout(set = 0, binding = 9, std430) readonly buffer ActiveChunksBuf {
+    int count;
+    int positions[];
+} active_chunks_buf;
+// Collision chunks for debug overlay (bit 2 of debug_chunk_flags). Same format as active_chunks_buf.
+layout(set = 0, binding = 10, std430) readonly buffer CollisionChunksBuf {
+    int count;
+    int positions[];
+} collision_chunks_buf;
+
+void main() {
+    uint px = gl_GlobalInvocationID.x;
+    uint py = gl_GlobalInvocationID.y;
+    if (int(px) >= params.screen_width || int(py) >= params.screen_height) return;
+
+    vec3 ray_origin = vec3(camera.origin_x, camera.origin_y, camera.origin_z);
+    vec3 lower_left = vec3(camera.lower_left_x, camera.lower_left_y, camera.lower_left_z);
+    vec3 horizontal = vec3(camera.horizontal_x, camera.horizontal_y, camera.horizontal_z);
+    vec3 vertical   = vec3(camera.vertical_x,   camera.vertical_y,   camera.vertical_z);
+
+    float u = float(px) / float(params.screen_width);
+    float v = float(py) / float(params.screen_height);
+    vec3 ray_dir = normalize(lower_left + u * horizontal + v * vertical - ray_origin);
+
+    int chunk_size = params.chunk_size;
+    float chunk_size_f = float(chunk_size);
+    float voxel_scale = params.voxel_scale;
+    vec3 ray_inv_dir = 1.0 / ray_dir;
+
+    // Slab AABB intersection
+    float entry_t = 0.0, exit_t = 1e30;
+    {
+        vec3 slab_min = vec3(params.slab_min_x, params.slab_min_y, params.slab_min_z);
+        vec3 slab_max = vec3(params.slab_max_x, params.slab_max_y, params.slab_max_z);
+
+        float t_near_x = (slab_min.x - ray_origin.x) * ray_inv_dir.x;
+        float t_far_x  = (slab_max.x - ray_origin.x) * ray_inv_dir.x;
+        if (t_near_x > t_far_x) { float tmp = t_near_x; t_near_x = t_far_x; t_far_x = tmp; }
+        float t_near_y = (slab_min.y - ray_origin.y) * ray_inv_dir.y;
+        float t_far_y  = (slab_max.y - ray_origin.y) * ray_inv_dir.y;
+        if (t_near_y > t_far_y) { float tmp = t_near_y; t_near_y = t_far_y; t_far_y = tmp; }
+        float t_near_z = (slab_min.z - ray_origin.z) * ray_inv_dir.z;
+        float t_far_z  = (slab_max.z - ray_origin.z) * ray_inv_dir.z;
+        if (t_near_z > t_far_z) { float tmp = t_near_z; t_near_z = t_far_z; t_far_z = tmp; }
+        entry_t = max(max(t_near_x, t_near_y), t_near_z);
+        exit_t  = min(min(t_far_x, t_far_y), t_far_z);
+    }
+
+    uint out_color = 0xFF1A1A2Eu;
+    float out_depth = 0.0;
+    bool is_debug_pixel = (int(px) == params.debug_pixel_x && int(py) == params.debug_pixel_y);
+
+    // Default cursor to no-hit sentinel; overwritten on hit below.
+    if (is_debug_pixel) {
+        cursor_out.remove_x = 0x7FFFFFFF;
+    }
+
+    if (entry_t <= exit_t) {
+        float t = max(entry_t, 1.0e-6);
+        vec3 world_pos = ray_origin + t * ray_dir;
+        ivec3 voxel_pos = ivec3(floor(world_pos / voxel_scale));
+        ivec3 step_dir = ivec3(sign(ray_dir));
+        vec3 delta_t = abs(voxel_scale / ray_dir);
+
+        vec3 t_max;
+        if (step_dir.x > 0) t_max.x = ((float(voxel_pos.x) + 1.0) * voxel_scale - world_pos.x) * abs(ray_inv_dir.x);
+        else if (step_dir.x < 0) t_max.x = (world_pos.x - float(voxel_pos.x) * voxel_scale) * abs(ray_inv_dir.x);
+        else t_max.x = 1e30;
+        if (step_dir.y > 0) t_max.y = ((float(voxel_pos.y) + 1.0) * voxel_scale - world_pos.y) * abs(ray_inv_dir.y);
+        else if (step_dir.y < 0) t_max.y = (world_pos.y - float(voxel_pos.y) * voxel_scale) * abs(ray_inv_dir.y);
+        else t_max.y = 1e30;
+        if (step_dir.z > 0) t_max.z = ((float(voxel_pos.z) + 1.0) * voxel_scale - world_pos.z) * abs(ray_inv_dir.z);
+        else if (step_dir.z < 0) t_max.z = (world_pos.z - float(voxel_pos.z) * voxel_scale) * abs(ray_inv_dir.z);
+        else t_max.z = 1e30;
+
+        int slab_voxel_min_x = int(params.slab_min_x / voxel_scale);
+        int slab_voxel_max_x = int(params.slab_max_x / voxel_scale);
+        int slab_voxel_min_y = int(params.slab_min_y / voxel_scale);
+        int slab_voxel_max_y = int(params.slab_max_y / voxel_scale);
+        int slab_voxel_min_z = int(params.slab_min_z / voxel_scale);
+        int slab_voxel_max_z = int(params.slab_max_z / voxel_scale);
+
+        ivec3 current_chunk = ivec3(-999);
+        int cached_chunk_index = -1;
+        uint cached_buffer_offset = 0u;
+        int hit_face_axis = 0;
+
+        for (int i = 0; i < 512; i++) {
+            ivec3 step_chunk;
+            step_chunk.x = int(floor(float(voxel_pos.x) / chunk_size_f));
+            step_chunk.y = int(floor(float(voxel_pos.y) / chunk_size_f));
+            step_chunk.z = int(floor(float(voxel_pos.z) / chunk_size_f));
+
+            if (step_chunk.x != current_chunk.x || step_chunk.y != current_chunk.y || step_chunk.z != current_chunk.z) {
+                current_chunk = step_chunk;
+                ivec3 grid_coords = current_chunk - ivec3(params.min_chunk_x, params.min_chunk_y, params.min_chunk_z);
+                if (grid_coords.x >= 0 && grid_coords.x < params.span_x &&
+                    grid_coords.y >= 0 && grid_coords.y < params.span_y &&
+                    grid_coords.z >= 0 && grid_coords.z < params.span_z) {
+                    cached_chunk_index = chunk_grid.grid[grid_coords.z * params.span_x * params.span_y
+                                                        + grid_coords.y * params.span_x
+                                                        + grid_coords.x];
+                    cached_buffer_offset = uint(max(cached_chunk_index, 0)) * uint(chunk_size * chunk_size * chunk_size);
+                } else {
+                    cached_chunk_index = -1;
+                }
+            }
+
+            if (cached_chunk_index >= 0) {
+                ivec3 local_voxel_pos = voxel_pos - current_chunk * chunk_size;
+                uint local_buffer_index = uint((local_voxel_pos.z * chunk_size + local_voxel_pos.y) * chunk_size + local_voxel_pos.x);
+                uint voxel_raw = voxels.data[cached_buffer_offset + local_buffer_index];
+                uint mat_id = voxel_raw & 0xFFu;
+
+                if (mat_id != 0u) {
+                    uint packed_color = materials.data[mat_id * 8u + 0u];
+                    uint red   = packed_color & 0xFFu;
+                    uint green = (packed_color >> 8u) & 0xFFu;
+                    uint blue  = (packed_color >> 16u) & 0xFFu;
+
+                    // Tint LIQUID voxels by fill level: full (255) = normal colour,
+                    // partial fill = darker, so low-fill water reads clearly as shallow.
+                    {
+                        uint mat_phase = materials.data[mat_id * 8u + 2u];
+                        if (mat_phase == 1u) {
+                            float fill_t = float((voxel_raw >> 8u) & 0xFFu) / 255.0;
+                            float tint   = 0.4 + 0.6 * fill_t;
+                            red   = uint(float(red)   * tint);
+                            green = uint(float(green) * tint);
+                            blue  = uint(float(blue)  * tint);
+                        }
+                    }
+
+                    vec3 normal = vec3(0.0);
+                    if (hit_face_axis == 0) normal.x = -float(step_dir.x);
+                    else if (hit_face_axis == 1) normal.y = -float(step_dir.y);
+                    else normal.z = -float(step_dir.z);
+
+                    vec3 light_dir = normalize(vec3(0.3, 0.8, 0.5));
+                    float light = 0.35 + 0.65 * max(dot(normal, light_dir), 0.0);
+                    uint lit_r = uint(float(red) * light);
+                    uint lit_g = uint(float(green) * light);
+                    uint lit_b = uint(float(blue) * light);
+
+                    // Debug chunk overlay (bit 0 = borders, bit 1 = active tint, bit 2 = collision tint)
+                    if (params.debug_chunk_flags != 0) {
+                        if ((params.debug_chunk_flags & 2) != 0) {
+                            int n = min(active_chunks_buf.count, 256);
+                            for (int ai = 0; ai < n; ai++) {
+                                if (active_chunks_buf.positions[ai*3]   == current_chunk.x &&
+                                    active_chunks_buf.positions[ai*3+1] == current_chunk.y &&
+                                    active_chunks_buf.positions[ai*3+2] == current_chunk.z) {
+                                    lit_r = min(255u, lit_r / 2u + 120u);
+                                    lit_g = lit_g / 4u;
+                                    lit_b = lit_b / 4u;
+                                    break;
+                                }
+                            }
+                        }
+                        if ((params.debug_chunk_flags & 4) != 0) {
+                            // Green tint = has collision shapes. Dim blue = no shapes yet.
+                            bool has_col = false;
+                            int nc = min(collision_chunks_buf.count, 256);
+                            for (int ci = 0; ci < nc; ci++) {
+                                if (collision_chunks_buf.positions[ci*3]   == current_chunk.x &&
+                                    collision_chunks_buf.positions[ci*3+1] == current_chunk.y &&
+                                    collision_chunks_buf.positions[ci*3+2] == current_chunk.z) {
+                                    has_col = true;
+                                    break;
+                                }
+                            }
+                            if (has_col) {
+                                lit_r = lit_r / 4u;
+                                lit_g = min(255u, lit_g / 2u + 80u);
+                                lit_b = lit_b / 4u;
+                            } else {
+                                lit_r = lit_r / 4u;
+                                lit_g = lit_g / 4u;
+                                lit_b = min(255u, lit_b / 2u + 80u);
+                            }
+                        }
+                        if ((params.debug_chunk_flags & 1) != 0) {
+                            ivec3 lv = local_voxel_pos;
+                            int cs1 = chunk_size - 1;
+                            if (lv.x == 0 || lv.y == 0 || lv.z == 0 ||
+                                lv.x == cs1 || lv.y == cs1 || lv.z == cs1) {
+                                lit_r = 220u; lit_g = 220u; lit_b = 220u;
+                            }
+                        }
+                    }
+
+                    out_color = lit_r | (lit_g << 8u) | (lit_b << 16u) | (0xFFu << 24u);
+
+                    mat4 vp_mat = mat4(
+                        view_proj.vp00, view_proj.vp01, view_proj.vp02, view_proj.vp03,
+                        view_proj.vp10, view_proj.vp11, view_proj.vp12, view_proj.vp13,
+                        view_proj.vp20, view_proj.vp21, view_proj.vp22, view_proj.vp23,
+                        view_proj.vp30, view_proj.vp31, view_proj.vp32, view_proj.vp33
+                    );
+                    vec4 clip_pos = vp_mat * vec4(ray_origin + t * ray_dir, 1.0);
+                    out_depth = 1.0 - (clip_pos.z / clip_pos.w * 0.5 + 0.5);
+                    out_depth = clamp(out_depth, 0.0, 1.0);
+
+                    if (is_debug_pixel) {
+                        debug.debug_x = uint(voxel_pos.x);
+                        debug.debug_y = uint(voxel_pos.y);
+                        debug.debug_z = uint(voxel_pos.z);
+                        debug.debug_voxel = voxel_raw;
+                        debug.debug_type = materials.data[mat_id * 8u + 4u];
+                        debug.debug_density = materials.data[mat_id * 8u + 5u];
+                        debug.debug_friction = materials.data[mat_id * 8u + 6u];
+                        debug.debug_ign_temp = materials.data[mat_id * 8u + 7u];
+                        ivec3 face_n = ivec3(0);
+                        if (hit_face_axis == 0) face_n.x = -step_dir.x;
+                        else if (hit_face_axis == 1) face_n.y = -step_dir.y;
+                        else face_n.z = -step_dir.z;
+                        cursor_out.remove_x = voxel_pos.x;
+                        cursor_out.remove_y = voxel_pos.y;
+                        cursor_out.remove_z = voxel_pos.z;
+                        cursor_out.add_x = voxel_pos.x + face_n.x;
+                        cursor_out.add_y = voxel_pos.y + face_n.y;
+                        cursor_out.add_z = voxel_pos.z + face_n.z;
+                    }
+                    break;
+                }
+            }
+
+            if (voxel_pos.x < slab_voxel_min_x - 1 || voxel_pos.x > slab_voxel_max_x ||
+                voxel_pos.y < slab_voxel_min_y - 1 || voxel_pos.y > slab_voxel_max_y ||
+                voxel_pos.z < slab_voxel_min_z - 1 || voxel_pos.z > slab_voxel_max_z) break;
+
+            if (t_max.x < t_max.y) {
+                if (t_max.x < t_max.z) { hit_face_axis = 0; t = t_max.x; voxel_pos.x += step_dir.x; t_max.x += delta_t.x; }
+                else                   { hit_face_axis = 2; t = t_max.z; voxel_pos.z += step_dir.z; t_max.z += delta_t.z; }
+            } else {
+                if (t_max.y < t_max.z) { hit_face_axis = 1; t = t_max.y; voxel_pos.y += step_dir.y; t_max.y += delta_t.y; }
+                else                   { hit_face_axis = 2; t = t_max.z; voxel_pos.z += step_dir.z; t_max.z += delta_t.z; }
+            }
+        }
+    }
+
+    if (is_debug_pixel && entry_t > exit_t) {
+        debug.debug_x = 0u;
+        debug.debug_y = 0u;
+        debug.debug_z = 0u;
+        debug.debug_voxel = 0u;
+        debug.debug_type = 0u;
+        debug.debug_density = 0u;
+        debug.debug_friction = 0u;
+        debug.debug_ign_temp = 0u;
+    }
+
+    uint total_pixels = uint(params.screen_width * params.screen_height);
+    output_buf.pixels[py * uint(params.screen_width) + px] = out_color;
+    output_buf.pixels[py * uint(params.screen_width) + px + total_pixels] = floatBitsToUint(out_depth);
+}

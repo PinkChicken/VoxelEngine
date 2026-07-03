@@ -1,0 +1,118 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// Applies a shaped edit (sphere/box/cylinder/capsule) directly to voxels_a.
+// Dispatched with ceil(aabb.xyz / 8) workgroups by EditDispatcher.
+// Also appends a changelog so the CPU can sync block_data without re-uploading chunks.
+
+layout(set = 0, binding = 0, std430) buffer VoxelBufA     { uint data[]; } voxels_a;
+layout(set = 0, binding = 1, std430) buffer EditChangelog  { uint count; uint entries[]; } changelog;
+layout(set = 0, binding = 2, std430) readonly buffer ChunkTableBuf { int data[]; } chunk_table;
+layout(set = 0, binding = 3, std430) readonly buffer EditParamsBuf { int data[]; } ep;
+
+// ep layout (int-indexed, each = 4 bytes):
+// [0..2]   center.xyz
+// [3]      shape_type
+// [4..7]   shape_params xyzw (float bits - use intBitsToFloat)
+// [8]      operation
+// [9]      material_id
+// [10..12] aabb_min.xyz
+// [13..15] aabb_size.xyz   (for bounds check - workgroups may overshoot)
+// [16..18] grid_min.xyz
+// [19..21] grid_span.xyz
+// [22]     chunk_size
+
+const int SHAPE_SPHERE   = 0;
+const int SHAPE_BOX      = 1;
+const int SHAPE_CYLINDER = 2;
+const int SHAPE_CAPSULE  = 3;
+
+const int OP_ADD     = 0;
+const int OP_REMOVE  = 1;
+const int OP_REPLACE = 2;
+
+const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGELOG_ENTRIES
+
+int world_to_flat(ivec3 pos) {
+    int   cs    = ep.data[22];
+    ivec3 gmin  = ivec3(ep.data[16], ep.data[17], ep.data[18]);
+    ivec3 gspan = ivec3(ep.data[19], ep.data[20], ep.data[21]);
+    // Chunk coordinate (floor division - matches GDScript _floor_div).
+    ivec3 cp = ivec3(floor(vec3(pos) / float(cs)));
+    ivec3 lp = pos - cp * cs;
+    ivec3 ti = cp - gmin;
+    if (any(lessThan(ti, ivec3(0))) || any(greaterThanEqual(ti, gspan))) return -1;
+    int slot = chunk_table.data[ti.x + ti.y * gspan.x + ti.z * gspan.x * gspan.y];
+    if (slot < 0) return -1;
+    int vpc = cs * cs * cs;
+    return slot * vpc + lp.z * cs * cs + lp.y * cs + lp.x;
+}
+
+float shape_sdf(vec3 d) {
+    int   shape = ep.data[3];
+    float sx    = intBitsToFloat(ep.data[4]);
+    float sy    = intBitsToFloat(ep.data[5]);
+    if (shape == SHAPE_SPHERE)
+        return length(d) - sx;
+    if (shape == SHAPE_BOX) {
+        float sz = intBitsToFloat(ep.data[6]);
+        vec3 q   = abs(d) - vec3(sx, sy, sz);
+        return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+    }
+    if (shape == SHAPE_CYLINDER)
+        return max(length(d.xz) - sx, abs(d.y) - sy);
+    if (shape == SHAPE_CAPSULE) {
+        vec3 q = d - vec3(0.0, clamp(d.y, -sy, sy), 0.0);
+        return length(q) - sx;
+    }
+    return 1.0;
+}
+
+void main() {
+    ivec3 tid       = ivec3(gl_GlobalInvocationID);
+    ivec3 aabb_size = ivec3(ep.data[13], ep.data[14], ep.data[15]);
+    if (any(greaterThanEqual(tid, aabb_size))) return;
+
+    ivec3 aabb_min = ivec3(ep.data[10], ep.data[11], ep.data[12]);
+    ivec3 gpos     = aabb_min + tid;
+    ivec3 center   = ivec3(ep.data[0], ep.data[1], ep.data[2]);
+
+    if (shape_sdf(vec3(gpos - center)) > 0.0) return;
+
+    int vidx = world_to_flat(gpos);
+    if (vidx < 0) return;
+
+    uint current = voxels_a.data[vidx];
+    uint mat_id  = current & 0xFFu;
+    int  op      = ep.data[8];
+    uint new_mat = uint(ep.data[9]);
+
+    uint new_voxel;
+    if (op == OP_ADD) {
+        if (mat_id == 0u) {
+            // Air → place new voxel at full fill.
+            new_voxel = new_mat | (255u << 8u);
+        } else if (mat_id == new_mat) {
+            // Same material already here — top up fill to 255.
+            // This lets holding left-click continuously add volume to low-fill liquid cells
+            // instead of silently skipping them (which caused dark, shallow-looking water).
+            uint old_fill = (current >> 8u) & 0xFFu;
+            if (old_fill >= 255u) return;
+            new_voxel = (current & 0xFFFF00FFu) | (255u << 8u);
+        } else {
+            return;  // occupied by a different material — skip
+        }
+    } else if (op == OP_REMOVE) {
+        if (mat_id == 0u) return;
+        new_voxel = 0u;
+    } else {
+        new_voxel = new_mat | (255u << 8u);
+    }
+
+    voxels_a.data[vidx] = new_voxel;
+    uint slot = atomicAdd(changelog.count, 1u);
+    if (slot < MAX_CHANGELOG) {
+        changelog.entries[slot * 2u]      = uint(vidx);
+        changelog.entries[slot * 2u + 1u] = new_voxel;
+    }
+}
