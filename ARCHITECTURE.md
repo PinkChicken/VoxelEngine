@@ -46,33 +46,20 @@ A chunk is a 32³ region of world space. Each chunk is a `StaticBody3D` for coll
 
 A voxel is the smallest addressable volume of world space. The voxel storage system has exactly one responsibility: **store the state of every addressable volume in the chunk.**
 
-Every voxel stores only state information that is unique to that location. Byte interpretation varies by material phase:
-
-**SOLID / GRANULAR voxels:**
+Every voxel stores only state information that is unique to that location. The byte layout is **uniform across every phase** — SOLID, GRANULAR, and LIQUID voxels all use the same 4-byte word (`Chunks/chunk_instance.gd`, `VOXEL_STRIDE = 4`):
 
 | Byte | Field | Range | Description |
 |------|-------|-------|-------------|
 | 0 | material_id | 0–255 | Maps to Material Database. 0 = AIR. |
-| 1 | fill | 0–255 | Always 255 for solids. Reserved for future sub-voxel solid density. |
-| 2 | temperature | −128..127 | Signed. Controlled by thermal simulation (Phase 8). |
+| 1 | fill | 0–255 | Always 255 for solids/granular. For LIQUID materials this byte is read as *pressure* by the fluid pipeline (0 = empty, becomes AIR) — same byte, phase-dependent interpretation, no separate voxel format. |
+| 2 | temperature | −128..127 | Signed (`encode_s8`/`decode_s8`). Controlled by thermal simulation (Phase 8, not yet built). |
 | 3 | flags | bit flags | Engine flags only (see Pillar 3). |
 
-**LIQUID / GAS voxels (Phase 7d+):**
-
-| Byte | Field | Range | Description |
-|------|-------|-------|-------------|
-| 0 | material_id | 0–255 | Water, oil, lava, smoke, etc. |
-| 1 | pressure | 0–255 | Amount of fluid in this cell. 0 = empty (becomes AIR). Drives flux physics. |
-| 2 | vx | −127..127 | Signed horizontal velocity in X. Packed as u8 (`vx + 127`). |
-| 3 | vz | −127..127 | Signed horizontal velocity in Z. |
-
-Rationale for LIQUID/GAS byte repurposing: per-liquid temperature is not meaningful (thermal sim treats all water at uniform conductivity); liquids carry no engine flags; velocity enables momentum, waves, and splash behavior. The thermal pass skips byte 2 for LIQUID/GAS voxels.
+**LIQUID voxels do not repurpose bytes 2/3 for velocity.** An earlier design (Phase 7d, superseded — see §Phase 7d/7e below) proposed packing per-voxel `vx`/`vz` into those bytes to give water momentum. It was scrapped before implementation in favor of a better fit: the fluid simulation (Phase 7e, "persistent flux") keeps its own private per-face flux buffer (`FluidSimulation._flux_buf`, one signed value per liquid voxel's owned +X/+Y/+Z face) that is *not zeroed between ticks* — each tick does `flux = decay(flux) + accel`, which is velocity integration with damping. That buffer, not the voxel word, is where momentum lives. This keeps temperature/flags meaningful for every voxel uniformly and avoids a phase-conditional voxel format.
 
 **AIR = 0u.** All air voxels are stored as exactly zero. This is critical for CAS operations in granular simulation and for the particle rebake path.
 
 **A voxel does NOT store material properties.** A voxel is a location with information — not a material.
-
-**AIR = 0u.** All air voxels are stored as exactly zero. This is critical for CAS operations in simulation.
 
 #### Pillar 1.1 — Material Database
 
@@ -85,7 +72,7 @@ Rationale for LIQUID/GAS byte repurposing: per-liquid temperature is not meaning
 | id | int | 0-255, unique identifier |
 | name | String | Display name |
 | phase | Phase | Physical state: SOLID / LIQUID / GAS / EFFECT |
-| simulation | SimulationClass | How the engine moves it: STATIC / GRANULAR / LIQUID / GAS / EFFECT |
+| simulation | SimulationClass | How the engine moves it: NONE / GRANULAR / LIQUID / GAS / EFFECT |
 | gravity | GravityMode | NONE / DOWN / UP / NEUTRAL |
 | color | Color | RGBA (alpha = transparency) |
 
@@ -131,76 +118,64 @@ const SIM_BITS: Array[int] = [0, 1, 2, 4, 8]  # indexed by SimulationClass value
 
 ---
 
-### Pillar 2 — The Orchestrator (Single Authority)
+### Pillar 2 — Player Edits: EditDispatcher (Single Authority for Edits)
 
-The Orchestrator is the only code allowed to write to `Chunk.block_data`. No simulation system (Fluid, Fire, Physics, Player) may directly call `chunk.set_voxel()`.
+**This section originally described a `VoxelMutation` + `commit()` transaction manager on `WorldOrchestrator` — that machinery still exists in the file (`class VoxelMutation`, `submit_mutation`, `submit_mutation_direct`, `submit_batch`, `commit()`) but is currently dead code: nothing in the codebase calls any of those functions.** It was superseded by `EditDispatcher` without being deleted. Left in this doc as historical record of the original design intent (priority-based conflict resolution between systems writing the same voxel), in case a future need for cross-system arbitration (e.g. an actual Fire simulation contesting a voxel with Fluid) brings it back — but treat it as unreferenced until then, not as the active edit path.
 
-**Why:** In the previous architecture, Fluid, Fire, and the Player all wrote to the same bytes simultaneously. The Orchestrator eliminates this by acting as a transaction manager.
+**What's actually the single writer for player edits today:** `EditDispatcher` (child of `WorldOrchestrator`, `simulations/edit_dispatcher.gd`). Every player tool (`ChunkManager.spawn_sand_sphere`/`remove_sphere`/single-voxel add-remove) calls one of `WorldOrchestrator.edit_add_voxel` / `edit_remove_voxel` / `edit_add_sphere` / `edit_remove_sphere`, which all forward into `EditDispatcher`. No other system calls `chunk.set_voxel()` at runtime except `Chunk`'s own terrain-generation code (which owns `block_data` outright before any GPU buffer exists, so there's no writer conflict to arbitrate yet).
 
-#### 2.1 The Mutation Request
-
-Instead of direct writes, systems submit a `VoxelMutation`:
+#### 2.1 EditRequest and dispatch
 
 ```gdscript
-class VoxelMutation:
-	var chunk_pos: Vector3i
-	var local_idx: int
-	var material_id: int   # -1 means "no change"
-	var fill: int          # -1 means "no change"
-	var temperature: int   # -1 means "no change"
-	var flags: int         # -1 means "no change"
-	var priority: int      # HIGH, NORMAL, LOW (used for conflict resolution)
+class EditRequest:
+	var center:       Vector3i
+	var shape_type:   int          # EditShape: SPHERE / BOX / CYLINDER / CAPSULE
+	var shape_params: Vector4      # e.g. SPHERE: (radius, 0, 0, 0)
+	var operation:    int          # EditOp: ADD / REMOVE / REPLACE
+	var material_id:  int
+	var priority:     int = 0      # unused by any current caller
 ```
 
-#### 2.2 The Commit Phase
+Two dispatch modes:
+- **`apply_immediate(req)`** — dispatches `edit_apply.comp` this frame, synchronously (`_compute.submit(); _compute.sync()`). Used for single-voxel add/remove (`edit_add_voxel`/`edit_remove_voxel`) and any tool that needs its result visible the same frame.
+- **`queue_edit(req)`** → drained by `process_queue()` (called from `WorldOrchestrator._process()` before simulation runs), rate-limited to `EDIT_BUDGET_VOXELS = 32768` voxels/frame so a huge sphere spawn can't spike a single frame. Used for sphere add/remove.
 
-Once per frame (after all systems have finished their `compute()` phase), the Orchestrator executes:
+`edit_apply.comp` writes **directly into `_voxel_buf_a`** (bound as `get_voxel_buf()`), not through a scratch buffer or the shared changelog/patch path — an edit is one shape written by one dispatch, not thousands of independently-racing threads, so there's no CAS/conflict problem to solve the way granular/fluid have. `EditDispatcher` keeps its *own private* `_changelog_buf` (separate RID from `WorldOrchestrator`'s), used only to discover which chunks the edit touched (`extract_changed_chunks` → mask/dirty-chunk bookkeeping) — not to apply values, since the shader already wrote them straight to `_voxel_buf_a`. After each dispatch it emits `_orchestrator.chunks_committed.emit(positions)` itself, same convention as the GPU simulations (Pillar 3).
 
-1. **Validation:** Clamps fill to 0–255, ensures material_id is valid, bounds-checks the chunk.
-2. **Conflict Resolution:** If two systems (e.g., Fluid and Fire) try to write to the same voxel in the same frame, the Orchestrator decides who wins based on priority (e.g., Fire spreading into water → water wins, cooling it).
-3. **Commit:** Writes the final resolved values to `block_data`.
-4. **Post-Commit:** Marks the chunk as `DIRTY_MESH` (so the renderer re-uploads 128KB) and triggers the chunk_table slot update if the material changed to/from AIR.
+#### 2.2 block_data staleness for edits
 
-#### 2.3 Why This Fixes the Old Bugs
+- `edit_add_voxel`/`edit_remove_voxel` (single-voxel, `apply_immediate` path) additionally call `_write_voxel_block_data()` synchronously, so `query_voxel_material()` reflects single-voxel player edits immediately.
+- `edit_add_sphere`/`edit_remove_sphere` (`queue_edit` path) do **not** touch `block_data` at all. A spawned/removed sphere is only visible in `_voxel_buf_a` (GPU) until some future full-chunk resync — which nothing currently triggers, since there is no save/load system implemented yet (see §2.3).
 
-The oscillation, CAS deadlocks, and order-dependent races were all caused by multiple writers competing over the same buffer. The Orchestrator eliminates this by:
+#### 2.3 block_data Ownership — no active sync budget
 
-- **Single writer:** Only the Orchestrator touches `block_data`. Period.
-- **Deferred writes:** Systems declare intent (mutations), not actions. The Orchestrator batches and resolves.
-- **Conflict resolution:** Priority-based arbitration prevents two systems from fighting over the same voxel.
-- **Deterministic order:** The Orchestrator enforces a strict execution order: Temperature → Fluids → Fire → Reactions.
+`Chunk.block_data` is a **CPU cache of GPU state**, not a real-time mirror. The GPU (`_voxel_buf_a`) is always authoritative at runtime. `block_data` is populated once at chunk generation and is otherwise stale during active gameplay, except for the single-voxel edit path above.
 
-#### 2.4 block_data Ownership and the Sync Budget
+`WorldOrchestrator` has two functions that exist specifically to refresh `block_data` from the GPU — **`sync_chunk_to_cpu(chunk_pos)`** (full-chunk download) and **`sync_block_data_from_buf(buf, count)`** (changelog-style incremental patch) — but **both currently have zero callers anywhere in the codebase**. They read as scaffolding for a save/load system that hasn't been built yet, not an active per-frame or per-save mechanism. There is no download-budget-gating mechanism in the current code (an earlier version of this doc described one that does not exist).
 
-`Chunk.block_data` is a **CPU cache of GPU state**, not a real-time mirror. The GPU (`_voxel_buf_a`) is always authoritative at runtime. block_data is populated once at generation and is otherwise stale during active gameplay.
-
-**Sole writer rule:** Only `WorldOrchestrator` writes to `block_data`. No simulation, editor tool, or player system may write directly. The legal paths are:
-
-| Path | When |
-|------|------|
-| `apply_mutation()` at chunk generation | One-time init — sets initial block_data from the generation loop |
-| `request_chunk_sync(chunk_pos)` | On-demand full sync: downloads the 128KB chunk slot from `_voxel_buf_a`, writes block_data, calls `rebuild_counts_and_mask()`. Budget-gated. |
-| `sync_block_data_from_buf(entries)` | Incremental: applies changelog `(flat_idx, new_value)` entries to block_data without a full download. O(changelog_size) writes, typically <<100 entries per active chunk. |
-
-**Download budget:** Both sync paths count against `_sync_budget_remaining` (reset each frame). Default: 4 full syncs OR 8 incremental syncs per frame. Excess requests are deferred to the next frame. `sync_all_for_save()` bypasses the budget — it runs once at save time over all loaded chunks.
-
-**Who requests syncs at runtime:** Nothing. `block_data` is no longer used for collision — `CollisionSystem` downloads only surface voxels via `extract_surface_voxels()` (GPU compute, compact). All other systems — rendering, simulation, cursor targeting, editing — read from GPU buffers or GPU readback results. `block_data` is only read for: initial GPU upload at generation, save-time full-chunk sync, and `query_voxel_material()` (single-voxel cursor hit, kept accurate for player edits only). No runtime system may access `block_data` expecting current simulation state.
+**Who reads `block_data` at runtime:** Nothing simulation-related. `CollisionSystem` never reads `block_data` for collision — it downloads only surface voxels via `extract_surface_voxels_batch()` (GPU compute, compact). Rendering, simulation, and cursor raycasting all read GPU buffers or GPU readback results directly. `block_data` is read only for: initial GPU upload at generation, and `query_voxel_material()` (single-voxel cursor hit — accurate for player single-voxel edits and terrain, stale for sphere edits and any simulation-moved material — acceptable since it's only used for projectile/cursor checks, not physics). No runtime system may access `block_data` expecting current simulation state.
 
 ---
 
 ### Pillar 3 — Simulation Runtime
 
-**How does the world change?** The runtime manages simulation lifecycles. Simulations own their own work state and propose mutations. The orchestrator commits.
+**How does the world change?** `SimulationRuntime` manages simulation lifecycles (which simulations are active, when they tick) but never touches voxel data itself. Voxel writes themselves all happen on the GPU now — there is no live CPU mutation pipeline (the `VoxelMutation`/`commit()` machinery on `WorldOrchestrator` still exists but has no callers, see Pillar 2). Three independent GPU dispatchers write voxel state, each following the same shape:
+
+- **`EditDispatcher`** (Pillar 2) — player edits, writes `edit_apply.comp` results directly into `_voxel_buf_a`.
+- **`GranularSimulation`** — sand, writes CAS moves into `_voxel_buf_b` (scratch) + the shared changelog, patched into `_voxel_buf_a` via `apply_changelog()`/`patch_apply.comp`.
+- **`FluidSimulation`** — water/oil (Phase 7e persistent flux), writes into its own private `_flux_buf` plus the shared changelog, same `apply_changelog()` patch step.
+
+All three read `_voxel_buf_a` for current state, and all three call `_orchestrator.chunks_committed.emit(changed)` themselves after their own dispatch — that signal is the one thing tying them together for scheduling purposes. `block_data` (the CPU cache) is untouched by all three except `EditDispatcher`'s single-voxel path (§2.2).
 
 #### Ownership table
 
 | System | Owns | Does NOT own |
 |---|---|---|
-| **ChunkManager** | Persistent voxel storage, chunk lifecycle | Simulation logic, mutation authority |
-| **SimulationRuntime** | Discovery (chunk scan on external commits), active simulation set, frame dispatch | Simulation state, geometry, mutation commit |
-| **SimulationContext** | Read-only world interface, mutation writer | Persistent state, candidate lists |
-| **Simulation** | Algorithm, all persistent algorithm state (frontiers, queues, graphs) | World state, scheduling decisions |
-| **WorldOrchestrator** | Mutation authority, conflict resolution, commit | Scheduling, simulation logic |
+| **ChunkManager** | Persistent voxel storage, chunk lifecycle | Simulation logic, voxel write authority |
+| **SimulationRuntime** | Active simulation set, fixed 60Hz tick scheduling, chunk-level candidate discovery on `chunks_committed` | Simulation state, geometry, voxel writes |
+| **EditDispatcher** | Player-edit GPU dispatch, its own private changelog (discovery-only) | Simulation scheduling, other systems' buffers |
+| **VoxelSimulation subclasses** (`GranularSimulation`, `FluidSimulation`) | All persistent algorithm state, their own GPU pipelines/buffers, changelog writes, `chunks_committed` emission for their own changes | Cross-simulation scheduling, `block_data` |
+| **WorldOrchestrator** | Shared GPU buffer ownership (`_voxel_buf_a/b`, `_changelog_buf`, etc.), changelog patch dispatch, `block_data` sole-writer discipline (mostly unexercised — see Pillar 2) | Simulation algorithms, scheduling |
 
 #### Scheduler invariants
 
@@ -209,164 +184,109 @@ The oscillation, CAS deadlocks, and order-dependent races were all caused by mul
 3. No simulation can lose work — once active, it stays until it reports done.
 4. Simulations own their notion of "unfinished" — the runtime only asks `has_work()`.
 5. The scheduler never understands physics.
-6. Discovery and residual work are separate: external commits trigger scanning; simulation-generated commits don't.
+6. Discovery is chunk-granular, not voxel-granular: the runtime scans committed chunks (plus their vertical/horizontal neighbors) for `active_simulation_mask()` bits, not individual voxels.
 
-#### Discovery vs. residual
+#### Discovery
 
-There are two kinds of work:
+`SimulationRuntime._on_chunks_committed()` fires on every `chunks_committed` emission — from `EditDispatcher` (player edits), `GranularSimulation`, and `FluidSimulation`, each emitting it themselves after their own GPU dispatch. For each committed chunk plus its 6 axis-aligned neighbors, it checks `chunk.active_simulation_mask()` (a per-chunk bitmask of which `SimulationClass`es have live voxels) and builds a per-simulation set of candidate **chunk positions** (not voxel positions — the GPU simulations dispatch per-chunk, not per-voxel). The committed chunk itself is always added regardless of mask state (the mask may be stale immediately after a fresh commit or chunk load); neighbors are still mask-gated. Each simulation with a non-empty candidate set gets `add_candidates(chunk_pos_list)` called and is added to `_active` if not already there.
 
-**Discovery** — triggered by external mutations (player edit, explosion, world load). The runtime scans the affected chunks once, builds per-simulation candidate lists, and calls `add_candidates()` on each simulation with non-empty results.
+There is no separate "residual work" concept in the runtime — `GranularSimulation` and `FluidSimulation` each track their own active-chunk sets internally (`_active_chunks` / equivalent) and keep ticking every frame while `has_work()` is true, independent of rediscovery.
 
-**Residual** — the simulation moved something; its frontier already contains the next positions to check. The simulation propagates this itself, without any re-scanning. `chunks_committed` fires for simulation-generated mutations too, but `GranularSimulation`'s frontier uses Dictionary set semantics — duplicate positions are a no-op, so residual re-discovery is harmless and free.
+#### SimulationRuntime — tick loop
 
-```
-External mutation (player places sand)
-      ↓ chunks_committed fires
-      ↓ runtime scans affected chunks → finds granular voxels
-      ↓ sim.add_candidates(positions)
-      ↓ sim added to _active
-
-Sand falls (simulation mutation)
-      ↓ chunks_committed fires
-      ↓ runtime scans → finds same sand (now at new position)
-      ↓ sim.add_candidates(positions) → already in Dictionary frontier → no-op
-      ↓ sim already in _active; frontier propagates naturally
-```
-
-#### SimulationRuntime — frame loop
-
-**On `chunks_committed`** (any commit — external or simulation):
-1. Scan each affected chunk (skip if `active_simulation_mask() == 0`)
-2. Build per-simulation candidate arrays from non-NONE voxels
-3. For each simulation with non-empty candidates: call `add_candidates()`, add to `_active` if not already there
-
-**Each frame (`run()`):**
-1. For each simulation in `_active`: call `sim.step(ctx)`, collect mutations
-2. After step: if `sim.has_work()` is false, remove from `_active`
-3. Return all mutations to WorldOrchestrator
-
-No regions. No AABBs. No TTLs. No geometry in the runtime.
-
-```
-chunks_committed
-      ↓
-SimulationRuntime scans once (active_simulation_mask fast path)
-      ↓
-sim.add_candidates(positions)     ← only for non-empty candidate lists
-      ↓
-_active set grows
-
-Each frame:
-  for sim in _active:
-      sim.step(ctx) → mutations
-      if not sim.has_work(): remove from _active
-```
-
-#### VoxelSimulation interface
+`SimulationRuntime.run(delta)` runs on a **fixed 60Hz accumulator** (`SIM_HZ = 60.0`, `MAX_CATCHUP = 1` tick per render frame — prevents spiral-of-death on a slow frame, at the cost of the simulation appearing to slow down under heavy load rather than trying to catch up):
 
 ```gdscript
-func get_simulation_class() -> int          # declares which SimulationClass this handles
-func add_candidates(chunk_positions: Array[Vector3i]) -> void  # runtime found relevant chunks
-func step(ctx: SimulationContext) -> void   # advance the simulation one frame
-func has_work() -> bool                     # false = runtime removes from active set
+func run(delta: float) -> void:
+    _accumulator += delta
+    var tick_dt := 1.0 / SIM_HZ
+    var ticks := 0
+    while _accumulator >= tick_dt and ticks < MAX_CATCHUP:
+        _accumulator -= tick_dt
+        ticks += 1
+        _tick()
+
+func _tick() -> void:
+    for sim in _active.duplicate():
+        sim.step()
+        # sim removed from _active if has_work() now false
 ```
 
-The simulation owns all persistent state. Example — `GranularSimulation` maintains a `Dictionary` frontier (Vector3i → true, set semantics). `add_candidates` merges positions in. `step` advances the frontier one level. `has_work` checks emptiness. No task IDs, no lifecycle ceremony, no coverage tracking.
+`step_once()` bypasses the accumulator entirely for manual single-stepping while paused (bound to Right Arrow in `world.gd`, `KEY_P` toggles `paused`).
+
+#### VoxelSimulation interface (actual, `simulations/voxel_simulation.gd`)
 
 ```gdscript
-func step(ctx: SimulationContext) -> void:
-    var next: Dictionary = {}
-    for pos in _frontier:
-        var below = pos + Vector3i.DOWN
-        if ctx.get_material_id(below) == 0:
-            ctx.emit_move(pos, below)
-            next[below] = true
-    _frontier = next
+func get_simulation_class() -> int                              # declares which SimulationClass this handles
+func add_candidates(_positions: Array[Vector3i]) -> void        # runtime found relevant chunks (chunk positions)
+func step() -> void                                              # advance one simulation tick — no context object
+func has_work() -> bool                                          # false = runtime removes from active set
 ```
 
-Adding a new simulation: extend `VoxelSimulation`, override `get_simulation_class()`, implement `add_candidates` / `step` / `has_work`, add as child of `SimulationRuntime`. Zero runtime changes.
+There is no `SimulationContext`, no `ctx.emit_move()`, no per-voxel mutation-emitting frontier algorithm — that was the Phase 3/4 CPU design, superseded once granular and fluid both became GPU compute dispatchers (Phase 5 / Phase 7e). `step()` takes no arguments: each simulation already holds its own `ComputeHelper`, pipeline, and buffer references from `_ready()`, and reads world/chunk state directly from `WorldOrchestrator`/`ChunkManager` references it cached at startup.
 
-#### SimulationContext — lightweight world view
+Adding a new simulation: extend `VoxelSimulation`, override the four methods above, register with `SimulationRuntime.register_simulation(self)` (called from `_ready()`), add as a child of `SimulationRuntime` in the scene tree.
 
-Created fresh each frame, owns no persistent data.
+#### Mutation commit — dead code, kept for history
 
-```gdscript
-ctx.get_material_id(world_pos)  # single-field read, resolves chunk internally
-ctx.get_material(material_id)   # → MaterialDef
-ctx.emit_move(from, to)         # queues atomic move as two mutations
-ctx.flush_mutations()           # returns queued mutations, clears buffer
-ctx.random() / ctx.frame()
-```
-
-`positions()` is removed — simulations own their frontiers.
-
-#### Mutation commit
-
-`WorldOrchestrator.commit()` is unchanged: conflict resolution (highest priority wins per world_pos), then `chunk.apply_mutation()` for each resolved mutation.
-
-```gdscript
-func commit():
-    for m in best.values():
-        var chunk = _chunk_manager.chunks.get(m.chunk_pos)
-        if not chunk: continue
-        var old_sim := _material_simulation[chunk.block_data[m.local_idx]]
-        var new_sim := _material_simulation[m.material_id]
-        if chunk.apply_mutation(m.local_idx, m.material_id, m.fill, m.temp, m.flags, old_sim, new_sim):
-            affected_chunks[m.chunk_pos] = true
-    chunks_committed.emit(positions)
-```
-
-Active regions are removed — `_expand_or_create_region` no longer called.
+`WorldOrchestrator.commit()` (conflict resolution by `priority` per `world_pos`, then `chunk.apply_mutation()` for each resolved mutation) still exists and is still correct GDScript, but nothing calls `submit_mutation`/`submit_mutation_direct`/`submit_batch` anywhere in the codebase, so it never runs. See Pillar 2's intro for why (superseded by `EditDispatcher` without being deleted).
 
 #### The three foundational pillars
 
-- **Pillar 1 — What exists?** Voxels stored in chunks. Each voxel is an addressable volume containing a material id and local state (fill, temperature, flags). The world is persistent.
+- **Pillar 1 — What exists?** Voxels stored in chunks. Each voxel is an addressable volume containing a material id and local state (fill, temperature, flags), same 4-byte layout for every phase. The world is persistent.
 - **Pillar 2 — What can exist?** Materials define physical identity and simulation class. The material database is the single source of truth for what a material is — not how it behaves.
-- **Pillar 3 — How does the world change?** External mutations trigger a chunk scan; the runtime delivers candidates to simulations. Simulations own their internal work state and propagate residuals without re-scanning. The orchestrator is the sole authority that commits mutations.
+- **Pillar 3 — How does the world change?** Three independent GPU dispatchers write voxel state — `EditDispatcher` (player edits), `GranularSimulation`, `FluidSimulation` — none of them via the CPU `VoxelMutation`/`commit()` machinery, which is currently unused. All three emit `chunks_committed` themselves, which drives chunk-granular discovery for `SimulationRuntime`'s fixed-timestep scheduler.
 
 ---
 
 ### Pillar 4 — GPU Buffer Architecture
 
-The voxel data lives in two places: `Chunk.block_data` (CPU, authoritative for collision/save/load) and `_voxel_buf` (GPU, authoritative for rendering and simulation). These must stay in sync through a controlled pipeline, not ad-hoc uploads.
+The voxel data lives in two places: `Chunk.block_data` (CPU, a lazily-refreshed cache — see Pillar 2 §2.3, nothing currently keeps it in sync at runtime) and `_voxel_buf_a`/`_voxel_buf_b` (GPU, authoritative for rendering and every simulation). Collision reads neither directly — it downloads surface voxels via a dedicated GPU extract pass (§4.1, `_surface_out_buf`).
 
-#### 4.1 Buffer Ownership (target state after Phase 5)
+#### 4.1 Buffer Ownership (current)
 
 | Buffer | Owner | Purpose |
 |--------|-------|---------|
-| `_voxel_buf_a` | WorldOrchestrator | Canonical GPU state. Renderer always binds this. Simulation reads this. Changelog sync writes back to this. |
-| `_voxel_buf_b` | WorldOrchestrator | Simulation scratch: GPU sim writes here only. Never read by renderer or CPU. Never swapped. |
+| `_voxel_buf_a` | WorldOrchestrator | Canonical GPU state. Renderer always binds this. All simulations read this. Changelog patch writes back to this. |
+| `_voxel_buf_b` | WorldOrchestrator | Simulation scratch: GPU sim writes here only (granular CAS). Never read by renderer or CPU. Never swapped. |
 | `_chunk_table` | WorldOrchestrator | Maps chunk positions → slot offsets in the voxel buffers. Shared by renderer and simulation. |
-| `_changelog_buf` | WorldOrchestrator | GPU-written list of `(global_voxel_idx, new_u32)` pairs. CPU downloads to patch `_voxel_buf_a` (via `patch_apply.comp`). |
-| `_surface_out_buf` | WorldOrchestrator | Output buffer for `surface_extract.comp`. Reused across calls. Layout: `u32 count` then `u32 entries[]` packed as `(local_flat_idx & 0xFFFF) \| (mat_id << 16)`. Max 65536 entries (64³). |
+| `_changelog_buf` | WorldOrchestrator | GPU-written list of `(flat_idx, new_value)` pairs, `atomicAdd`-appended by whichever shader is dispatching. CPU calls `apply_changelog()` to patch `_voxel_buf_a` via `patch_apply.comp` — a pure GPU→GPU operation, `block_data` is not involved. |
+| `_material_sim_buf` | WorldOrchestrator | 256 `u32`s: `material_id → SimulationClass`, flat GPU-side cache mirroring `_material_simulation` on the CPU. |
+| `_surface_out_buf` | WorldOrchestrator | Output buffer for `surface_extract.comp`. Reused across calls. Layout: `u32 count` then `u32 entries[]` packed as `(local_flat_idx & 0xFFFF) \| (mat_id << 16)`. |
 | `_surface_params_buf` | WorldOrchestrator | Persistent params buffer for `surface_extract.comp`: `chunk_size`, `slot`, `max_entries`, `_pad`. Updated per call. |
+| `_surface_slot_list_buf` | WorldOrchestrator | `int[SURFACE_EXTRACT_MAX_BATCH]` — one chunk slot per batched `surface_extract.comp` dispatch (`extract_surface_voxels_batch`, used by `CollisionSystem`/`VoxelMover`). |
 | `_sim_active_buf` | WorldOrchestrator | One `u32` per voxel slot (same indexing as `_voxel_buf_a`). Non-zero = grain moved this sim tick = treat as particle. Zeroed by `zero_slots.comp`, written to `1u` by `granular_sim.comp` `try_move()`, read by `surface_extract.comp` binding 4. Grown alongside voxel bufs on capacity expansion. |
-| `block_data` | Chunk (holds) / Orchestrator (sole writer) | CPU cache of GPU state. Populated once at chunk generation. NOT updated at runtime. Read only at save time and for `query_voxel_material()` (single-voxel cursor, kept current for player edits only). |
+| `_flux_buf` (private, **not** WorldOrchestrator) | `FluidSimulation` | Persistent per-face flux (Phase 7e — see §Phase 7e). Deliberately *not* exposed through `WorldOrchestrator` — Step 1 of Phase 7e moved this buffer, its growth path, and its freelist entirely into `FluidSimulation` since nothing else needs to touch it. |
+| `block_data` | Chunk (holds) / Orchestrator (sole writer) | CPU cache of GPU state. Populated once at chunk generation. NOT updated at runtime by any simulation, and only by the single-voxel `EditDispatcher` path for player edits. `sync_chunk_to_cpu`/`sync_block_data_from_buf` exist to refresh it but currently have no callers — no save/load system is implemented yet (see Pillar 2 §2.3). |
 
-**Why no swap:** The simulation shader dispatches only over active chunks. Non-active chunks are never written to `_voxel_buf_b`, so after a swap the renderer would see stale/zero data for them. Instead, `apply_changelog()` applies each changed voxel to `block_data` and immediately calls `_update_chunk_in_grid()` to upload the affected chunks to `_voxel_buf_a`. A stays canonical at all times; B is a permanent write-only scratch buffer.
+**Why no swap:** The granular shader dispatches only over active chunks. Non-active chunks are never written to `_voxel_buf_b`, so after a swap the renderer would see stale/zero data for them. Instead, every simulation writes to the shared changelog and `apply_changelog()` patches only the changed entries into `_voxel_buf_a` directly on the GPU (`patch_apply.comp`) — `block_data` is never touched by this path. A stays canonical at all times; B is a permanent write-only scratch buffer used only by granular's CAS step.
 
-**Current state (Phase 5 Step 5 complete):** `WorldOrchestrator` owns `_voxel_buf_a`, `_voxel_buf_b`, `_chunk_table`, `_changelog_buf`, and `_material_sim_buf`. The renderer is a pure consumer. GPU granular simulation is running. `swap_voxel_bufs()` exists but is not called — retained for potential future use in a full-world sim pass.
+**Current state:** `WorldOrchestrator` owns all buffers in the table above except `_flux_buf`. The renderer is a pure consumer (`_voxel_buf_a`, `_chunk_table`). GPU granular simulation (`granular_sim.comp`) and GPU fluid simulation (`fluid_flux.comp`, Phase 7e persistent flux) both run, each independently patching the changelog and emitting `chunks_committed`. `swap_voxel_bufs()` exists but is not called — retained for potential future use in a full-world sim pass.
 
-#### 4.2 The Frame Pipeline (Phase 5+)
+#### 4.2 The Frame Pipeline (current)
 
 ```
-Simulate:  GranularSimulation dispatches compute shader
-               reads  _voxel_buf_a   (canonical state)
-               writes _voxel_buf_b   (scratch — only active chunks written)
-               appends changelog     (what changed, compact)
+Simulate (granular): GranularSimulation dispatches compute shader
+                          reads  _voxel_buf_a   (canonical state)
+                          writes _voxel_buf_b   (scratch — only active chunks written)
+                          appends changelog     (what changed, compact)
 
-Sync:      CPU downloads changelog (~KB, not ~MB)
-               dispatches patch_apply.comp → writes entries to _voxel_buf_a
-               decodes dirty bitmask → affected chunk positions
-               updates active_simulation_mask() per chunk via new_value
-               fires chunks_committed → CollisionSystem dirty set
-               block_data NOT updated here — synced on demand by CollisionSystem
+Simulate (fluid):    FluidSimulation dispatches 3 fully-synced GPU passes per sub-step
+                          (Accelerate → Scale-Outflow/Inflow → Transport, see §Phase 7e)
+                          reads  _voxel_buf_a + its own private _flux_buf (persists across ticks)
+                          writes _flux_buf (Accelerate/Scale) and the changelog (Transport)
 
-Render:    RaymarchRenderer binds _voxel_buf_a
-               always canonical — no swap, no stale non-active chunks
+Patch:               CPU calls apply_changelog() (per simulation, after its dispatch)
+                          dispatches patch_apply.comp → writes changelog entries into _voxel_buf_a
+                          simulation determines its own changed-chunk list (dirty bitmask, etc.)
+                          simulation itself emits chunks_committed(changed) — drives SimulationRuntime discovery
+                          block_data NOT updated here — stays stale until save time
+
+Render:              RaymarchRenderer binds _voxel_buf_a
+                          always canonical — no swap, no stale non-active chunks
 ```
 
-Player mutations (place/remove voxel) still go through `WorldOrchestrator.commit()` — written to `block_data` and uploaded to `_voxel_buf_a` directly. They don't use the scratch-buffer path.
+Player edits (`EditDispatcher`) are conceptually a fourth path in this diagram but architecturally simpler than granular/fluid: `edit_apply.comp` writes straight into `_voxel_buf_a`, no scratch buffer or patch step needed (see Pillar 2 §2.1) — its private changelog exists purely for chunk-discovery bookkeeping, not for applying values.
 
 #### 4.3 Write Conflict Resolution — Checkerboard
 
@@ -377,15 +297,15 @@ GPU simulation runs thousands of threads in parallel. Two grains cannot both wri
 
 Adjacent cells never update in the same pass. No atomics needed. The cost is that grains update every other frame, which is invisible at 60fps.
 
-#### 4.4 GPU Discovery Scan
+#### 4.4 Chunk Discovery — CPU chunk-mask scan (GPU discovery still unimplemented)
 
-The CPU `_on_chunks_committed` scan (32,768 voxels per chunk per frame) is replaced by a GPU compute pass that scans `_voxel_buf_a` for non-NONE simulation voxels and writes candidate positions to an output buffer. The CPU reads back the list and calls `add_candidates`. This lands for free once `_voxel_buf` is no longer owned by the renderer.
+**This was never built as a GPU pass.** What actually replaced the old O(32,768 voxels/chunk/frame) CPU scan is chunk-*granularity*, not a GPU scan: `SimulationRuntime._on_chunks_committed()` checks `chunk.active_simulation_mask()` (a per-chunk bitmask kept current by the changelog patch path) for the committed chunk and its 6 neighbors, and only calls `add_candidates()` with chunk positions, never individual voxels (see Pillar 3 §Discovery). A true GPU-primary discovery pass (scan `_voxel_buf_a` on the GPU, write candidates to a buffer, CPU reads back the compact list) remains a planned, unimplemented optimization — tracked as "Opt-4 — GPU-primary chunk discovery" further down in §3.
 
 #### 4.5 Changelog Buffer
 
-Pre-allocated buffer holding `(global_voxel_idx: u32, new_value: u32)` pairs. An atomic counter at offset 0 tracks how many entries were written this frame. The simulation shader appends to this buffer using `atomicAdd`. At the end of the frame the CPU downloads the counter, then downloads exactly that many entries. Entries are applied to `block_data` in order.
+Pre-allocated buffer (`_changelog_buf`, `MAX_CHANGELOG_ENTRIES = 524288`) holding `(flat_idx: u32, new_value: u32)` pairs. An atomic counter at offset 0 tracks how many entries were written this dispatch. Whichever simulation shader is running appends to this buffer using `atomicAdd`. `WorldOrchestrator.apply_changelog()` downloads only the counter (4 bytes), then dispatches `patch_apply.comp` to apply exactly that many entries **directly into `_voxel_buf_a` on the GPU** — entries are never downloaded to the CPU and never applied to `block_data` on this path. `MAX_CHANGELOG_ENTRIES` must match the `MAX_CHANGELOG` constant baked into every shader that writes this buffer (`fluid_flux.comp`, `granular_sim.comp`, `edit_apply.comp`) — a mismatch silently wastes allocated capacity or lets a shader write past what's allocated.
 
-The changelog replaces `VoxelMutation` for simulation-generated changes. Player mutations remain CPU-authored and skip the changelog path entirely.
+The shared changelog is used by `GranularSimulation` and `FluidSimulation` to apply values via `patch_apply.comp`. `EditDispatcher` uses its own separate, privately-owned changelog buffer purely for chunk-discovery bookkeeping — `edit_apply.comp` already wrote the actual values straight into `_voxel_buf_a` itself. `VoxelMutation`/`commit()` is unused (see Pillar 2's intro).
 
 ---
 
