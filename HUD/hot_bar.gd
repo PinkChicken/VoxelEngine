@@ -1,7 +1,7 @@
 extends CanvasLayer
 
 const MATERIAL_IDS := [1, 2, 3, 4]
-const MATERIAL_NAMES := ["ROCK", "SAND", "WATER", "WOOD"]
+const MATERIAL_NAMES := ["ROCK", "SAND", "WATER", "GLASS"]
 
 var _player: CharacterBody3D
 var _material_db: MaterialDB

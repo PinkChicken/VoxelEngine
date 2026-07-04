@@ -80,12 +80,13 @@ func _default_materials() -> Array[MaterialDef]:
 	water.gravity = MaterialDef.GravityMode.DOWN
 	water.color = Color(0.2, 0.4, 0.9, 0.7)
 
-	var wood := MaterialDef.new()
-	wood.id = 4; wood.name = "WOOD"
-	wood.phase = MaterialDef.Phase.SOLID
-	wood.simulation = MaterialDef.SimulationClass.NONE
-	wood.gravity = MaterialDef.GravityMode.NONE
-	wood.color = Color(0.55, 0.35, 0.15, 1)
+	var glass := MaterialDef.new()
+	glass.id = 4; glass.name = "GLASS"
+	glass.phase = MaterialDef.Phase.SOLID
+	glass.simulation = MaterialDef.SimulationClass.NONE
+	glass.gravity = MaterialDef.GravityMode.NONE
+	glass.color = Color(0.75, 0.92, 0.97, 1)
+	glass.transparent = true
 
 	var fire := MaterialDef.new()
 	fire.id = 5; fire.name = "FIRE"
@@ -108,26 +109,29 @@ func _default_materials() -> Array[MaterialDef]:
 	oil.gravity = MaterialDef.GravityMode.DOWN
 	oil.color = Color(0.2, 0.15, 0.05, 0.85)
 
-	return [air, rock, sand, water, wood, fire, smoke, oil]
+	return [air, rock, sand, water, glass, fire, smoke, oil]
 
 
 func build_buffer() -> void:
 	if buffer_rid.is_valid():
 		_compute.free_rid(buffer_rid)
 
-	# GPU layout per material (32 bytes):
+	# GPU layout per material (36 bytes):
 	#   offset  0: packed RGBA8 color (u32)
 	#   offset  4: simulation class (u32)
 	#   offset  8: phase (u32)
 	#   offset 12: gravity mode (u32)
 	#   offset 16-31: reserved
+	#   offset 32: transparent flag (u32, 0/1) — raymarch.comp sees through non-edge
+	#              pixels of these voxels instead of terminating the ray (2026-07-04,
+	#              glass test-tube walls for visually verifying fluid U-tube behavior)
 	var data := PackedByteArray()
-	data.resize(max_materials * 32)
+	data.resize(max_materials * 36)
 	data.fill(0)
 
 	for def in materials:
-		var base = def.id * 32
-		if base < 0 or base + 32 > data.size():
+		var base = def.id * 36
+		if base < 0 or base + 36 > data.size():
 			continue
 		var col = def.color
 		var packed = (int(col.a8) << 24) | (int(col.b8) << 16) | (int(col.g8) << 8) | int(col.r8)
@@ -135,5 +139,6 @@ func build_buffer() -> void:
 		data.encode_u32(base + 4, def.simulation)
 		data.encode_u32(base + 8, def.phase)
 		data.encode_u32(base + 12, def.gravity)
+		data.encode_u32(base + 32, 1 if def.transparent else 0)
 
 	buffer_rid = _compute.buffer_upload(data)

@@ -1,7 +1,7 @@
 @tool
 class_name Chunk extends StaticBody3D
 
-enum Mat { AIR = 0, ROCK = 1, SAND = 2, WATER = 3, WOOD = 4, FIRE = 5, SMOKE = 6, OIL = 7 }
+enum Mat { AIR = 0, ROCK = 1, SAND = 2, WATER = 3, GLASS = 4, FIRE = 5, SMOKE = 6, OIL = 7 }
 const VOXEL_STRIDE := 4
 
 
@@ -150,7 +150,7 @@ const _MAT_COLORS := {
 	1: Color(0.45, 0.43, 0.42),  # ROCK  — dark grey
 	2: Color(0.87, 0.78, 0.50),  # SAND  — warm yellow
 	3: Color(0.25, 0.50, 0.85),  # WATER — blue
-	4: Color(0.48, 0.32, 0.18),  # WOOD  — brown
+	4: Color(0.75, 0.92, 0.97),  # GLASS — pale cyan
 	5: Color(1.00, 0.45, 0.10),  # FIRE  — orange
 	6: Color(0.60, 0.60, 0.60),  # SMOKE — grey
 	7: Color(0.15, 0.12, 0.08),  # OIL   — near-black

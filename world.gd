@@ -59,13 +59,15 @@ func _unhandled_input(event: InputEvent) -> void:
 			world_orchestrator.debug_dump_fluid_stats()
 			fluid_simulation.debug_dump_flux_stats()
 		elif event.keycode == KEY_F7:
-			pass
-		elif event.keycode == KEY_F9:
 			# Crosshair-driven fluid watch target (2026-07-02) — typing chunk/local
 			# coordinates into the Inspector by hand was too unreliable for isolating
 			# one misbehaving voxel found by eye. Reuses the same cursor raycast
 			# player_controller.gd already uses for add/remove voxel, so "look at the
-			# voxel, press F8" targets exactly what's under the crosshair.
+			# voxel, press V" targets exactly what's under the crosshair. Moved off F7
+			# (2026-07-07) — F6-F9 are Godot's own editor debug-menu shortcuts (step,
+			# breakpoint, etc.) and can steal window focus away from the running game
+			# depending on editor settings, which is exactly the opposite of what you
+			# want when you need to hit this key repeatedly without re-focusing.
 			var target = raymarch_renderer.get_cursor_remove_pos()
 			if target == null:
 				print("[FluidWatch] no voxel under cursor")

@@ -34,3 +34,4 @@ enum GravityMode {
 @export var simulation: int = SimulationClass.NONE
 @export var gravity: int = GravityMode.NONE
 @export var color: Color = Color.WHITE
+@export var transparent: bool = false

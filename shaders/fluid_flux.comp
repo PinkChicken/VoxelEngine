@@ -282,7 +282,17 @@ ivec2 resolve_page_local(ivec3 gpos, int cs, int vpc) {
 float compute_s_out(ivec3 gpos, int cs, int vpc) {
     ivec2 pl = resolve_page_local(gpos, cs, vpc);
     int page = pl.x, local = pl.y;
-    if (page < 0) return 1.0;  // no page: nothing to scale, cell contributes nothing anyway
+    // page < 0 means "not in THIS TICK's dispatch range" -- which includes chunks that
+    // genuinely hold real flux/fill from prior ticks but got temporarily unmapped because
+    // they're outside the 1-hop flux_list radius (see _build_flux_chunk_list). Returning
+    // 1.0 here ("assume full capacity") let a caller credit/debit fill against a cell that
+    // will never actually be dispatched to apply the matching side of the transfer this
+    // tick -- a real, silent mass leak (found while testing Build B, see docs/BUG_LOG.md,
+    // but structurally present here too since compute_s_out/compute_s_in can reach 2 hops
+    // from the dispatching thread while the dispatch range is only 1-hop wide). 0.0 =
+    // "unknown, assume no capacity, don't transport" -- stalls one tick at the boundary
+    // and self-heals once the frontier expands, same as the page-allocation fix above.
+    if (page < 0) return 0.0;
 
     uint v = read_a(gpos);
     uint fill = (v >> 8u) & 0xFFu;
@@ -312,7 +322,8 @@ float compute_s_out(ivec3 gpos, int cs, int vpc) {
 float compute_s_in(ivec3 gpos, int cs, int vpc) {
     ivec2 pl = resolve_page_local(gpos, cs, vpc);
     int page = pl.x, local = pl.y;
-    if (page < 0) return 1.0;
+    // See compute_s_out's identical page<0 case above -- same leak, same fix.
+    if (page < 0) return 0.0;
 
     uint v = read_a(gpos);
     uint fill = (v >> 8u) & 0xFFu;
