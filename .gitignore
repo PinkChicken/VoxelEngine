@@ -7,3 +7,7 @@
 Reference.pdf
 Reference_Two.pdf
 Reference_Three.pdf
+
+# Python bytecode cache (tools/fluid_prototypes/ and any future Python tooling)
+__pycache__/
+*.pyc
