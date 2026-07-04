@@ -1,8 +1,12 @@
 class_name FluidSimulation extends VoxelSimulation
 
 # GPU dispatcher for liquid simulation (water, oil) — Phase 7e persistent-flux pipeline.
-# Four passes per sub-step, all in fluid_flux.comp: Accelerate -> Scale-Outflow ->
-# Scale-Inflow -> Transport.
+# Two passes per sub-step, both in fluid_flux.comp: Accelerate -> Transport. (Was four
+# passes -- Accelerate -> Scale-Outflow -> Scale-Inflow -> Transport -- until Phase 7e
+# Step 9, 2026-07-06: Transport now recomputes each cell's conservation-scale factor
+# inline as a pure function of already-synced flux_buf/voxels_a data instead of reading it
+# back from a buffer a prior pass wrote, so the two Scale passes and their rewritten-lane
+# race-avoidance proof are gone entirely. See fluid_flux.comp's header comment.)
 # No CAS, no voxels_b scratch buffer — Transport writes the changelog directly, same
 # single-writer discipline as every other simulation.
 #
@@ -390,41 +394,28 @@ func step() -> void:
 	for _s in range(steps_per_tick):
 		_frame += 1
 
-		# Pass A (accelerate) -> Scale-Outflow -> Scale-Inflow -> Transport (writes
+		# Pass A (accelerate) -> Transport (fused conservation guard + apply, writes
 		# changelog). Persistent: flux_buf is never zeroed between ticks (see
-		# fluid_flux.comp header). Each pass reads data another workgroup wrote in the
-		# previous pass, so all four need their own submit+sync — a genuine
-		# cross-workgroup dependency, not just tidy separation. Scale-Inflow (added
-		# 2026-07-02) caps a voxel's total INCOMING flux at its remaining capacity
-		# (255-fill), symmetric to Scale-Outflow's existing cap on total OUTGOING flux at
-		# its own fill — without it, multiple donors could each individually stay within
-		# their own outflow budget while overcommitting a shared receiver, silently
-		# losing the excess to Transport's clamp. Must run as its own dispatch AFTER
-		# Scale-Outflow fully completes, not merged into it — see fluid_flux.comp's Scale-
-		# Inflow comment for why merging them would race. Transport is the only pass that
-		# touches the changelog, so it gets its own reset_changelog()/apply_changelog()
-		# pair immediately around its dispatch. Guard: flux_count can be 0 if all active
-		# chunks were unloaded since last step().
+		# fluid_flux.comp header). Transport reads flux_buf and voxels_a that Accelerate
+		# already finished writing, a genuine cross-workgroup dependency, so it still needs
+		# its own submit+sync after Accelerate — but that's the only cross-dispatch
+		# dependency left (Phase 7e Step 9, 2026-07-06: the old Scale-Outflow/Scale-Inflow
+		# passes are gone; Transport now recomputes their scale factors inline per-cell
+		# instead of reading them back from a buffer a prior pass wrote — see
+		# fluid_flux.comp's compute_s_out()/compute_s_in()). Transport is the only pass
+		# that touches the changelog, so it gets its own reset_changelog()/
+		# apply_changelog() pair immediately around its dispatch. Guard: flux_count can be
+		# 0 if all active chunks were unloaded since last step().
 		var flux_bitmask := zero_dirty  # default: no flux changes this sub-step
 		if flux_count > 0:
-			_upload_flux_params(grid_min, grid_span, _frame, 0)  # Pass A
-			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
-			_compute.submit()
-			_compute.sync()
-
-			_upload_flux_params(grid_min, grid_span, _frame, 1)  # Scale-Outflow
-			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
-			_compute.submit()
-			_compute.sync()
-
-			_upload_flux_params(grid_min, grid_span, _frame, 2)  # Scale-Inflow
+			_upload_flux_params(grid_min, grid_span, _frame, 0)  # Accelerate
 			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
 			_compute.submit()
 			_compute.sync()
 
 			_orchestrator.reset_changelog()
 			_compute.buffer_update(_dirty_chunks_buf, 0, zero_dirty)
-			_upload_flux_params(grid_min, grid_span, _frame, 3)  # Transport
+			_upload_flux_params(grid_min, grid_span, _frame, 1)  # Transport
 			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
 			_compute.submit()
 			_compute.sync()

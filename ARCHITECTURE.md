@@ -271,10 +271,11 @@ Simulate (granular): GranularSimulation dispatches compute shader
                           writes _voxel_buf_b   (scratch — only active chunks written)
                           appends changelog     (what changed, compact)
 
-Simulate (fluid):    FluidSimulation dispatches 3 fully-synced GPU passes per sub-step
-                          (Accelerate → Scale-Outflow/Inflow → Transport, see §Phase 7e)
+Simulate (fluid):    FluidSimulation dispatches 2 fully-synced GPU passes per sub-step
+                          (Accelerate → Transport, see §Phase 7e Step 9 — was 4 passes
+                          before 2026-07-06's pass-compression)
                           reads  _voxel_buf_a + its own private _flux_buf (persists across ticks)
-                          writes _flux_buf (Accelerate/Scale) and the changelog (Transport)
+                          writes _flux_buf (Accelerate only) and the changelog (Transport)
 
 Patch:               CPU calls apply_changelog() (per simulation, after its dispatch)
                           dispatches patch_apply.comp → writes changelog entries into _voxel_buf_a
@@ -1390,7 +1391,7 @@ This root cause produced every symptom patched during Phase 7d's tuning sessions
 
 | Scrapped | Replaced by |
 |----------|-------------|
-| `fluid_flux.comp` two-pass accumulate/apply (zeroed every tick) | 3-pass persistent flux: Accelerate → Scale → Transport |
+| `fluid_flux.comp` two-pass accumulate/apply (zeroed every tick) | persistent flux: Accelerate → Transport (grew to 4 passes once Scale-Outflow/Scale-Inflow were added for conservation, then compressed back to 2 — Step 9, 2026-07-06 — once Transport could recompute both scale factors inline instead of needing separate synced rewrite passes) |
 | `_flux_buf` owned by `WorldOrchestrator`, dense (sized to full voxel buffer) | `_flux_buf` owned privately by `FluidSimulation`, sparse per-chunk pages |
 | `WorldOrchestrator.get_flux_buf()` and all `_flux_buf` allocation/grow/free code in `WorldOrchestrator.gd` | `FluidSimulation`-internal allocation, page freelist, `_flux_chunk_table` |
 | Vertical CAS fall (`try_move`/`try_compress` in `fluid_sim.comp`) for liquids | Y-axis flux face, driven by hydrostatic head — folded into the same 3-pass mechanism as X/Z |
@@ -1761,6 +1762,8 @@ Ordered by priority. Update this section as work is completed or new items are d
 ### Active / Next Up
 
 - [x] **Fluid never-settles bug** ✅ FIXED & VERIFIED (2026-07-04) — See `docs/BUG_LOG.md` "FIXED (2026-07-04...)" entry for full details. Root cause was Pass A's Y-axis forcing having no hydrostatic equilibrium (`dh*g_dt*gravity_bias - gravity_force`, where a column at perfect rest still generated constant nonzero forcing every tick). Fixed by replacing with elevation/piezometric head, `(dh - FILL_CAP) * g_dt * gravity_bias`, deleting `gravity_force` entirely (export + `SimParams` field, buffer shrunk 56→52 bytes). In-editor verification confirmed a flat settled lake reaches exact zero flux, pouring water spreads and fully settles, and disturbing a settled surface nearby doesn't reawaken an already-stable voxel.
+- [ ] **Fluid pipeline compressed 4→2 dispatches** (2026-07-06, Phase 7e Step 9, implemented, needs in-editor verification) — `fluid_flux.comp`'s Scale-Outflow/Scale-Inflow passes (which rewrote `flux_buf` lanes twice and needed a sign-based no-double-write proof) are deleted. Transport now recomputes each cell's conservation-scale factor (`s_out`/`s_in`) inline as a pure function of already-synced `flux_buf`/`voxels_a` data — `compute_s_out()`/`compute_s_in()` in the shader — instead of reading it back from a buffer a prior pass wrote. Conservation holds by construction (both endpoints of a face compute the same deterministic function of the same stable inputs), with no shared writes anywhere. `fluid_simulation.gd`'s dispatch loop now does Accelerate → Transport only (`pass` 0/1, was 0-3). Needs the same verification pass as prior flux changes: settled-lake zero-flux check, pour/spread/settle, and the GPU-side conservation check (`debug_conservation_check`) should read exactly 0 same as before.
+- [ ] **U-pipe / connected-vessel hydrostatics don't work** — a tall column connected via a horizontal pipe to an empty column will not push water up the empty side. Root cause: `head()` is a strictly-local, straight-up-only column scan (Phase 7e Step 3) — a cell fed entirely from a horizontal neighbor reads as being at rest (`dh - FILL_CAP == 0`) the instant it's full, with zero visibility into the pressure still queued behind it. `Scale-Inflow`'s (now `compute_s_in`'s) rejection of over-budget inflow shrinks it in place; nothing redirects the rejected pressure to another face (e.g. upward). Candidate fix under discussion: approximate global connected-component pressure head via iterative relaxation across ticks (cheaper than a full flood-fill/labeling pass, fits the existing multi-tick-convergence model already used for settling/waves) — not yet implemented.
 - [x] **Phase UX-1 — Sphere edit tool + player scale** ✅ — See Phase UX-1 section.
 - [x] **Collision wireframe debug** ✅ — `collision_debug.gd`, yellow ImmediateMesh boxes, toggled via `RaymarchRenderer.debug_collision_shapes` export. C key binding removed.
 - [x] **Immediate collision removal on erase** ✅ — `CollisionSystem.invalidate_sphere()` called from `world.gd` on every remove_sphere event. Box-sphere overlap test strips stale shapes immediately.

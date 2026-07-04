@@ -6,6 +6,36 @@ Split out from `ARCHITECTURE.md` (2026-07-02) once that file grew too large to c
 
 ---
 
+### BUG (FIXED, 2026-07-03): exported .exe renders black — shader `.comp` files not bundled into the PCK
+
+**Symptom:** In-editor everything renders correctly. After exporting a standalone Windows `.exe` (Project → Export, "Water Simulation" preset), the running game is **completely black except for the player sphere and the UI** — the entire voxel world is missing. No crash, no visible error window.
+
+**Root cause:** Every compute shader in this project is a plain-text `.comp` file loaded at runtime via `FileAccess.open("res://shaders/*.comp", FileAccess.READ)` and compiled from source through `ComputeHelper.compile_shader*` (see `RaymarchRenderer._shader_source()`, `WorldOrchestrator`, `edit_dispatcher`, `granular_simulation`, `fluid_simulation`). These files have **no `.import` sidecar** — Godot does not treat them as resources. The export preset used `export_filter="all_resources"` with an empty `include_filter`, and `all_resources` only bundles *imported resources* (`.tscn`, `.gd`, textures, …). Non-resource files like raw `.comp` are included **only** if they match `include_filter`. With it empty, `res://shaders/*.comp` was absent from the exported PCK. At runtime `FileAccess.open` returned `null`, so `RaymarchRenderer._shader_source()` returned `""`, SPIR-V compilation failed, and the raymarch pipeline never ran → black screen. The player sphere (a real mesh node) and UI (CanvasLayer) don't go through the raymarcher, so they still drew. This affected *all* shaders, not just the raymarcher — it's just the most visible one.
+
+**Fix:** Set the export preset's non-resource include filter (`export_presets.cfg`, and equivalently the Export dialog → Resources tab → "Filters to export non-resource files/folders to include"):
+```
+include_filter="shaders/*.comp, shaders/*.glsl"
+```
+Re-export. Verify by running the exported build with the console wrapper (`debug/export_console_wrapper=2`, already on) — no `RaymarchRenderer: failed to load shader` push_error and a rendered world means the files are bundled.
+
+**Rule:** Any file loaded via `FileAccess.open("res://…")` rather than `load()`/`preload()` is a *non-resource* file as far as export is concerned and will silently be missing from the exported PCK unless it matches the preset's `include_filter`. When adding a new raw asset (shader, JSON, CSV, etc.) loaded by path, extend `include_filter`. Alternative long-term fix (not taken): rename shaders to `.glsl` and load them as `RDShaderFile` resources so `all_resources` picks them up automatically and Godot's `#include` preprocessing becomes available.
+
+**Loose end worth tightening (not required for the fix):** most shader loaders dereference the `FileAccess` handle with no null check (`edit_dispatcher`, `granular_simulation`, `fluid_simulation`), so in the broken export they would have thrown "Cannot call method 'get_as_text' on a null value" instead of failing gracefully like `RaymarchRenderer` does. Adding a null guard + `push_error` to each would make a future missing-file misconfiguration self-diagnosing.
+
+---
+
+### CHANGED (2026-07-06): fluid pipeline compressed from 4 GPU passes to 2 (Accelerate → Transport)
+
+**Status: implemented, needs in-editor verification (settled-lake zero-flux check, pour/spread/settle, conservation check reads exactly 0).** Not a bug fix — a structural simplification of the passes described in the Scale-Inflow entry below. `Scale-Outflow` and `Scale-Inflow` used to each be their own fully-synced dispatch, rewriting `flux_buf` lanes (once scaled for the donor's outflow budget, once more for the receiver's inflow budget), which required a careful sign-based proof that no two invocations ever wrote the same lane in the same pass (see that proof in git history / the Scale-Inflow entry below).
+
+**The change:** neither scale factor is written to a buffer by its own pass anymore. `fluid_flux.comp` now has `compute_s_out(gpos)`/`compute_s_in(gpos)` — pure, read-only functions of that tick's already-synced `flux_buf` + `voxels_a`, callable for *any* cell, not just "my own". Transport calls these inline for itself and for whichever neighbor is the true donor/receiver of each of its 6 relevant faces (`compute_s_out` only ever needs a 1-hop neighborhood; `compute_s_in` calls `compute_s_out` on up to 6 neighbors, so from Transport's thread it's a bounded 2-hop lookup, never deeper — no recursion risk). Because both endpoints of a shared face compute the identical deterministic function of the identical stable inputs, conservation holds exactly with zero shared writes and zero races — no proof needed, purity does the job instead of careful bookkeeping.
+
+**Why this is safe re: the sub-threshold trap bug (see MIN_FLOW/eff_flux history further down):** `eff_flux()`'s read-side deadzone is unchanged and still applied identically everywhere `flux_buf` is read (Accelerate's decay, `compute_s_out`, `compute_s_in`, Transport's final delta) — the fix for that bug never depended on which pass did the reading, only on both sides reading through the same threshold function, which is still true here.
+
+**Semantic change worth watching:** since nothing but Accelerate ever writes `flux_buf` now (no Scale pass clamps-and-rewrites it mid-tick), a persistently unservable lane no longer gets nudged toward zero by that rewrite. It's still bounded every tick by Accelerate's own `axis_cap` clamp, so it can't grow unboundedly, but it may sit at a stable nonzero raw value indefinitely if the underlying head difference driving it never resolves (e.g. a permanently pressurized face into an already-full receiver) — this is the physically correct behavior, not a regression, and it structurally deletes the "Scale-writeback oscillating trap" bug class described below (nothing rewrites `flux_buf` mid-tick anymore, so that race can't recur).
+
+---
+
 ### FIXED (2026-07-04, root cause found 2026-07-03): fluid never fully settles — no hydrostatic equilibrium in Pass A's vertical forcing
 
 **Status: fix applied 2026-07-04, verified in-editor same day — CLOSED.** `shaders/fluid_flux.comp`'s Pass A Y-axis accel now uses `(dh - FILL_CAP) * g_dt * gravity_bias` instead of `dh * g_dt * gravity_bias - gravity_force`. `gravity_force` is deleted entirely — the `@export` in `fluid_simulation.gd`, the `SimParams` field in the shader, and the corresponding byte in `_flux_params_buf`/`_upload_flux_params()` (struct/buffer shrunk 56→52 bytes, `settle_threshold`'s offset shifted 52→48 accordingly). No other pass changed — `axis_cap`, the truncated-decay logic, and the neighbour-page dispatch check were all confirmed unrelated to this bug.
