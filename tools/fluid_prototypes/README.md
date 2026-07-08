@@ -1,25 +1,36 @@
-# Fluid prototypes — connected-vessel hydrostatics bench
+# Fluid prototypes — connected-vessel hydrostatics bench (reset 2026-07-07)
 
-Standalone 2D Python emulators used to design and falsify approaches to the U-tube /
-connected-vessel hydrostatics problem **before** touching `shaders/fluid_flux.comp`.
-They faithfully mirror the engine's owned-face flux model and its conservative
-`s_out`/`s_in` transport, plus a strict invariant suite (per-arm mass balance, full
-columns, exact conservation, pipe-length independence, thin-film drain, no-churn).
+**The previous 2D Python emulators in this folder were deleted.** They were used to design
+and validate the Chorin pressure-projection approach to the U-tube / connected-vessel
+problem, which was then ported to `shaders/fluid_flux.comp` — but the in-engine result
+under-delivered badly enough (didn't react to water added after initial settling,
+staircases that never level out, worse feel/performance than the flux system it replaced)
+that the whole effort was set aside. See branch `pressure-projection-wip` for the full
+implementation, its docs, and everything that was learned — nothing was lost, just parked.
 
-Run any file directly: `python utube_projection.py` → prints `ALL TESTS PASSED`.
+**The known root cause of the mismatch (read this before writing a new bench):** the 2D
+Python benches were a *conceptual* model of the design (owned-face flux, conservative
+`s_out`/`s_in` transport), not a faithful mirror of the actual GLSL. They differed from the
+real engine in at least: dimensionality (2D vs. 3D — several real bugs, like the
+`LEVEL_DEGREE` 4-neighbor normalization miss, could only ever manifest with a 3rd axis),
+solver ordering (serial row-major Gauss-Seidel vs. the GPU's red-black checkerboard —
+confirmed to matter, see `LEVELSURFACE_TRANSIENT_HANDOFF.md` on the WIP branch), gravity
+axis convention (top-down vs. bottom-up), and general handwaviness around chunk-boundary
+and dispatch-range behavior that only exists because the real engine is sparse/paged. Each
+mismatch cost real debugging time chasing a "bug" that was actually a bench artifact, or
+missing a real bug the bench structurally couldn't expose.
 
-| File | What it is | Running it |
-|---|---|---|
-| `utube_projection.py` | **The validated winner.** Chorin pressure projection (provisional weight-scaled gravity flux → divergence RHS + surface-masked density correction → SOR solve → `−∇P` correction → conservative transport). Passes the full invariant suite. This is the design being ported. | prints `ALL TESTS PASSED` |
-| `utube_pressure.py` | **Falsified (expected to fail equalization):** `P` replaces `head()` via a max-with-cost relaxation field. Equilibrium-correct but dynamically dead — `max`-propagation makes pressure uniform-at-elevation, flattening the lateral gradient, so arms freeze lopsided. Same failure class as "Build B". | prints `FALSIFIED AS DOCUMENTED` (a self-demonstration, not a pass) |
-| `utube_emulator.py` | **Falsified:** narrow static-lift, then deficit-toward-surface-elevation. Can't route/climb; smears thin. | raises `AssertionError: THIN SMEAR` (the intended demonstration) |
+**If a Python bench is built again, it must be a direct 1:1 port of
+`shaders/fluid_flux.comp` as it stands at that time** — same dimensionality (3D), same
+solver ordering (red-black, not serial), same axis conventions, same chunk/dispatch-range
+discipline — not a from-scratch reimplementation of the *design*. A bench that models the
+idea but not the implementation will eventually diverge from what's actually shipping, and
+by construction can't catch the class of bug that only exists because of *how* the real
+thing is built (parallel ordering, 3D neighbor counts, sparse paging), only bugs in the
+underlying algorithm.
 
-> **⚠️ Metric pitfall — do not judge equalization by `column_top`.** A lopsided *thin smear* reaches the same column HEIGHT in both arms at very different DENSITIES, so `column_top` (and "median submerged fill over both arms") reports "equalized" while the arms hold very different amounts of water. The only trustworthy equalization metric is **per-arm mass** (`sum(fill) / FILL_CAP` per arm column). `utube_pressure.py` originally shipped with `column_top`-based tests that printed a **false** "ALL TESTS PASSED" and misled a reviewer into thinking max-relaxation worked; the strict per-arm-mass check shows imbalance ~2 (a broken smear). Any future port must judge the U-tube by per-arm mass + a fill-profile dump, never by surface height alone.
-
-**Design rationale, the full falsification ladder, and the GPU-port plan:**
-- `docs/BUG_LOG.md` → *"DESIGN (2026-07-04): connected-vessel hydrostatics — SOLVED IN A 2D BENCH via pressure projection"*
-- `docs/PRESSURE_PROJECTION_PORT_PLAN.md` → staged implementation plan
-
-Keep these as a regression rig: the 3D / red-black-Gauss-Seidel port must reproduce
-these same invariants. Note the bench uses **serial SOR**, which cannot run on a GPU —
-the port must use red-black GS or Jacobi and re-measure iteration counts.
+**Still useful, in-engine, independent of which fluid system is used:**
+`world.gd`'s `KEY_U` → `build_utube_test_scene()` — builds a sealed glass U-tube rig
+(two vertical shafts + a connecting passage) with a known, exact volume of water poured
+into one arm, pauses immediately so the scene can be inspected before running. This is the
+actual acceptance test, not a Python stand-in for it — use it directly.

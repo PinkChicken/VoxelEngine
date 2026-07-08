@@ -61,6 +61,19 @@ func _ray_placement_voxel() -> Vector3i:
 	return Vector3i(floor(world_pos.x / VS), floor(world_pos.y / VS), floor(world_pos.z / VS))
 
 
+# Placement target for ADD operations (2026-07-07). While the sphere-visual indicator
+# (V toggle) is showing, placement stays distance-tracked (_ray_placement_voxel) so you
+# can push a sphere out into open air to place mid-air structures on purpose. When the
+# indicator is off, placement snaps to RaymarchRenderer's GPU-computed cursor_add_pos --
+# the exact air voxel adjacent to the surface face under the crosshair -- and returns
+# null (no placement at all) when the ray doesn't hit anything, instead of silently
+# falling back to a mid-air distance guess.
+func _add_placement_voxel() -> Variant:
+	if show_sphere_indicator:
+		return _ray_placement_voxel()
+	return _renderer.get_cursor_add_pos()
+
+
 func _process(_delta: float) -> void:
 	var pressing_left  := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
 	var pressing_right := Input.is_mouse_button_pressed(MOUSE_BUTTON_RIGHT)
@@ -94,7 +107,9 @@ func _process(_delta: float) -> void:
 
 	if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		if pressing_left:
-			body.add_sphere.emit(voxel_center, sphere_radius, body.selected_material)
+			var add_center = _add_placement_voxel()
+			if add_center != null:
+				body.add_sphere.emit(add_center, sphere_radius, body.selected_material)
 		elif pressing_right:
 			body.remove_sphere.emit(voxel_center, sphere_radius)
 
@@ -114,7 +129,9 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo \
 			and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		if event.keycode == KEY_Q:
-			body.add_sphere.emit(_ray_placement_voxel(), 0, body.selected_material)
+			var add_pos = _add_placement_voxel()
+			if add_pos != null:
+				body.add_sphere.emit(add_pos, 0, body.selected_material)
 			get_viewport().set_input_as_handled()
 		elif event.keycode == KEY_E:
 			var rem = _renderer.get_cursor_remove_pos()
