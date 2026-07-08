@@ -1,7 +1,7 @@
 class_name FluidSimulation extends VoxelSimulation
 
 # GPU dispatcher for liquid simulation (water, oil) — Phase 7e persistent-flux pipeline.
-# Two passes per sub-step, both in fluid_flux.comp: Accelerate -> Transport. (Was four
+# Core loop per sub-step, all in fluid_flux.comp: Accelerate -> Transport. (Was four
 # passes -- Accelerate -> Scale-Outflow -> Scale-Inflow -> Transport -- until Phase 7e
 # Step 9, 2026-07-06: Transport now recomputes each cell's conservation-scale factor
 # inline as a pure function of already-synced flux_buf/voxels_a data instead of reading it
@@ -9,6 +9,15 @@ class_name FluidSimulation extends VoxelSimulation
 # race-avoidance proof are gone entirely. See fluid_flux.comp's header comment.)
 # No CAS, no voxels_b scratch buffer — Transport writes the changelog directly, same
 # single-writer discipline as every other simulation.
+#
+# Phi-flood (2026-07-08, tools/fluid_prototypes/python/phi_flood.py) — three more passes
+# (PhiSeed -> PhiFloodStep x(K-1) -> PhiFloodStepFinal) now run BEFORE Accelerate each
+# sub-step, replacing head() with a piezometric pressure field as Accelerate's dh input.
+# This is the connected-vessel/U-tube fix: head()'s strictly-local column scan has zero
+# visibility across a saturated horizontal connector (see docs/CONNECTED_VESSEL_HANDOFF.md
+# §3); the flood gives real non-local pressure awareness while reducing to head() exactly
+# for any settled, isolated body. See step()'s dispatch loop and _build_phi_chunk_list()
+# for the mechanism and the (separate) sleep-scheduler fix this required.
 #
 # Phase 7e Step 7 (2026-07-01): the legacy vertical-CAS shader (fluid_sim.comp) has been
 # deleted. It was dispatched every sub-step BEFORE Pass A/Scale/Transport and its
@@ -23,7 +32,7 @@ class_name FluidSimulation extends VoxelSimulation
 
 var _compute
 var _flux_pipeline: Dictionary = {}   # fluid_flux.comp — Accelerate / Scale / Transport
-var _flux_params_buf: RID             # 52-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, settle_threshold)
+var _flux_params_buf: RID             # 56-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, settle_threshold, phi_read_buf)
 var _flux_chunk_list_buf: RID         # active + 6 face neighbours — flux dispatch range
 var _flux_chunk_list_capacity: int = 0
 var _dirty_chunks_buf: RID
@@ -50,6 +59,42 @@ var _flux_page_idle: Dictionary = {}
 # fixed after WorldOrchestrator._init_grid() — unlike _flux_buf, this never needs to grow.
 var _flux_page_table_buf: RID
 const FLUX_PAGE_INITIAL_CAPACITY := 64
+
+# Phi-flood (2026-07-08 port of tools/fluid_prototypes/python/phi_flood.py) — piezometric
+# pressure field replacing head() as Pass A's dh input, giving the flux system real
+# non-local awareness across a connected vessel (the U-tube's structurally-blind saturated
+# horizontal connector — see docs/CONNECTED_VESSEL_HANDOFF.md §3). Two buffers because the
+# flood is a Jacobi relaxation: each iteration must read last iteration's FULLY-settled
+# field while writing this one's, so a single shared buffer would race. Paged 1:1 with
+# _flux_buf via the SAME _flux_chunk_table/_flux_page_table_buf (stride 1 int per voxel,
+# not 3) — no new page table or allocator; a "page" now reserves flux + phi storage
+# together. See _ensure_flux_buf_capacity/_allocate_flux_page/_free_flux_page for the
+# lockstep sizing/zeroing, and _build_phi_chunk_list for why the phi DISPATCH RANGE is
+# wider than the flux one (the second structural bug found in the Python port: the sleep
+# scheduler is itself connector-blind).
+var _phi_buf_a: RID
+var _phi_buf_b: RID
+# K, the number of Jacobi flood iterations per sub-step. IMPORTANT (found 2026-07-08,
+# in-editor KEY_U testing): phi is re-seeded and re-flooded FROM SCRATCH every tick, with
+# no field persisted across ticks (matches the validated Python port exactly — see
+# phi_flood.py's module docstring). That makes K a hard PER-TICK REACH BUDGET, not a
+# "converges eventually given enough ticks" iteration count: pressure information can
+# travel at most K voxel-hops from a free surface before this tick's flood simply stops,
+# and since nothing carries over, two seeds farther apart than K can NEVER meet, no matter
+# how many ticks pass. It must therefore cover the worst-case path a real rig needs —
+# roughly (down one arm) + (across the connector) + (up the other arm) in voxels.
+#
+# The Python bench's own measured convergence (avg 7, max ~30 hops) was against its small
+# test rigs and does NOT transfer to the shipped KEY_U scene, whose arms are much taller
+# (world.gd's UTUBE_ARM_HEIGHT = 32). Confirmed empirically in-editor: K=16 left the U-tube
+# visibly uneven (~2x mass imbalance between arms, stable — not still converging); K=32
+# fully equalized it. Default raised to 40 for headroom above the demonstrated-working 32;
+# if a future scene uses much taller arms or a much longer connector, this needs raising
+# again (or the whole approach needs cross-tick warm-starting — not implemented — see
+# docs/PHI_FLOOD_PORT_PLAN.md). Under-convergence is still safe either way: phi degrades
+# toward head()'s value and never overshoots, so a too-small K produces a stable but
+# uneven rest, never an explosion or leak.
+@export_range(1, 96, 1) var phi_flood_iterations: int = 40
 
 # Automatic conservation check (2026-07-02) — one signed int, atomicAdd'd by Transport
 # with every real (new_fill - old_fill) it applies. Zero after a tick means mass
@@ -218,7 +263,7 @@ func _ready() -> void:
 		_flux_pipeline = _compute.compile_shader(_load_flux_shader(), 4)
 		if _flux_pipeline.is_empty():
 			push_error("FluidSimulation: fluid_flux.comp compile failed")
-		var fp := PackedByteArray(); fp.resize(52); fp.fill(0)  # damp, g_dt, gravity_bias, settle_threshold
+		var fp := PackedByteArray(); fp.resize(56); fp.fill(0)  # damp, g_dt, gravity_bias, settle_threshold, phi_read_buf
 		_flux_params_buf = _compute.buffer_upload(fp)
 		_flux_chunk_list_capacity = 256
 		var fl := PackedByteArray(); fl.resize(_flux_chunk_list_capacity * 12); fl.fill(0)
@@ -240,7 +285,7 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	if Performance.has_custom_monitor("Voxel/fluid_active_chunks"):
 		Performance.remove_custom_monitor("Voxel/fluid_active_chunks")
-	for rid in [_flux_params_buf, _flux_chunk_list_buf, _dirty_chunks_buf, _flux_buf, _flux_page_table_buf, _conservation_buf, _gain_tracker_buf]:
+	for rid in [_flux_params_buf, _flux_chunk_list_buf, _dirty_chunks_buf, _flux_buf, _flux_page_table_buf, _conservation_buf, _gain_tracker_buf, _phi_buf_a, _phi_buf_b]:
 		if rid.is_valid():
 			_compute.free_rid(rid)
 
@@ -327,21 +372,31 @@ func step() -> void:
 	# (Scale's neighbour-owned-face lookups, Transport's changelog application) land within
 	# a single dispatch.
 	var flux_list := _build_flux_chunk_list(active_list)
-	_upload_flux_chunk_list(flux_list)
 	var flux_count := flux_list.size()
 
-	# Every chunk in the flux dispatch range needs a page, not just _active_chunks — Pass A
+	# Phi dispatch range (2026-07-08) — the WIDER superset (see _build_phi_chunk_list's
+	# header comment for why: the sleep scheduler is itself connector-blind, and this wider
+	# range is the fix). phi_list ⊇ flux_list always, so every page-lifecycle step below
+	# now keys off phi_list instead of flux_list — a chunk can legitimately be phi-only
+	# (liquid-component member, no flux flow this tick) and its page must stay mapped for
+	# Seed/FloodStep even though Accelerate/Transport skip it.
+	var phi_list := _build_phi_chunk_list(flux_list)
+	var phi_count := phi_list.size()
+
+	# Every chunk in the PHI dispatch range needs a page, not just _active_chunks — Pass A
 	# gates its entire per-axis loop on my_page (2026-07-02 fix made air cells compute their
-	# own owned faces, but that computation is still gated on the CURRENT voxel's own page).
-	# Positive-direction flow crossing a chunk boundary stores on the DONOR's face (already
-	# paged, since the donor's chunk is active) and works fine either way. Negative-direction
-	# flow — including straight down, gravity is -Y — stores on the RECEIVER's own owned
-	# face: if that neighbour chunk has never held water, it has no page, so Pass A returns
-	# immediately for every voxel there and nothing is ever computed, let alone materialized
-	# — there's no changelog entry to trigger discovery, so this doesn't self-heal like the
-	# positive-direction case does. Allocating pages for the full neighbour set up front
-	# closes that hole.
-	for cp in flux_list:
+	# own owned faces, but that computation is still gated on the CURRENT voxel's own page),
+	# and PhiSeed/PhiFloodStep need pages across the whole liquid component, not just the
+	# 1-hop flux halo. Positive-direction flow crossing a chunk boundary stores on the
+	# DONOR's face (already paged, since the donor's chunk is active) and works fine either
+	# way. Negative-direction flow — including straight down, gravity is -Y — stores on the
+	# RECEIVER's own owned face: if that neighbour chunk has never held water, it has no
+	# page, so Pass A returns immediately for every voxel there and nothing is ever
+	# computed, let alone materialized — there's no changelog entry to trigger discovery,
+	# so this doesn't self-heal like the positive-direction case does. Allocating pages for
+	# the full phi range up front closes that hole (and, being a superset, the flux
+	# neighbour set too).
+	for cp in phi_list:
 		if _flux_page_table_buf.is_valid() and not _flux_chunk_table.has(cp):
 			_allocate_flux_page(cp)
 
@@ -350,7 +405,7 @@ func step() -> void:
 	# though the CPU-side page itself was never freed. Pass A's new neighbour-page check
 	# (2026-07-02) depends on flux_page_table accurately reflecting THIS TICK's dispatch
 	# membership, not just "ever had a page".
-	for cp in flux_list:
+	for cp in phi_list:
 		var restore_page: int = _flux_chunk_table.get(cp, -1)
 		if restore_page >= 0:
 			_write_flux_page_table_entry(cp, restore_page)
@@ -368,11 +423,17 @@ func step() -> void:
 	# tick's dispatch" — which Pass A's new neighbour-page check (fluid_flux.comp) now
 	# relies on to refuse computing flux against an un-dispatched neighbour at all. The
 	# CPU-side page allocation itself (_flux_chunk_table) is untouched — this is a
-	# per-tick logical unmap, restored every tick a chunk re-enters flux_list (see the
+	# per-tick logical unmap, restored every tick a chunk re-enters phi_list (see the
 	# restore loop above), not a free. Idle-guard eviction (actual page freeing) is
 	# unaffected, still governed separately below.
+	#
+	# Range is phi_list now, not flux_list (2026-07-08) — a chunk that's phi-only (liquid
+	# component member reached by the wider BFS, no flux flow this tick) must stay mapped
+	# for Seed/FloodStep; unmapping it here the moment it falls outside the NARROWER
+	# flux_list would silently zero its phi data every tick and defeat the scheduler fix
+	# _build_phi_chunk_list exists for.
 	var in_dispatch_range := {}
-	for cp in flux_list:
+	for cp in phi_list:
 		in_dispatch_range[cp] = true
 	for cp in _flux_chunk_table.keys():
 		if not in_dispatch_range.has(cp):
@@ -381,6 +442,9 @@ func step() -> void:
 			var vpc := cs * cs * cs
 			var zero := PackedByteArray(); zero.resize(vpc * 3 * 4); zero.fill(0)
 			_compute.buffer_update(_flux_buf, page * vpc * 3 * 4, zero)
+			var phi_zero := PackedByteArray(); phi_zero.resize(vpc * 4); phi_zero.fill(0)
+			_compute.buffer_update(_phi_buf_a, page * vpc * 4, phi_zero)
+			_compute.buffer_update(_phi_buf_b, page * vpc * 4, phi_zero)
 			_write_flux_page_table_entry(cp, -1)
 
 	var merged_bitmask := PackedByteArray(); merged_bitmask.resize(DIRTY_BUF_BYTES); merged_bitmask.fill(0)
@@ -394,27 +458,69 @@ func step() -> void:
 	for _s in range(steps_per_tick):
 		_frame += 1
 
-		# Pass A (accelerate) -> Transport (fused conservation guard + apply, writes
-		# changelog). Persistent: flux_buf is never zeroed between ticks (see
-		# fluid_flux.comp header). Transport reads flux_buf and voxels_a that Accelerate
-		# already finished writing, a genuine cross-workgroup dependency, so it still needs
-		# its own submit+sync after Accelerate — but that's the only cross-dispatch
-		# dependency left (Phase 7e Step 9, 2026-07-06: the old Scale-Outflow/Scale-Inflow
-		# passes are gone; Transport now recomputes their scale factors inline per-cell
-		# instead of reading them back from a buffer a prior pass wrote — see
-		# fluid_flux.comp's compute_s_out()/compute_s_in()). Transport is the only pass
-		# that touches the changelog, so it gets its own reset_changelog()/
-		# apply_changelog() pair immediately around its dispatch. Guard: flux_count can be
-		# 0 if all active chunks were unloaded since last step().
+		# Phi-flood (Seed -> FloodStep x(K-1) -> FloodStepFinal, 2026-07-08) -> Pass A
+		# (accelerate) -> Transport (fused conservation guard + apply, writes changelog).
+		# Persistent: flux_buf is never zeroed between ticks (see fluid_flux.comp header).
+		# Each dispatch below gets its own submit+sync — Transport reads flux_buf and
+		# voxels_a that Accelerate already finished writing (a genuine cross-workgroup
+		# dependency), Accelerate reads the phi buffer PhiFloodStepFinal just wrote, and so
+		# on down the chain (Phase 7e Step 9, 2026-07-06: the old Scale-Outflow/Scale-Inflow
+		# passes are gone; Transport recomputes their scale factors inline per-cell instead
+		# of reading them back from a buffer a prior pass wrote — see fluid_flux.comp's
+		# compute_s_out()/compute_s_in()). Transport is the only pass that touches the
+		# changelog, so it gets its own reset_changelog()/apply_changelog() pair immediately
+		# around its dispatch. Guard: flux_count can be 0 if all active chunks were
+		# unloaded since last step() (phi_count is then also 0, since phi_list ⊇ flux_list).
 		var flux_bitmask := zero_dirty  # default: no flux changes this sub-step
 		if flux_count > 0:
-			_upload_flux_params(grid_min, grid_span, _frame, 0)  # Accelerate
+			# Reset the dirty bitmask BEFORE the phi pipeline now (2026-07-08) —
+			# PhiFloodStepFinal (pass 4) also writes into it via the pressure-wave wake
+			# check (fluid_flux.comp), and that write must survive until the bitmask is
+			# downloaded after Transport below, not get wiped by a reset that used to run
+			# only immediately before Transport's own dispatch.
+			_compute.buffer_update(_dirty_chunks_buf, 0, zero_dirty)
+
+			# --- Phi-flood: re-derived from voxels_a every substep, no persisted field.
+			# See docs/PHI_FLOOD_PORT_PLAN.md's "ship the safe version first" note: one
+			# submit+sync per dispatch here, matching every existing multi-pass effort in
+			# this file (including the pressure-projection branch's red-black solve loop);
+			# batching into one submit via compute_list_add_barrier is a real, documented
+			# Godot RD capability and the planned perf follow-up once this is verified
+			# in-editor. ---
+			_upload_flux_chunk_list(phi_list)
+			_upload_flux_params(grid_min, grid_span, _frame, 2)  # PhiSeed (always writes phi_buf_a)
+			_compute.run(_flux_pipeline, flux_uniforms, phi_count * 4, 4, 4)
+			_compute.submit()
+			_compute.sync()
+
+			# latest_is_a tracks which physical buffer holds the most recently written (and
+			# therefore next iteration's source) value — starts true because Seed always
+			# writes phi_buf_a. No parity math in the shader; this is plain CPU bookkeeping
+			# fed in via phi_read_buf each dispatch (0 = phi_buf_a, 1 = phi_buf_b, matching
+			# fluid_flux.comp's phi_read()/phi_flood_candidate()).
+			var latest_is_a := true
+			var flood_iters: int = max(1, phi_flood_iterations)
+			for _fi in range(flood_iters - 1):
+				_upload_flux_params(grid_min, grid_span, _frame, 3, 0 if latest_is_a else 1)  # PhiFloodStep
+				_compute.run(_flux_pipeline, flux_uniforms, phi_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
+				latest_is_a = not latest_is_a
+			_upload_flux_params(grid_min, grid_span, _frame, 4, 0 if latest_is_a else 1)  # PhiFloodStepFinal (+ wake check)
+			_compute.run(_flux_pipeline, flux_uniforms, phi_count * 4, 4, 4)
+			_compute.submit()
+			_compute.sync()
+			latest_is_a = not latest_is_a
+			var accel_phi_read_buf := 0 if latest_is_a else 1
+
+			# --- Accelerate / Transport: same flux dispatch range as before ---
+			_upload_flux_chunk_list(flux_list)
+			_upload_flux_params(grid_min, grid_span, _frame, 0, accel_phi_read_buf)  # Accelerate
 			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
 			_compute.submit()
 			_compute.sync()
 
 			_orchestrator.reset_changelog()
-			_compute.buffer_update(_dirty_chunks_buf, 0, zero_dirty)
 			_upload_flux_params(grid_min, grid_span, _frame, 1)  # Transport
 			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
 			_compute.submit()
@@ -565,6 +671,12 @@ func _ensure_flux_buf_capacity(min_pages: int) -> void:
 		var bytes = initial * vpc * 3 * 4
 		var data := PackedByteArray(); data.resize(bytes); data.fill(0)
 		_flux_buf = _compute.buffer_upload(data)
+		# Phi buffers (2026-07-08) — same page count as _flux_buf, stride 1 not 3, grown/
+		# freed in lockstep everywhere _flux_buf is (see _phi_buf_a's declaration comment).
+		var phi_bytes = initial * vpc * 4
+		var phi_data := PackedByteArray(); phi_data.resize(phi_bytes); phi_data.fill(0)
+		_phi_buf_a = _compute.buffer_upload(phi_data)
+		_phi_buf_b = _compute.buffer_upload(phi_data.duplicate())
 		_flux_page_capacity = initial
 		for i in range(initial - 1, -1, -1):
 			_flux_freelist.append(i)
@@ -576,6 +688,10 @@ func _ensure_flux_buf_capacity(min_pages: int) -> void:
 			new_capacity *= 2
 		var new_bytes := new_capacity * vpc * 3 * 4
 		_flux_buf = _compute.buffer_grow(_flux_buf, old_bytes, new_bytes)
+		var old_phi_bytes := _flux_page_capacity * vpc * 4
+		var new_phi_bytes := new_capacity * vpc * 4
+		_phi_buf_a = _compute.buffer_grow(_phi_buf_a, old_phi_bytes, new_phi_bytes)
+		_phi_buf_b = _compute.buffer_grow(_phi_buf_b, old_phi_bytes, new_phi_bytes)
 		for i in range(new_capacity - 1, _flux_page_capacity - 1, -1):
 			_flux_freelist.append(i)
 		_flux_page_capacity = new_capacity
@@ -626,6 +742,12 @@ func _free_flux_page(chunk_pos: Vector3i) -> void:
 	var vpc := cs * cs * cs
 	var zero := PackedByteArray(); zero.resize(vpc * 3 * 4); zero.fill(0)
 	_compute.buffer_update(_flux_buf, page * vpc * 3 * 4, zero)
+	# Phi buffers ride the same page index (stride 1, not 3) — zero both so a future
+	# occupant doesn't inherit stale phi (matters most for PhiSeed's very first iteration
+	# read on a freshly-reused page, before this tick's own seed write lands).
+	var phi_zero := PackedByteArray(); phi_zero.resize(vpc * 4); phi_zero.fill(0)
+	_compute.buffer_update(_phi_buf_a, page * vpc * 4, phi_zero)
+	_compute.buffer_update(_phi_buf_b, page * vpc * 4, phi_zero)
 
 
 func _decode_dirty_bitmask(bitmask: PackedByteArray) -> Array[Vector3i]:
@@ -664,12 +786,15 @@ func _build_flux_uniforms() -> Array:
 		u.call(8, _flux_page_table_buf),
 		u.call(9, _conservation_buf),
 		u.call(10, _gain_tracker_buf),
+		u.call(11, _phi_buf_a),  # phi-flood (2026-07-08) — always bound, even for passes
+		u.call(12, _phi_buf_b),  # (e.g. Transport) that never touch it; same convention
+		                          # already used for conservation/gain_tracker above.
 	]
 
 
-func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pass_idx: int) -> void:
+func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pass_idx: int, phi_read_buf: int = 0) -> void:
 	var cs := _chunk_manager.chunk_size
-	var p := PackedByteArray(); p.resize(52)
+	var p := PackedByteArray(); p.resize(56)
 	p.encode_s32(0,  cs)
 	p.encode_s32(4,  grid_min.x)
 	p.encode_s32(8,  grid_min.y)
@@ -683,6 +808,10 @@ func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pa
 	p.encode_float(40, g_dt)
 	p.encode_float(44, gravity_bias)
 	p.encode_s32(48, settle_threshold)
+	# Phi-flood (2026-07-08) — which buffer (0=phi_buf_a, 1=phi_buf_b) this dispatch reads
+	# as source. Irrelevant for Transport (pass 1, never touches phi) and for PhiSeed
+	# (pass 2, always writes phi_buf_a regardless) — harmless to upload a default there.
+	p.encode_s32(52, phi_read_buf)
 	_compute.buffer_update(_flux_params_buf, 0, p)
 
 
@@ -705,6 +834,65 @@ func _build_flux_chunk_list(active_list: Array) -> Array:
 			if not seen.has(nb) and _chunk_manager.chunks.has(nb):
 				seen[nb] = true
 				out.append(nb)
+	return out
+
+
+# Phi-flood dispatch range (2026-07-08) — deliberately WIDER than _build_flux_chunk_list's
+# 1-hop halo. This is the fix for the second structural bug found porting phi-flood to the
+# faithful Python replica: the sleep scheduler is itself connector-blind. On a long
+# connector the discharge endpoint (the far arm's surface) can sit several chunks outside
+# the 1-hop flux dispatch frontier while every cell INSIDE that frontier is already
+# saturated — zero transfers occur there, nothing marks a chunk dirty, and the idle-guard
+# puts the whole rig to sleep with the imbalance still intact (reproduced in the Python
+# port: arm A/B left permanently lopsided, `active=0`). Fix: flood the FULL connected
+# liquid component (BFS via face-adjacency through chunks that currently hold liquid,
+# `Chunk.has_simulation(SimulationClass.LIQUID)` — Chunks/chunk_instance.gd:21, a bitmask
+# already ref-counted on every voxel mutation, no new bookkeeping needed) starting from
+# flux_list, not just flux_list's own 1-hop halo. The flood is READ-ONLY on voxels_a, so
+# covering chunks outside the flux/Transport dispatch range is safe — they simply don't get
+# an Accelerate/Transport dispatch this tick, only Seed/FloodStep. Capped at
+# PHI_FLOOD_MAX_CHUNKS so a single giant lake can't blow up one tick's dispatch cost: over
+# the cap, the flood just stops expanding for that tick (degraded convergence at the
+# frontier, never a hang) and picks back up next tick as the BFS re-runs from scratch.
+const PHI_FLOOD_MAX_CHUNKS := 4096
+
+func _build_phi_chunk_list(flux_list: Array) -> Array:
+	var seen := {}
+	var out  := []
+	var offsets: Array[Vector3i] = [
+		Vector3i( 1,  0,  0), Vector3i(-1,  0,  0),
+		Vector3i( 0,  0,  1), Vector3i( 0,  0, -1),
+		Vector3i( 0,  1,  0), Vector3i( 0, -1,  0),
+	]
+	# Seed the BFS frontier with flux_list itself (guarantees phi_list ⊇ flux_list even for
+	# an active chunk whose own liquid content is momentarily nil, e.g. this tick's edit) —
+	# Accelerate/Transport need valid phi data everywhere they read voxels, and only expand
+	# past a chunk if IT holds liquid (a chunk with none is a valid stopping point: nothing
+	# on the far side of it needs phi awareness through a non-liquid wall).
+	var frontier: Array = []
+	for cp: Vector3i in flux_list:
+		if not seen.has(cp):
+			seen[cp] = true
+			out.append(cp)
+			frontier.append(cp)
+	while not frontier.is_empty() and out.size() < PHI_FLOOD_MAX_CHUNKS:
+		var next_frontier: Array = []
+		for cp: Vector3i in frontier:
+			var chunk: Chunk = _chunk_manager.chunks.get(cp)
+			if chunk == null or not chunk.has_simulation(MaterialDef.SimulationClass.LIQUID):
+				continue  # a chunk with no liquid is a valid stopping point for the BFS
+			for offset in offsets:
+				var nb: Vector3i = cp + offset
+				if seen.has(nb) or not _chunk_manager.chunks.has(nb):
+					continue
+				seen[nb] = true
+				out.append(nb)
+				next_frontier.append(nb)
+				if out.size() >= PHI_FLOOD_MAX_CHUNKS:
+					break
+			if out.size() >= PHI_FLOOD_MAX_CHUNKS:
+				break
+		frontier = next_frontier
 	return out
 
 

@@ -83,10 +83,19 @@ layout(set = 0, binding = 2, std430) readonly buffer SimParams {
     int grid_span_x; int grid_span_y; int grid_span_z;
     int frame;
     int pass;    // 0 = Accelerate. 1 = Transport (fused conservation guard + apply, writes changelog).
+                 // 2 = PhiSeed. 3 = PhiFloodStep. 4 = PhiFloodStepFinal (+ pressure-wave wake
+                 // check) — see the phi-flood block near the end of main() for 2/3/4.
     float damp;  // velocity retained per tick (0–1) — tunable, see FluidSimulation.damp
     float g_dt;  // acceleration per unit of hydrostatic head — tunable, see FluidSimulation.g_dt
     float gravity_bias;   // Y-axis multiplier on the (dh - elevation) term — see FluidSimulation.gravity_bias
     int settle_threshold; // scheduling-only floor for mark_dirty — see FluidSimulation.settle_threshold
+    // Phi-flood (2026-07-08 port of tools/fluid_prototypes/python/phi_flood.py) — which of
+    // phi_buf_a/phi_buf_b is this dispatch's SOURCE. PhiSeed always writes phi_buf_a
+    // (fixed iteration-0 source) regardless of this value. PhiFloodStep/PhiFloodStepFinal
+    // read this buffer and write the other one. Accelerate only reads it. No parity math
+    // needed in-shader — the CPU dispatch loop (fluid_simulation.gd) tracks which physical
+    // buffer holds the current value and feeds it in here every dispatch.
+    int phi_read_buf;
 } params;
 layout(set = 0, binding = 3, std430) readonly buffer MaterialSim { uint data[256]; } material_sim;
 layout(set = 0, binding = 4, std430)          buffer Changelog {
@@ -113,9 +122,39 @@ layout(set = 0, binding = 9, std430) buffer ConservationCheck { int delta; } con
 // races between threads — good enough for "which chunk should I go look at", not meant to
 // be a perfectly deterministic "the" largest value if several qualify in the same tick.
 layout(set = 0, binding = 10, std430) buffer GainTracker { int flat_idx; int amount; } gain_tracker;
+// Phi-flood buffers (2026-07-08) — piezometric pressure field, paged 1:1 with flux_buf
+// (same page index via flux_page_table, stride 1 int per voxel instead of 3) so no new
+// page table/allocator was needed; fluid_simulation.gd's existing page lifecycle grows
+// these two buffers in lockstep with flux_buf. Two buffers, not one, because the flood is
+// a Jacobi relaxation (see PhiFloodStep below): each iteration must read last iteration's
+// FULLY settled field while writing this iteration's — a single shared buffer would race
+// (a thread could read a neighbour's value already updated THIS iteration, silently turning
+// Jacobi into an uncontrolled mix of Jacobi/Gauss-Seidel with no ordering guarantee across
+// workgroups). params.phi_read_buf selects which one is source for the current dispatch.
+layout(set = 0, binding = 11, std430) coherent buffer PhiBufA { int data[]; } phi_buf_a;
+layout(set = 0, binding = 12, std430) coherent buffer PhiBufB { int data[]; } phi_buf_b;
 
 const uint SIM_LIQUID    = 2u;
 const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGELOG_ENTRIES
+// Hoisted to file scope (was local to main()'s pass==0 block) so the phi-flood helpers
+// below (file-scope, defined before main()) can share it — one full voxel's worth of fill.
+const int FILL_CAP = 255;
+// Phi-flood tuning (2026-07-08 port of tools/fluid_prototypes/python/phi_flood.py) — both
+// verified against the Python bench's wake-loop repros, not arbitrary:
+// EPS_H: horizontal hydraulic slope, fill units per hop. Keeps the flooded field
+// non-uniform-at-elevation (the defect that made the max-relaxation "Build B" field
+// unable to drive equalization, see docs/BUG_LOG.md's falsification ladder) — small enough
+// that steady-state equalization error (EPS_H * path_len / FILL_CAP voxels) stays
+// sub-voxel for game-scale pipes.
+const int EPS_H = 4;
+// PHI_WAKE_MARGIN: a real free-surface cell whose flooded phi exceeds its own fill by more
+// than this wakes its chunk (see the wake check in PhiFloodStepFinal, pass==4) — the fix
+// for the discovered scheduler blindness: a discharge endpoint can sit outside the flux
+// dispatch frontier while the connector inside it is fully saturated, so no transfer ever
+// marks a chunk dirty and the idle-guard sleeps the rig with the imbalance intact. At rest
+// this signal is exactly zero (EPS_H's slope makes an invading ramp undershoot the local
+// seed), so sleep still happens once genuinely settled.
+const int PHI_WAKE_MARGIN = 64;
 
 ivec3 world_to_chunk(ivec3 gpos) {
     float cs = float(params.chunk_size);
@@ -354,6 +393,112 @@ float compute_s_in(ivec3 gpos, int cs, int vpc) {
     return min(1.0, float(capacity) / total_in);
 }
 
+// === Phi-flood (2026-07-08 port of tools/fluid_prototypes/python/phi_flood.py) ===
+// A per-tick, per-material piezometric pressure field that replaces head() as Pass A's
+// dh input — see phi_read() below for the only call-site change. Re-derived from
+// voxels_a every tick (no persisted field), which is what makes reactivity to a fresh
+// pour automatic: a newly-poured cell becomes a new seed the instant Transport writes
+// it, with no invalidation logic needed anywhere.
+
+// A liquid voxel seeds phi = its own fill iff it's a FREE SURFACE: partially filled, or
+// the cell directly above isn't the same liquid material (mirrors head()'s own "the
+// surface stops the column walk" rule exactly). Non-surface cells default to a floor of
+// 0 (matches phi_flood.py's `seed.get(pos, 0)`) — re-derived fresh every call, never
+// cached, so this is correct both for PhiSeed's initial write and for every subsequent
+// PhiFloodStep's per-iteration floor (Python re-applies the seed floor every iteration,
+// not just once — see _compute_phi's `best = seed.get(pos, 0)` inside the iteration loop).
+//
+// KNOWN ISSUE (found 2026-07-08, in-editor testing — the "flat lake ripple" bug):
+// placing one full voxel directly on an already-full flat lake radiates a spurious
+// pressure wave across the WHOLE lake in one tick (a wide "crater" ring), because a
+// taller pile's genuinely higher head at the one true interface (its submerged
+// former-top cell vs. a flat neighbour's still-open top) can keep "leaking" sideways
+// through the flat neighbour's OWN valid seed value via max() — hop after hop, each
+// losing only EPS_H=4 — something stock head() (which never looks sideways at all)
+// could never do. A "protect true air-exposed surfaces from ever being inflated" fix
+// was attempted and REVERTED the same day: it also blocks the U-tube's own arm-base
+// cells (exposed to air only because that arm is still empty/dry) from receiving the
+// connector's real pressure, which is the ENTIRE mechanism this fix exists for — a
+// single cell's local state (fill, what's above it) cannot distinguish "a coincidental
+// neighbour that's already correctly at rest" from "a dry arm base that genuinely needs
+// this exact inflation to know it should rise." Left open — see
+// docs/PHI_FLOOD_PORT_PLAN.md and docs/BUG_LOG.md for the full write-up and candidate
+// directions (e.g. bounding disturbance MAGNITUDE/SPEED rather than blocking the
+// mechanism outright, so a single small edit can't outrun what stock head()'s own
+// one-hop-per-tick diffusion would do, while a genuine large connected-body imbalance
+// still gets through).
+int phi_seed_floor(ivec3 gpos, uint mat_id, uint my_fill) {
+    if (my_fill < 255u) return int(my_fill);
+    ivec3 above = gpos + AXIS_DIR[1];
+    uint av = read_a(above);
+    if ((av & 0xFFu) != mat_id) return int(my_fill);  // == 255, but written generally
+    return 0;
+}
+
+// One Jacobi hop of the max-flood: phi(p) = max(seed_floor(p), best candidate over the 6
+// same-material liquid neighbours). Costs mirror phi_flood.py::_compute_phi's inner loop
+// EXACTLY, including the two fixes found there against real wake-loop repros (see that
+// file's module docstring for the failure cases each one fixes) — do not "simplify" the
+// down-step or up-step terms without re-reading those repros:
+//   down-step (q above p):  phi(q) + fill(p) - deficit(p)   -- deficit MUST be subtracted
+//     here too, not just on up/horizontal steps, else a slightly-deficient submerged cell
+//     inherits the full static ramp from above and can never be corrected.
+//   up-step   (q below p):  phi(q) - FILL_CAP - deficit(p)  -- costs the full elevation
+//     quantum FILL_CAP, NOT fill(q); costing fill(q) under-charges a chain of
+//     slightly-deficient cells, which self-consistently inflates phi into a permanently
+//     over-pressured, uncorrectable state.
+//   horizontal:              phi(q) - EPS_H - deficit(p)
+// deficit(p) = FILL_CAP - fill(p), zero on full cells, so a settled column (all full
+// cells) reduces this whole function to exactly head()'s own column-sum behaviour.
+// src_buf follows the SAME convention as params.phi_read_buf / phi_read() below: 0 = read
+// phi_buf_a, 1 = read phi_buf_b. Callers should pass params.phi_read_buf straight through.
+int phi_flood_candidate(ivec3 gpos, uint mat_id, uint my_fill, int src_buf) {
+    int best = phi_seed_floor(gpos, mat_id, my_fill);
+    int deficit = FILL_CAP - int(my_fill);
+    int cs  = params.chunk_size;
+    int vpc = cs * cs * cs;
+    for (int axis = 0; axis < 3; axis++) {
+        for (int sgn = -1; sgn <= 1; sgn += 2) {
+            ivec3 q = gpos + AXIS_DIR[axis] * sgn;
+            uint qv = read_a(q);
+            if ((qv & 0xFFu) != mat_id) continue;  // not this liquid: no candidate from here
+            ivec2 pl = resolve_page_local(q, cs, vpc);
+            if (pl.x < 0) continue;  // no page this tick -- same "assume no capacity" rule
+                                      // compute_s_out/compute_s_in already use at this boundary
+            int qidx = pl.x * vpc + pl.y;
+            int pq = (src_buf == 0) ? phi_buf_a.data[qidx] : phi_buf_b.data[qidx];
+            int cand;
+            if (axis == 1 && sgn == 1) {          // q above p: down-step
+                cand = pq + int(my_fill) - deficit;
+            } else if (axis == 1 && sgn == -1) {  // q below p: up-step
+                cand = pq - FILL_CAP - deficit;
+            } else {                               // horizontal
+                cand = pq - EPS_H - deficit;
+            }
+            if (cand > best) best = cand;
+        }
+    }
+    return best;
+}
+
+// Accelerate's (pass==0) replacement for head() — same material gate head() uses (return
+// 0 if p isn't this liquid), else the flooded value PhiSeed/PhiFloodStep already computed
+// this tick, read through whichever buffer params.phi_read_buf designates as final. Page<0
+// (no phi page this tick) also returns 0 — same fail-safe convention as compute_s_out/
+// compute_s_in's dispatch-range guard: "can't see it" must mean "assume nothing", never
+// "assume the base case," so this never overstates pressure at a boundary this tick can't
+// actually see.
+int phi_read(ivec3 p, uint mat_id) {
+    uint v = read_a(p);
+    if ((v & 0xFFu) != mat_id) return 0;
+    int cs  = params.chunk_size;
+    int vpc = cs * cs * cs;
+    ivec2 pl = resolve_page_local(p, cs, vpc);
+    if (pl.x < 0) return 0;
+    int idx = pl.x * vpc + pl.y;
+    return (params.phi_read_buf == 0) ? phi_buf_a.data[idx] : phi_buf_b.data[idx];
+}
+
 void main() {
     int cs  = params.chunk_size;
     int vpc = cs * cs * cs;
@@ -390,7 +535,8 @@ void main() {
     uint mat_id   = my_voxel & 0xFFu;
     uint my_fill  = (my_voxel >> 8u) & 0xFFu;
 
-    const int FILL_CAP = 255;  // one flux tick can move at most one full voxel's worth of fill
+    // FILL_CAP is now file-scope (hoisted 2026-07-08 so the phi-flood helpers above main()
+    // can share it) — see its declaration near SIM_LIQUID/MAX_CHANGELOG.
 
     // === Pass A: accelerate flux (params.pass == 0) ===
     //
@@ -520,7 +666,17 @@ void main() {
             // (pull a near-zero-dh floating mass down) falls out of this for free: a
             // floating blob's bottom face sees dh_total = 0 - 255, strongly negative,
             // so it still falls coherently with no separate constant needed.
-            int dh = head(gpos, active_mat) - head(nb, active_mat);
+            // PORT (2026-07-08, tools/fluid_prototypes/python/phi_flood.py): dh now comes
+            // from the flooded piezometric field, not the raw local column scan. phi_read()
+            // reduces to EXACTLY head()'s value for any settled, isolated body (the flood's
+            // deficit terms vanish on full cells, and a surface cell's seed value IS
+            // head()'s own value there) — so this change is a no-op for ordinary lakes,
+            // falling water, and disconnected columns, and only actually differs where a
+            // horizontal path carries more pressure than the local column: the connected-
+            // vessel case head() is structurally blind to (see docs/CONNECTED_VESSEL_HANDOFF.md
+            // §3). head() itself is left in this file, unused by Accelerate, as a reference/
+            // fallback for debugging.
+            int dh = phi_read(gpos, active_mat) - phi_read(nb, active_mat);
 
             float accel = (axis == 1)
                 ? (float(dh) - float(FILL_CAP)) * params.g_dt * params.gravity_bias
@@ -699,5 +855,71 @@ void main() {
         if (abs(applied) >= params.settle_threshold) {
             mark_dirty(my_flat, vpc);
         }
+    }
+
+    // === PhiSeed (params.pass == 2) ===
+    // Runs over the WIDER phi dispatch range (fluid_simulation.gd's _build_phi_chunk_list,
+    // a superset of the flux dispatch range — see that function's header comment for why:
+    // the sleep scheduler is itself connector-blind, and this wider range plus the wake
+    // check in PhiFloodStepFinal below are the fix). Initializes phi_buf_a with a valid
+    // starting point for iteration 0 of the flood: only liquid cells participate (matches
+    // phi_flood.py's `cells` dict, which never contains air/solid) — no write needed for
+    // non-liquid cells, since phi_read()/phi_flood_candidate() both gate on the CURRENT
+    // voxel's material at read time and simply skip/ignore non-matching cells regardless
+    // of whatever stale data sits in their phi slot.
+    if (params.pass == 2) {
+        if (my_page < 0) return;
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        if (!my_is_liquid) return;
+        int idx = my_page * vpc + my_local;
+        phi_buf_a.data[idx] = phi_seed_floor(gpos, mat_id, my_fill);
+        return;
+    }
+
+    // === PhiFloodStep (params.pass == 3) / PhiFloodStepFinal (params.pass == 4) ===
+    // One Jacobi hop of the max-flood (phi_flood_candidate, above) reading params.phi_read_buf
+    // and writing the OTHER buffer — fluid_simulation.gd's dispatch loop alternates
+    // phi_read_buf 0/1 across K-1 plain PhiFloodStep dispatches, then runs PhiFloodStepFinal
+    // once for the last iteration. Both passes do IDENTICAL relaxation math; FloodStepFinal
+    // additionally runs the pressure-wave wake check using the value it just computed, since
+    // that's the only point in the tick where the fully-relaxed (for this tick) field is
+    // available without an extra dispatch.
+    if (params.pass == 3 || params.pass == 4) {
+        if (my_page < 0) return;
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        if (!my_is_liquid) return;
+
+        int idx = my_page * vpc + my_local;
+        int new_val = phi_flood_candidate(gpos, mat_id, my_fill, params.phi_read_buf);
+        if (params.phi_read_buf == 0) {
+            phi_buf_b.data[idx] = new_val;  // read A, write B
+        } else {
+            phi_buf_a.data[idx] = new_val;  // read B, write A
+        }
+
+        if (params.pass == 4) {
+            // Pressure-wave wake (see PHI_WAKE_MARGIN's declaration for the full mechanism
+            // and why this is exactly zero at genuine rest). Only a REAL free-surface cell
+            // can wake: air above (can push up/out), or a partial cell with a CORRECTABLE
+            // deficit (fill < FILL_CAP - rest_tol). A sealed full cell is pure static
+            // pressure and must never wake (preserves vacuum-lock/aquifer behaviour — see
+            // docs' vacuum-lock note); nor may a cell within the substrate's own rest
+            // tolerance (rest_tol = max(1, settle_threshold-1): a deficit that small rounds
+            // to zero accel and is invisible to the sleep scheduler by design, so waking on
+            // it would churn forever against a correction the substrate cannot express —
+            // see tools/fluid_prototypes/python/run_tests.py's staircase-tolerance comment
+            // for the numeric verification of this floor).
+            if (new_val - int(my_fill) > PHI_WAKE_MARGIN) {
+                ivec3 above = gpos + AXIS_DIR[1];
+                uint av = read_a(above);
+                uint am = av & 0xFFu;
+                int rest_tol = max(1, params.settle_threshold - 1);
+                bool dischargeable = (am == 0u) || (int(my_fill) < FILL_CAP - rest_tol);
+                if (dischargeable) {
+                    mark_dirty(my_flat, vpc);
+                }
+            }
+        }
+        return;
     }
 }

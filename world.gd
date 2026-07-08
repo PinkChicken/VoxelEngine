@@ -78,16 +78,16 @@ func _unhandled_input(event: InputEvent) -> void:
 				fluid_simulation.watch_local = lp
 				fluid_simulation.watch_enabled = true
 				print("[FluidWatch] now watching chunk %s local %s (world %s)" % [cp, lp, target])
-			elif event.keycode == KEY_U:
+		elif event.keycode == KEY_U:
 				build_utube_test_scene()
-			elif event.keycode == KEY_DOWN:
-				# Debug rewind tool (2026-07-07) -- save the canonical voxel buffer to a CPU-side
-				# snapshot so a test scenario can be captured once and replayed: build the scene,
-				# press Down to save, unpause/step forward and watch one voxel, press Up to
-				# restore, step forward again and watch a different voxel, etc.
-				world_orchestrator.debug_save_voxel_snapshot()
-			elif event.keycode == KEY_UP:
-				world_orchestrator.debug_load_voxel_snapshot()
+		elif event.keycode == KEY_DOWN:
+			# Debug rewind tool (2026-07-07) -- save the canonical voxel buffer to a CPU-side
+			# snapshot so a test scenario can be captured once and replayed: build the scene,
+			# press Down to save, unpause/step forward and watch one voxel, press Up to
+			# restore, step forward again and watch a different voxel, etc.
+			world_orchestrator.debug_save_voxel_snapshot()
+		elif event.keycode == KEY_UP:
+			world_orchestrator.debug_load_voxel_snapshot()
 
 
 # Scripted U-tube acceptance-test scene (2026-07-04, Checkpoint 4/5 tooling — see
