@@ -214,6 +214,45 @@ func debug_dump_fluid_stats() -> void:
 	var grand_avg: float = (float(grand_total_fill) / grand_total_voxels) if grand_total_voxels > 0 else 0.0
 	print("[FluidDebug] TOTAL fill=%d across %d liquid voxels (avg %.1f)" % [grand_total_fill, grand_total_voxels, grand_avg])
 
+# --- Debug rewind snapshot (2026-07-07) --- a CPU-side copy of the canonical voxel buffer
+# (_voxel_buf_a), so a hand-built or scripted test scenario can be captured ONCE and replayed
+# repeatedly -- run forward, watch one voxel, restore, watch a different voxel, without having
+# to reproduce a fiddly multi-tick drop/settle scenario from scratch each time. World.gd binds
+# Down Arrow to save, Up Arrow to load. Deliberately only snapshots _voxel_buf_a (the single
+# source of truth per CLAUDE.md) -- _voxel_buf_b is scratch, _sim_active_buf/_changelog_buf are
+# zeroed at the start of every dispatch, and pressure_buf resets to 0 every tick (warm_start is
+# off by default), so none of those need to be captured for a restore to reproduce the exact
+# same simulation trajectory going forward.
+var _debug_voxel_snapshot: PackedByteArray = PackedByteArray()
+
+func debug_save_voxel_snapshot() -> void:
+	if not _voxel_buf_a.is_valid():
+		print("[DebugSnapshot] voxel buffer not ready")
+		return
+	var cs := _chunk_manager.chunk_size
+	var vpc := cs * cs * cs
+	var total_bytes := _voxel_buf_capacity * vpc * 4
+	_debug_voxel_snapshot = _compute.download_range(_voxel_buf_a, 0, total_bytes)
+	print("[DebugSnapshot] saved %d bytes (%d slots)" % [_debug_voxel_snapshot.size(), _voxel_buf_capacity])
+
+func debug_load_voxel_snapshot() -> void:
+	if _debug_voxel_snapshot.is_empty():
+		print("[DebugSnapshot] no snapshot saved yet")
+		return
+	if not _voxel_buf_a.is_valid():
+		print("[DebugSnapshot] voxel buffer not ready")
+		return
+	_compute.buffer_update(_voxel_buf_a, 0, _debug_voxel_snapshot)
+	# Re-run the same chunk-committed discovery a normal edit would trigger, so simulations
+	# pick the restored content back up -- without this, chunks whose _active_chunks entry
+	# already idled out (see fluid_simulation.gd's idle-guard) would sit quiet forever even
+	# though the buffer now has fresh, un-settled content again.
+	var positions: Array[Vector3i] = []
+	for pos in _slot_to_chunk.values():
+		positions.append(pos)
+	chunks_committed.emit(positions)
+	print("[DebugSnapshot] restored %d bytes to %d chunk(s)" % [_debug_voxel_snapshot.size(), positions.size()])
+
 # Downloads the changelog count, dispatches patch_apply.comp to sync _voxel_buf_a.
 # Changed-chunk discovery is now done by GranularSimulation via the dirty-chunk bitmask —
 # this function no longer calls _extract_changed_chunks (was O(131k) GDScript loop).
@@ -462,6 +501,19 @@ func edit_remove_voxel(pos: Vector3i) -> void:
 		EditDispatcher.EditRequest.new(pos, EditDispatcher.EditShape.BOX,
 			Vector4(0, 0, 0, 0), EditDispatcher.EditOp.REMOVE))
 	_write_voxel_block_data(pos, 0, 0)
+
+# General box edit (2026-07-04, U-tube test-scene builder) — same immediate-dispatch BOX
+# path as edit_add_voxel/edit_remove_voxel above, generalized to an arbitrary half-extent
+# so a script can carve/fill exact rectangular regions instead of looping per-voxel.
+# Deliberately skips _write_voxel_block_data (same as the existing sphere-edit wrappers
+# below) -- block_data is only a CPU cache refreshed at chunk generation/save time, not a
+# runtime source of truth (see CLAUDE.md), so bulk edits not syncing it is established
+# precedent, not a gap introduced here.
+func edit_box(center: Vector3i, half_extent: Vector3i, op: int, mat: int = 0) -> void:
+	if not _edit_dispatcher: return
+	_edit_dispatcher.apply_immediate(
+		EditDispatcher.EditRequest.new(center, EditDispatcher.EditShape.BOX,
+			Vector4(half_extent.x, half_extent.y, half_extent.z, 0), op, mat))
 
 func edit_add_sphere(center: Vector3i, radius: float, mat: int) -> void:
 	if not _edit_dispatcher: return

@@ -40,6 +40,78 @@ var _flux_buf: RID
 var _flux_page_capacity: int = 0        # total pages currently backing _flux_buf
 var _flux_freelist: Array = []          # free page indices (int), pop_back() to allocate
 var _flux_chunk_table: Dictionary = {}  # chunk_pos → page index (CPU bookkeeping)
+
+# Pressure-projection port (2026-07-04, Checkpoint 2 — see docs/PRESSURE_PROJECTION_PORT_PLAN.md).
+# _pressure_buf/_div_buf ride the EXACT SAME page allocation as _flux_buf (same
+# _flux_chunk_table/_flux_freelist/_flux_page_table_buf) — the pressure domain is a
+# subset of the flux-active region, so no separate paging subsystem is needed. 1
+# float32/voxel each (vs. _flux_buf's 3 lanes/voxel), grown/zeroed in lockstep with it
+# in _ensure_flux_buf_capacity()/_allocate_flux_page()/_free_flux_page(). Gated entirely
+# behind use_projection — when false, these are allocated but never read or written by
+# any shader pass, so they cannot affect the current (Accelerate → Transport) behavior.
+var _pressure_buf: RID
+var _div_buf: RID
+
+# Feature flag for the pressure-projection connected-vessel hydrostatics port. Default
+# false: current baseline (Accelerate → Transport, no U-tube support) stays exactly as
+# shipped. When true, step() dispatches BuildRHS → (SolveRed → SolveBlack)×N_ITER →
+# Correct → Transport instead. See docs/PRESSURE_PROJECTION_PORT_PLAN.md.
+@export var use_projection: bool = false
+
+# Pressure-solve tuning. G/STIFF still starting points from Checkpoint 1's red-black-GS
+# bench re-measurement (tools/fluid_prototypes/utube_projection_redblack.py), NOT the
+# original bench's serial SOR values (G=64/STIFF=0.5/OMEGA=1.7/N_ITER~60), which don't
+# transfer directly. OMEGA/N_ITER updated 2026-07-04 after in-editor testing found
+# OMEGA=1.6 causes a genuine, non-decaying low-level oscillation at settle (small but
+# real fill jitter every tick, never landing on a silent "nothing changed" tick) --
+# over-relaxation intentionally overshoots each iteration for faster convergence, and it
+# was overshooting into a stable limit cycle instead of settling. OMEGA=1.0 (plain
+# Gauss-Seidel, no overshoot) confirmed genuinely silent settling (identical output
+# repeated 60+ ticks in a row) at N_ITER=24. Re-tune further against the acceptance scene
+# (Checkpoint 6) if convergence speed becomes a problem -- prefer raising N_ITER over
+# raising OMEGA back up, given what this cost to find.
+@export var proj_G: float = 64.0        # provisional gravity flux magnitude per open vertical face
+@export var proj_STIFF: float = 0.5     # density-correction strength (submerged, under-full cells)
+@export var proj_OMEGA: float = 1.0     # over-relaxation factor for red-black GS (1.0 = plain GS)
+# Diagnostic toggle (2026-07-04) — M1's design is quasi-static (pressure_buf zeroed fresh
+# every tick, see the port plan). Default false = that design, unchanged. When true, skip
+# the per-tick zero and let solve_red/solve_black keep refining last tick's pressure_buf
+# instead of re-solving from scratch -- testing whether the low-level fill jitter/
+# checkerboard artifact seen at settle is a convergence-consistency artifact (a fresh
+# solve landing in a slightly different place near the rest point each tick) rather than a
+# deeper issue with the STIFF density-correction term itself. This is exactly what M2
+# (temporal amortization) would do anyway; testing it early here is diagnostic only.
+@export var proj_warm_start: bool = false
+@export_range(1, 200, 1) var proj_N_ITER: int = 24  # red-black GS sweeps per tick (2 dispatches each)
+
+# Checkpoint 6 (2026-07-05, FLAT_PUDDLE_HANDOFF.md section 5b) — surface height-leveling
+# pass. BuildRHS's divergence only ever comes from VERTICAL stacking, so a single flat
+# uneven layer has div==0 everywhere and the pressure solve can never move it (P is pinned
+# to ~0 by the free-surface Dirichlet BC at every cell). This pass sidesteps the solve
+# entirely with a small, conservative, lateral fill exchange applied directly to the
+# surface layer, dispatched after Transport. Bench-validated in
+# tools/fluid_prototypes/height_level_prototype.py; defaults match that bench exactly.
+# Gated separately from use_projection since it's a standalone fix for a projection-only
+# gap — default false until verified in-engine (Checkpoint 6 acceptance gates).
+@export var use_surface_leveling: bool = false
+@export var proj_LEVEL_RATE: float = 0.20  # fraction of surface-elevation diff moved per tick
+@export var proj_LEVEL_MIN: float = 1.0    # stop below this |diff| -> clean termination, no churn
+# BUG (found 2026-07-06, in-engine): "submerged" originally meant ANY nonzero same-liquid
+# fill above (matching BuildRHS's own mask), so a thin residual film (e.g. fill=1) left on
+# top of an otherwise-full reservoir permanently locked it out of LevelSurface, even with
+# room to spread laterally -- confirmed reproducible in the bench (thin_film_check.py) and
+# fixed there: only treat a cell as submerged if the fill directly above exceeds a threshold.
+# SUPERSEDED (2026-07-06, see docs/BUG_LOG.md): the vertical-fill "submerged" proxy itself
+# turned out wrong whenever a buried low-fill seam sits inside an otherwise-uniformly-stacked
+# blob -- confirmed in-engine (a fully-submerged 255-fill cell with genuinely open ~11-fill
+# lateral neighbours never spread to them at all). Replaced with a PER-PAIR pressure-
+# difference test: |P_self - P_neighbour| beyond this threshold means the pressure solve
+# already owns this pair's redistribution (defer); near-zero means the projection has no
+# signal there (act), regardless of raw vertical fill. Bench-validated in
+# tools/fluid_prototypes/level_surface_v3.py / level_surface_v3_check.py. 2.0 chosen the
+# same way as before -- well below a genuine column-height gradient (~3.5 in the bench) and
+# above the buried-seam blind-spot case's converged residual (~0.3).
+@export var proj_LEVEL_PRESSURE_MIN: float = 2.0
 # Idle-guard for pages allocated purely as flux-dispatch neighbours (chunk-boundary fix,
 # 2026-07-02) that never actually became active — chunk_pos → idle ticks. Separate from
 # _active_chunks's own idle tracking, which only covers chunks that were simulating.
@@ -218,7 +290,7 @@ func _ready() -> void:
 		_flux_pipeline = _compute.compile_shader(_load_flux_shader(), 4)
 		if _flux_pipeline.is_empty():
 			push_error("FluidSimulation: fluid_flux.comp compile failed")
-		var fp := PackedByteArray(); fp.resize(52); fp.fill(0)  # damp, g_dt, gravity_bias, settle_threshold
+		var fp := PackedByteArray(); fp.resize(76); fp.fill(0)  # ...settle_threshold, proj_G, proj_STIFF, proj_OMEGA, proj_LEVEL_RATE, proj_LEVEL_MIN, proj_LEVEL_PRESSURE_MIN
 		_flux_params_buf = _compute.buffer_upload(fp)
 		_flux_chunk_list_capacity = 256
 		var fl := PackedByteArray(); fl.resize(_flux_chunk_list_capacity * 12); fl.fill(0)
@@ -240,7 +312,7 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	if Performance.has_custom_monitor("Voxel/fluid_active_chunks"):
 		Performance.remove_custom_monitor("Voxel/fluid_active_chunks")
-	for rid in [_flux_params_buf, _flux_chunk_list_buf, _dirty_chunks_buf, _flux_buf, _flux_page_table_buf, _conservation_buf, _gain_tracker_buf]:
+	for rid in [_flux_params_buf, _flux_chunk_list_buf, _dirty_chunks_buf, _flux_buf, _flux_page_table_buf, _conservation_buf, _gain_tracker_buf, _pressure_buf, _div_buf]:
 		if rid.is_valid():
 			_compute.free_rid(rid)
 
@@ -303,6 +375,139 @@ func debug_dump_flux_stats() -> void:
 		grand_abs += chunk_abs
 		grand_nonzero += chunk_nonzero
 	print("[FluxDebug] TOTAL |flux|=%d across %d nonzero lane(s)" % [grand_abs, grand_nonzero])
+
+
+# Pressure-projection port debug tool (2026-07-04, Checkpoint 3 — see
+# docs/PRESSURE_PROJECTION_PORT_PLAN.md). One-shot BuildRHS dispatch over the CURRENT
+# active+neighbour flux list, for manually verifying div_buf against known test scenes
+# BEFORE the pass is wired into the real step() dispatch loop (that wiring is
+# Checkpoint 5, gated on use_projection). Safe to call regardless of use_projection's
+# value or how step() is currently running — this only writes div_buf, which nothing
+# else reads yet. Bound to a debug key in world.gd, alongside debug_dump_div().
+# Shared setup for the one-shot projection debug dispatches: builds the active+neighbour
+# flux list, allocates any missing pages, uploads the chunk list. Returns the flux list
+# (empty if not ready/nothing active) and the uniforms array for the caller to dispatch
+# with. Does NOT upload params — each pass differs only in params.pass, which callers set.
+func _debug_prep_projection_dispatch() -> Dictionary:
+	if _flux_pipeline.is_empty() or not _orchestrator.is_grid_valid():
+		return {"flux_list": [], "uniforms": []}
+	var active_list := _active_chunks.keys()
+	var flux_list := _build_flux_chunk_list(active_list)
+	if flux_list.is_empty():
+		return {"flux_list": [], "uniforms": []}
+	_ensure_flux_page_table()
+	for cp in flux_list:
+		if _flux_page_table_buf.is_valid() and not _flux_chunk_table.has(cp):
+			_allocate_flux_page(cp)
+	_upload_flux_chunk_list(flux_list)
+	return {"flux_list": flux_list, "uniforms": _build_flux_uniforms()}
+
+
+func debug_dispatch_build_rhs() -> void:
+	var prep := _debug_prep_projection_dispatch()
+	var flux_list: Array = prep["flux_list"]
+	if flux_list.is_empty():
+		print("[ProjDebug] not ready or no active chunks to dispatch BuildRHS over")
+		return
+	var grid_min  := _orchestrator.get_grid_min()
+	var grid_span := _orchestrator.get_grid_span()
+	_upload_flux_params(grid_min, grid_span, _frame, 2)  # BuildRHS
+	_compute.run(_flux_pipeline, prep["uniforms"], flux_list.size() * 4, 4, 4)
+	_compute.submit()
+	_compute.sync()
+	print("[ProjDebug] BuildRHS dispatched over %d chunk(s)" % flux_list.size())
+
+
+# Pressure-projection port debug tool (2026-07-04, Checkpoint 4). One-shot BuildRHS +
+# proj_N_ITER red-black GS sweeps, for manually verifying pressure_buf against known test
+# scenes before Checkpoint 5 wires this into the real step() loop. Zeroes pressure_buf
+# fully before solving (this debug command has no warm-start/persistence concept yet —
+# that's a Checkpoint 5+/M2 concern), so each call is a clean, reproducible solve from
+# scratch, matching the bench's per-tick "drop stale P in non-liquid cells" reset just
+# extended to a full zero for repeatable manual testing.
+func debug_dispatch_solve_pressure() -> void:
+	var prep := _debug_prep_projection_dispatch()
+	var flux_list: Array = prep["flux_list"]
+	if flux_list.is_empty():
+		print("[ProjDebug] not ready or no active chunks to dispatch solve over")
+		return
+	var grid_min  := _orchestrator.get_grid_min()
+	var grid_span := _orchestrator.get_grid_span()
+	var uniforms: Array = prep["uniforms"]
+
+	if _pressure_buf.is_valid() and not proj_warm_start:
+		var cs := _chunk_manager.chunk_size
+		var vpc := cs * cs * cs
+		var zero := PackedByteArray(); zero.resize(_flux_page_capacity * vpc * 4); zero.fill(0)
+		_compute.buffer_update(_pressure_buf, 0, zero)
+
+	_upload_flux_params(grid_min, grid_span, _frame, 2)  # BuildRHS
+	_compute.run(_flux_pipeline, uniforms, flux_list.size() * 4, 4, 4)
+	_compute.submit(); _compute.sync()
+
+	for _i in range(proj_N_ITER):
+		_upload_flux_params(grid_min, grid_span, _frame, 3)  # solve_red
+		_compute.run(_flux_pipeline, uniforms, flux_list.size() * 4, 4, 4)
+		_compute.submit(); _compute.sync()
+		_upload_flux_params(grid_min, grid_span, _frame, 4)  # solve_black
+		_compute.run(_flux_pipeline, uniforms, flux_list.size() * 4, 4, 4)
+		_compute.submit(); _compute.sync()
+
+	print("[ProjDebug] BuildRHS + %d red-black sweep(s) dispatched over %d chunk(s)" % [proj_N_ITER, flux_list.size()])
+
+
+# Checkpoint 6 debug tool (2026-07-05) — one-shot LevelSurface dispatch, for manually
+# verifying the surface-leveling pass against known test scenes (e.g. build_utube_test_scene
+# or a hand-placed flat puddle) independent of use_projection/use_surface_leveling and the
+# real step() loop. Unlike debug_dispatch_build_rhs()/debug_dispatch_solve_pressure() (which
+# only write div_buf/pressure_buf, harmless to call standalone), LevelSurface writes real
+# changelog entries — this resets and applies the changelog itself so the effect is
+# immediately visible in voxels_a, exactly like a single real dispatch in step().
+func debug_dispatch_level_surface() -> void:
+	var prep := _debug_prep_projection_dispatch()
+	var flux_list: Array = prep["flux_list"]
+	if flux_list.is_empty():
+		print("[ProjDebug] not ready or no active chunks to dispatch LevelSurface over")
+		return
+	var grid_min  := _orchestrator.get_grid_min()
+	var grid_span := _orchestrator.get_grid_span()
+	_orchestrator.reset_changelog()
+	_upload_flux_params(grid_min, grid_span, _frame, 6)  # LevelSurface
+	_compute.run(_flux_pipeline, prep["uniforms"], flux_list.size() * 4, 4, 4)
+	_compute.submit()
+	_compute.sync()
+	_orchestrator.apply_changelog()
+	print("[ProjDebug] LevelSurface dispatched + applied over %d chunk(s)" % flux_list.size())
+
+
+# Prints div_buf's value at a specific (chunk, local) voxel — call after
+# debug_dispatch_build_rhs(). Reuses the same page-lookup pattern as _debug_dump_voxel().
+func debug_dump_div(chunk_pos: Vector3i, local: Vector3i) -> void:
+	var page: int = _flux_chunk_table.get(chunk_pos, -1)
+	if page < 0:
+		print("[ProjDebug] chunk %s has no flux/pressure page" % chunk_pos)
+		return
+	var cs := _chunk_manager.chunk_size
+	var vpc := cs * cs * cs
+	var local_idx := local.z * cs * cs + local.y * cs + local.x
+	var byte_off := (page * vpc + local_idx) * 4
+	var data: PackedByteArray = _compute.download_range(_div_buf, byte_off, 4)
+	print("[ProjDebug] div at chunk %s local %s = %f" % [chunk_pos, local, data.decode_float(0)])
+
+
+# Prints pressure_buf's value at a specific (chunk, local) voxel — call after
+# debug_dispatch_solve_pressure().
+func debug_dump_pressure(chunk_pos: Vector3i, local: Vector3i) -> void:
+	var page: int = _flux_chunk_table.get(chunk_pos, -1)
+	if page < 0:
+		print("[ProjDebug] chunk %s has no flux/pressure page" % chunk_pos)
+		return
+	var cs := _chunk_manager.chunk_size
+	var vpc := cs * cs * cs
+	var local_idx := local.z * cs * cs + local.y * cs + local.x
+	var byte_off := (page * vpc + local_idx) * 4
+	var data: PackedByteArray = _compute.download_range(_pressure_buf, byte_off, 4)
+	print("[ProjDebug] P at chunk %s local %s = %f" % [chunk_pos, local, data.decode_float(0)])
 
 
 func step() -> void:
@@ -408,10 +613,47 @@ func step() -> void:
 		# 0 if all active chunks were unloaded since last step().
 		var flux_bitmask := zero_dirty  # default: no flux changes this sub-step
 		if flux_count > 0:
-			_upload_flux_params(grid_min, grid_span, _frame, 0)  # Accelerate
-			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
-			_compute.submit()
-			_compute.sync()
+			# Pressure-projection port, Checkpoint 5 (docs/PRESSURE_PROJECTION_PORT_PLAN.md).
+			# use_projection swaps Accelerate for BuildRHS -> zero pressure_buf -> N red-black
+			# sweeps -> Correct. Transport below is completely unchanged either way -- it
+			# only ever reads flux_buf, never cares which pass populated it this tick.
+			if use_projection:
+				_upload_flux_params(grid_min, grid_span, _frame, 2)  # BuildRHS
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
+
+				# Quasi-static (M1): pressure is recomputed fresh every tick, never
+				# persisted -- see the port plan's M1 milestone note on why (no
+				# warm-start/inertia yet, that's a separate, later M2 concern).
+				# Diagnostic override: proj_warm_start skips this zero, letting
+				# solve_red/solve_black refine last tick's pressure_buf instead --
+				# testing whether the observed settle-time jitter/checkerboard is a
+				# convergence-consistency artifact of re-solving from scratch every
+				# tick, see the export's own comment above.
+				if _pressure_buf.is_valid() and not proj_warm_start:
+					var cs := _chunk_manager.chunk_size
+					var vpc := cs * cs * cs
+					var zero_p := PackedByteArray(); zero_p.resize(_flux_page_capacity * vpc * 4); zero_p.fill(0)
+					_compute.buffer_update(_pressure_buf, 0, zero_p)
+
+				for _iter in range(proj_N_ITER):
+					_upload_flux_params(grid_min, grid_span, _frame, 3)  # solve_red
+					_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+					_compute.submit(); _compute.sync()
+					_upload_flux_params(grid_min, grid_span, _frame, 4)  # solve_black
+					_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+					_compute.submit(); _compute.sync()
+
+				_upload_flux_params(grid_min, grid_span, _frame, 5)  # Correct
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
+			else:
+				_upload_flux_params(grid_min, grid_span, _frame, 0)  # Accelerate
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
 
 			_orchestrator.reset_changelog()
 			_compute.buffer_update(_dirty_chunks_buf, 0, zero_dirty)
@@ -419,6 +661,18 @@ func step() -> void:
 			_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
 			_compute.submit()
 			_compute.sync()
+
+			# Checkpoint 6 (2026-07-05, FLAT_PUDDLE_HANDOFF.md section 5b) — LevelSurface,
+			# dispatched after Transport (and after any projection passes above). Appends
+			# to the SAME changelog Transport just wrote to (no reset_changelog() call
+			# here) so both are applied together by the single apply_changelog() below.
+			# Gated separately from use_projection: it's a standalone fix for a
+			# projection-only gap and has no effect when use_projection is false.
+			if use_projection and use_surface_leveling:
+				_upload_flux_params(grid_min, grid_span, _frame, 6)  # LevelSurface
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
 
 			flux_bitmask = _compute.download_range(_dirty_chunks_buf, 0, DIRTY_BUF_BYTES)
 			_orchestrator.apply_changelog()
@@ -568,6 +822,13 @@ func _ensure_flux_buf_capacity(min_pages: int) -> void:
 		_flux_page_capacity = initial
 		for i in range(initial - 1, -1, -1):
 			_flux_freelist.append(i)
+		# _pressure_buf/_div_buf ride the same page count as _flux_buf, 1 float32/voxel
+		# each (vs. flux's 3 lanes/voxel) — see the field declarations above.
+		var scalar_bytes = initial * vpc * 4
+		var pdata := PackedByteArray(); pdata.resize(scalar_bytes); pdata.fill(0)
+		_pressure_buf = _compute.buffer_upload(pdata)
+		var ddata := PackedByteArray(); ddata.resize(scalar_bytes); ddata.fill(0)
+		_div_buf = _compute.buffer_upload(ddata)
 		return
 	if min_pages > _flux_page_capacity:
 		var old_bytes := _flux_page_capacity * vpc * 3 * 4
@@ -576,6 +837,10 @@ func _ensure_flux_buf_capacity(min_pages: int) -> void:
 			new_capacity *= 2
 		var new_bytes := new_capacity * vpc * 3 * 4
 		_flux_buf = _compute.buffer_grow(_flux_buf, old_bytes, new_bytes)
+		var old_scalar_bytes := _flux_page_capacity * vpc * 4
+		var new_scalar_bytes := new_capacity * vpc * 4
+		_pressure_buf = _compute.buffer_grow(_pressure_buf, old_scalar_bytes, new_scalar_bytes)
+		_div_buf = _compute.buffer_grow(_div_buf, old_scalar_bytes, new_scalar_bytes)
 		for i in range(new_capacity - 1, _flux_page_capacity - 1, -1):
 			_flux_freelist.append(i)
 		_flux_page_capacity = new_capacity
@@ -626,6 +891,10 @@ func _free_flux_page(chunk_pos: Vector3i) -> void:
 	var vpc := cs * cs * cs
 	var zero := PackedByteArray(); zero.resize(vpc * 3 * 4); zero.fill(0)
 	_compute.buffer_update(_flux_buf, page * vpc * 3 * 4, zero)
+	# A future occupant must not inherit stale pressure/RHS any more than stale flux.
+	var scalar_zero := PackedByteArray(); scalar_zero.resize(vpc * 4); scalar_zero.fill(0)
+	_compute.buffer_update(_pressure_buf, page * vpc * 4, scalar_zero)
+	_compute.buffer_update(_div_buf, page * vpc * 4, scalar_zero)
 
 
 func _decode_dirty_bitmask(bitmask: PackedByteArray) -> Array[Vector3i]:
@@ -664,12 +933,14 @@ func _build_flux_uniforms() -> Array:
 		u.call(8, _flux_page_table_buf),
 		u.call(9, _conservation_buf),
 		u.call(10, _gain_tracker_buf),
+		u.call(11, _pressure_buf),  # pressure-projection port, Checkpoint 2 — unread until Checkpoint 4
+		u.call(12, _div_buf),       # pressure-projection port, Checkpoint 2 — unread until Checkpoint 3
 	]
 
 
 func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pass_idx: int) -> void:
 	var cs := _chunk_manager.chunk_size
-	var p := PackedByteArray(); p.resize(52)
+	var p := PackedByteArray(); p.resize(76)
 	p.encode_s32(0,  cs)
 	p.encode_s32(4,  grid_min.x)
 	p.encode_s32(8,  grid_min.y)
@@ -683,6 +954,15 @@ func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pa
 	p.encode_float(40, g_dt)
 	p.encode_float(44, gravity_bias)
 	p.encode_s32(48, settle_threshold)
+	# Pressure-projection port (Checkpoint 2) — unread by any shader pass until Checkpoints
+	# 3-5 implement build_rhs/solve_red/solve_black/correct; harmless to upload now.
+	p.encode_float(52, proj_G)
+	p.encode_float(56, proj_STIFF)
+	p.encode_float(60, proj_OMEGA)
+	# Checkpoint 6 (surface-leveling pass, params.pass == 6) — unread by any other pass.
+	p.encode_float(64, proj_LEVEL_RATE)
+	p.encode_float(68, proj_LEVEL_MIN)
+	p.encode_float(72, proj_LEVEL_PRESSURE_MIN)
 	_compute.buffer_update(_flux_params_buf, 0, p)
 
 

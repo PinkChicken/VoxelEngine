@@ -313,9 +313,44 @@ def test_utube_equalizes():
     print("  -> U-tube equalizes (balanced arms, full columns, mass conserved)")
 
 
+def test_sealed_column_vacuum_lock_KNOWN_LIMITATION():
+    """KNOWN LIMITATION (2026-07-04, found stress-testing beyond the default suite): a liquid
+    column sealed to a solid ceiling with NO air gap does not drain — it vacuum-locks. This is
+    physically correct for an incompressible fluid (no free-surface anchor; draining would
+    require compression or a vacuum) but is likely game-unfriendly. It correlates with the
+    SEAL, not the imbalance magnitude: the identical column with a 2-row air gap equalizes
+    (re-verified independently: gap=0 and gap=1 both lock, gap>=2 always equalizes).
+    A naive fix (treat solid-above as a P=0 anchor) is WRONG — it also fires on confined
+    horizontal pipe cells and zeroes the connector gradient, breaking the normal case. A
+    principled fix is a non-negativity (P >= 0) cavitation constraint (an LCP solve); scoped
+    out of v1. This test documents/pins the behavior so a future change to it is noticed."""
+    def utube(H, fill_to):
+        s = Sim(6, H); lx, rx = 1, 4
+        for y in range(1, H - 1):
+            s.carve(lx, y, AIR); s.carve(rx, y, AIR)
+        for x in range(lx, rx + 1):
+            s.carve(x, 1, LIQUID, FILL_CAP)
+        for y in range(1, fill_to + 1):
+            s.carve(lx, y, LIQUID, FILL_CAP)
+        return s, lx, rx
+    # air gap above the tall column -> equalizes fine (the mechanism is sound)
+    s, lx, rx = utube(16, 12); s.run(max_ticks=8000)
+    gap_imb = abs(s.arm_mass(lx) - s.arm_mass(rx))
+    # same column sealed to the ceiling -> vacuum locks (does not drain)
+    s, lx, rx = utube(14, 12); s.run(max_ticks=8000)
+    sealed_imb = abs(s.arm_mass(lx) - s.arm_mass(rx))
+    print(f"[sealed-column]  air-gap imbalance={gap_imb:.2f} (equalizes)  |  "
+          f"sealed imbalance={sealed_imb:.2f} (vacuum-locked, KNOWN LIMITATION)")
+    assert gap_imb < 1.0, f"air-gap column should equalize, got {gap_imb:.2f}"
+    assert sealed_imb > 2.0, ("sealed column now DRAINS -- behavior changed; a cavitation "
+                              "rule may have landed. Update docs/BUG_LOG.md accordingly.")
+    print("  -> free-surface case equalizes; sealed case vacuum-locks as documented")
+
+
 if __name__ == "__main__":
     test_pressure_null_at_rest()
     test_bottom_pipe_gradient()
     test_flat_lake_noop()
     test_utube_equalizes()
-    print("\nALL TESTS PASSED")
+    test_sealed_column_vacuum_lock_KNOWN_LIMITATION()
+    print("\nALL TESTS PASSED (incl. documented sealed-column limitation)")

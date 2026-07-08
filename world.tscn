@@ -55,7 +55,7 @@ environment = SubResource("Environment_tlwt5")
 
 [node name="Terrain" type="Node" parent="." unique_id=1858831734]
 script = ExtResource("4_aqk2v")
-base_height = 0.0
+base_height = -5.0
 primary_noise = SubResource("FastNoiseLite_wse8f")
 primary_amplitude = 0.0
 detail_noise = SubResource("FastNoiseLite_ic0uy")
@@ -95,10 +95,12 @@ metadata/_custom_type_script = "uid://b3ee10d6jlmm0"
 
 [node name="FluidSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=603403045]
 script = ExtResource("12_fluid")
+use_projection = true
+use_surface_leveling = true
 watch_chunk = Vector3i(0, -1, 0)
 watch_local = Vector3i(0, 0, 0)
 steps_per_tick = 3
-gravity_bias = 1.0
+gravity_bias = 1.6
 settle_threshold = 1
 
 [node name="MaterialDB" type="Node" parent="." unique_id=1815152731]

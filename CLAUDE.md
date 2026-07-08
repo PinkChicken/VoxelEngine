@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A voxel sandbox engine built in **Godot 4** (GDScript) with GPU-accelerated raymarched rendering. The engine stores 4-byte voxels on the CPU (`block_data`) and renders them via a GPU compute shader raymarcher. Granular (sand) simulation runs on the GPU via `granular_sim.comp`.
 
+## Working with the User
+
+The user works nights — don't treat the hour as a reason to suggest wrapping up or picking things up "tomorrow." Keep going through checkpoints/testing at their pace; they'll say when they want to stop.
+
 ## Running the Project
 
 Open the project in Godot 4 and press F5 (or the Play button) to run `world.tscn` as the main scene. There are no CLI build commands — all development is done through the Godot editor. The `@tool` annotation on several scripts means they also run in the editor (ChunkManager, Chunk, TerrainGetter).

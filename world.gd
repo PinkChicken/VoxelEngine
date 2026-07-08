@@ -63,11 +63,11 @@ func _unhandled_input(event: InputEvent) -> void:
 			# coordinates into the Inspector by hand was too unreliable for isolating
 			# one misbehaving voxel found by eye. Reuses the same cursor raycast
 			# player_controller.gd already uses for add/remove voxel, so "look at the
-			# voxel, press V" targets exactly what's under the crosshair. Moved off F7
-			# (2026-07-07) — F6-F9 are Godot's own editor debug-menu shortcuts (step,
-			# breakpoint, etc.) and can steal window focus away from the running game
-			# depending on editor settings, which is exactly the opposite of what you
-			# want when you need to hit this key repeatedly without re-focusing.
+			# voxel, press F7" targets exactly what's under the crosshair. Deliberately
+			# F7, not V (2026-07-04) -- V is player_controller.gd's sphere-visibility
+			# toggle; F6-F9 are Godot's own editor debug-menu shortcuts and can steal
+			# window focus depending on editor settings, but that tradeoff was accepted
+			# to keep V free for the sphere toggle.
 			var target = raymarch_renderer.get_cursor_remove_pos()
 			if target == null:
 				print("[FluidWatch] no voxel under cursor")
@@ -78,3 +78,91 @@ func _unhandled_input(event: InputEvent) -> void:
 				fluid_simulation.watch_local = lp
 				fluid_simulation.watch_enabled = true
 				print("[FluidWatch] now watching chunk %s local %s (world %s)" % [cp, lp, target])
+		elif event.keycode == KEY_G:
+			# Pressure-projection port debug tool (2026-07-04, Checkpoints 3-4 — see
+			# docs/PRESSURE_PROJECTION_PORT_PLAN.md). Nothing here is wired into the real
+			# step() dispatch loop yet (that's Checkpoint 5), so this manually triggers a
+			# full BuildRHS + proj_N_ITER red-black solve and prints both div and the
+			# solved pressure at the current F7-key watch target.
+			fluid_simulation.debug_dispatch_solve_pressure()
+			fluid_simulation.debug_dump_div(fluid_simulation.watch_chunk, fluid_simulation.watch_local)
+			fluid_simulation.debug_dump_pressure(fluid_simulation.watch_chunk, fluid_simulation.watch_local)
+		elif event.keycode == KEY_U:
+			build_utube_test_scene()
+		elif event.keycode == KEY_H:
+			# Checkpoint 6 debug tool (2026-07-05, FLAT_PUDDLE_HANDOFF.md section 5b).
+			# One-shot LevelSurface dispatch + apply, independent of use_projection/
+			# use_surface_leveling and the real step() loop -- for manually verifying the
+			# surface-leveling pass against a hand-placed or scripted flat puddle.
+			fluid_simulation.debug_dispatch_level_surface()
+		elif event.keycode == KEY_DOWN:
+			# Debug rewind tool (2026-07-07) -- save the canonical voxel buffer to a CPU-side
+			# snapshot so a test scenario can be captured once and replayed: build the scene,
+			# press Down to save, unpause/step forward and watch one voxel, press Up to
+			# restore, step forward again and watch a different voxel, etc.
+			world_orchestrator.debug_save_voxel_snapshot()
+		elif event.keycode == KEY_UP:
+			world_orchestrator.debug_load_voxel_snapshot()
+
+
+# Scripted U-tube acceptance-test scene (2026-07-04, Checkpoint 4/5 tooling — see
+# docs/PRESSURE_PROJECTION_PORT_PLAN.md). Hand-carving with the sphere/single-voxel edit
+# tools produced inconsistent, hard-to-reproduce geometry (uneven connector width, unclear
+# arm volumes) that polluted the bottom-gradient measurement -- this builds an exact,
+# known-volume rig instead: a solid rock shell (guaranteed sealed regardless of
+# surrounding terrain), two equal-height vertical shafts connected by a bottom passage,
+# and a water block placed near the top of ONE shaft (not pre-filling the whole arm) so it
+# falls and fills naturally once unpaused -- closer to an actual pour, and the poured
+# volume is exactly known instead of hand-placed. Pauses the sim immediately after
+# building so chunks/geometry can be inspected (F7/G) before manually unpausing (P).
+const UTUBE_ARM_HALF_XZ := 1      # half-extent -> 3x3 voxel shaft cross-section
+const UTUBE_ARM_HEIGHT  := 20     # voxels tall, both arms equal height
+const UTUBE_GAP         := 8      # horizontal distance between arm centers
+const UTUBE_WALL        := 2      # rock shell thickness around the carved shape
+const UTUBE_WATER_BLOCK := 5      # voxels tall, placed near the top of the pour arm
+
+func build_utube_test_scene() -> void:
+	var origin = raymarch_renderer.get_cursor_remove_pos()
+	if origin == null:
+		print("[UTubeBuilder] no voxel under cursor -- aim at solid ground first")
+		return
+
+	var arm_a_x = origin.x
+	var arm_b_x = origin.x + UTUBE_GAP
+	var base_y  = origin.y          # floor of the connecting passage
+	var top_y   = base_y + UTUBE_ARM_HEIGHT
+	var z       = origin.z
+
+	# Solid rock shell first, sized to fully contain both shafts + connector + wall
+	# thickness -- guarantees a sealed rig regardless of what's actually around the
+	# cursor target (open air, existing terrain, previously-carved space, etc.).
+	var shell_center := Vector3i((arm_a_x + arm_b_x) / 2, (base_y + top_y) / 2, z)
+	var shell_half := Vector3i(
+		(arm_b_x - arm_a_x) / 2 + UTUBE_ARM_HALF_XZ + UTUBE_WALL,
+		(top_y - base_y) / 2 + UTUBE_WALL,
+		UTUBE_ARM_HALF_XZ + UTUBE_WALL)
+	world_orchestrator.edit_box(shell_center, shell_half, EditDispatcher.EditOp.ADD, Chunk.Mat.GLASS)
+
+	# Carve the two vertical shafts (air).
+	var arm_a_center := Vector3i(arm_a_x, (base_y + top_y) / 2, z)
+	var arm_b_center := Vector3i(arm_b_x, (base_y + top_y) / 2, z)
+	var arm_half := Vector3i(UTUBE_ARM_HALF_XZ, (top_y - base_y) / 2, UTUBE_ARM_HALF_XZ)
+	world_orchestrator.edit_box(arm_a_center, arm_half, EditDispatcher.EditOp.REMOVE)
+	world_orchestrator.edit_box(arm_b_center, arm_half, EditDispatcher.EditOp.REMOVE)
+
+	# Carve the bottom connecting passage (air), joining both shafts.
+	var connector_center := Vector3i((arm_a_x + arm_b_x) / 2, base_y, z)
+	var connector_half := Vector3i((arm_b_x - arm_a_x) / 2 + UTUBE_ARM_HALF_XZ, 0, UTUBE_ARM_HALF_XZ)
+	world_orchestrator.edit_box(connector_center, connector_half, EditDispatcher.EditOp.REMOVE)
+
+	# Pre-poured water block near the top of arm A (not the whole arm) -- an exact,
+	# known volume that falls and fills the tube once unpaused, rather than a
+	# hand-placed splat of uncertain size.
+	var water_top_y = top_y - 2  # leave a couple voxels of headroom below the opening
+	var water_center := Vector3i(arm_a_x, water_top_y - UTUBE_WATER_BLOCK / 2, z)
+	var water_half := Vector3i(UTUBE_ARM_HALF_XZ, UTUBE_WATER_BLOCK / 2, UTUBE_ARM_HALF_XZ)
+	world_orchestrator.edit_box(water_center, water_half, EditDispatcher.EditOp.ADD, Chunk.Mat.WATER)
+
+	simulation_runtime.paused = true
+	get_node("HotBar").set_paused(true)
+	print("[UTubeBuilder] built U-tube at %s (arm height %d, gap %d) -- sim paused, press P to run" % [origin, UTUBE_ARM_HEIGHT, UTUBE_GAP])

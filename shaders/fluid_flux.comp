@@ -82,11 +82,36 @@ layout(set = 0, binding = 2, std430) readonly buffer SimParams {
     int grid_min_x; int grid_min_y; int grid_min_z;
     int grid_span_x; int grid_span_y; int grid_span_z;
     int frame;
-    int pass;    // 0 = Accelerate. 1 = Transport (fused conservation guard + apply, writes changelog).
+    // 0 = Accelerate. 1 = Transport (fused conservation guard + apply, writes changelog).
+    // Pressure-projection port (2026-07-04, docs/PRESSURE_PROJECTION_PORT_PLAN.md): 2 =
+    // build_rhs, 3 = solve_red, 4 = solve_black, 5 = correct (Checkpoints 3-5, all landed).
+    // 6 = level_surface (Checkpoint 6, FLAT_PUDDLE_HANDOFF.md section 5b) -- fractional
+    // lateral fill exchange on the free surface, bypassing the pressure solve entirely.
+    // Fixes the design gap where BuildRHS's divergence is vertical-stacking-only, so a
+    // single flat uneven layer has div==0 everywhere and the solve can never move it.
+    int pass;
     float damp;  // velocity retained per tick (0–1) — tunable, see FluidSimulation.damp
     float g_dt;  // acceleration per unit of hydrostatic head — tunable, see FluidSimulation.g_dt
     float gravity_bias;   // Y-axis multiplier on the (dh - elevation) term — see FluidSimulation.gravity_bias
     int settle_threshold; // scheduling-only floor for mark_dirty — see FluidSimulation.settle_threshold
+    // Pressure-projection port, Checkpoint 2 -- read by build_rhs/solve_red/solve_black/correct.
+    float proj_G;
+    float proj_STIFF;
+    float proj_OMEGA;
+    // Checkpoint 6 (surface-leveling pass, params.pass == 6) -- bench defaults 0.20/1.0,
+    // see tools/fluid_prototypes/height_level_prototype.py (LEVEL_RATE/LEVEL_MIN).
+    float proj_LEVEL_RATE;
+    float proj_LEVEL_MIN;
+    // Checkpoint 6, superseded (2026-07-06, see BUG_LOG.md): originally
+    // proj_LEVEL_SUBMERGED_MIN, a vertical-fill threshold. Replaced by
+    // proj_LEVEL_PRESSURE_MIN -- the |P_self - P_neighbour| threshold beyond which a pair
+    // is treated as having a real pressure-solve-owned gradient (defer, damping -> 0)
+    // rather than the projection's blind spot (act, damping -> 1). See
+    // proj_level_pressure_damping()'s header comment for the full reasoning; bench-validated
+    // in tools/fluid_prototypes/level_surface_v3.py. Default 2.0 -- roughly an order of
+    // magnitude below the smallest genuine column-height gradient measured in the bench
+    // (~3.5) and well above the buried-seam blind-spot case's converged residual (~0.3).
+    float proj_LEVEL_PRESSURE_MIN;
 } params;
 layout(set = 0, binding = 3, std430) readonly buffer MaterialSim { uint data[256]; } material_sim;
 layout(set = 0, binding = 4, std430)          buffer Changelog {
@@ -113,6 +138,14 @@ layout(set = 0, binding = 9, std430) buffer ConservationCheck { int delta; } con
 // races between threads — good enough for "which chunk should I go look at", not meant to
 // be a perfectly deterministic "the" largest value if several qualify in the same tick.
 layout(set = 0, binding = 10, std430) buffer GainTracker { int flat_idx; int amount; } gain_tracker;
+// Pressure-projection port (2026-07-04, Checkpoint 2) -- one float32/voxel each, riding
+// the exact same page allocation as flux_buf/flux_page_table (see
+// FluidSimulation._pressure_buf/_div_buf). Unread/unwritten by any pass until Checkpoints
+// 3-5 (build_rhs writes div_buf; solve_red/solve_black write pressure_buf; correct reads
+// both). Declared `coherent` like flux_buf since solve_red/solve_black will read a
+// neighbour invocation's write within the same dispatch (red-black coloring).
+layout(set = 0, binding = 11, std430) coherent buffer PressureBuf { float data[]; } pressure_buf;
+layout(set = 0, binding = 12, std430) coherent buffer DivBuf      { float data[]; } div_buf;
 
 const uint SIM_LIQUID    = 2u;
 const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGELOG_ENTRIES
@@ -182,6 +215,47 @@ const ivec3 AXIS_DIR[3] = ivec3[3](ivec3(1, 0, 0), ivec3(0, 1, 0), ivec3(0, 0, 1
 void mark_dirty(int flat_idx, int vpc) {
     int chunk_slot = flat_idx / vpc;
     atomicOr(dirty_chunks.data[uint(chunk_slot) >> 5u], 1u << (uint(chunk_slot) & 31u));
+}
+
+// Pressure-projection port (2026-07-04, Checkpoint 3 — docs/PRESSURE_PROJECTION_PORT_PLAN.md).
+// BuildRHS (params.pass == 2) computes the provisional-gravity-flux divergence into
+// div_buf, per tools/fluid_prototypes/utube_projection.py's prov_fy()/solve_pressure().
+//
+// "Sealed" here means solid material OR entirely outside the loaded voxel grid (no chunk
+// loaded there at all) -- NOT a loaded, empty (air) cell, which is an open boundary. This
+// is the port plan's non-negotiable #3: solid/off-grid/withheld-page are all Neumann
+// (sealed) boundaries for this system, never treated as air. world_to_flat() already
+// returns -1 for both "off-grid" and "chunk not loaded" uniformly, which is exactly the
+// distinction needed here.
+bool proj_is_sealed(ivec3 p) {
+    int idx = world_to_flat(p);
+    if (idx < 0) return true;
+    uint m = voxels_a.data[idx] & 0xFFu;
+    return (m != 0u && material_sim.data[m] != SIM_LIQUID);
+}
+
+// True iff p is a loaded, in-range voxel holding the SAME liquid material as mat_id --
+// mirrors Accelerate's existing "two different liquids never exchange directly" rule
+// (the bench only ever has one liquid type, so its is_liquid() check is the same thing).
+bool proj_is_liquid_same(ivec3 p, uint mat_id) {
+    int idx = world_to_flat(p);
+    if (idx < 0) return false;
+    return (voxels_a.data[idx] & 0xFFu) == mat_id;
+}
+
+// Provisional vertical gravity flux on the +Y face between p and p+Y (up) -- analogous to
+// the bench's prov_fy(). Nonzero only when there's same-material liquid directly above p
+// (water above wants to fall into p) and neither side is sealed. Scaled by the ABOVE
+// cell's fill (its weight), not a flat constant -- this is what injects the fill
+// imbalance into the RHS and is what lets a real lateral pressure gradient survive
+// between a tall arm and a short one (see the bench's header comment).
+float proj_prov_fy(ivec3 p, uint mat_id) {
+    ivec3 above = p + AXIS_DIR[1];
+    if (proj_is_sealed(p) || proj_is_sealed(above)) return 0.0;
+    if (!proj_is_liquid_same(above, mat_id)) return 0.0;
+    int idx_above = world_to_flat(above);
+    float fill_above = float((voxels_a.data[idx_above] >> 8u) & 0xFFu);
+    return -params.proj_G * (fill_above / 255.0);
 }
 
 // Phase 7e Step 3 — hydrostatic head.
@@ -273,6 +347,137 @@ ivec2 resolve_page_local(ivec3 gpos, int cs, int vpc) {
     ivec3 lp = gpos - world_to_chunk(gpos) * cs;
     int local = lp.z * cs * cs + lp.y * cs + lp.x;
     return ivec2(page, local);
+}
+
+// Pressure-projection port (2026-07-04, Checkpoint 4). Classifies a solve neighbour for
+// the red-black GS stencil. Uses resolve_page_local (not just world_to_flat) so a
+// neighbour whose chunk has a page but is WITHHELD this tick (outside the 1-hop dispatch
+// radius, flux_page_table entry temporarily -1) is treated as sealed too -- the exact
+// same discipline as compute_s_out/compute_s_in's page<0 fix above, and the port plan's
+// non-negotiable #3 (solid / off-grid / withheld page are ALL Neumann-sealed, never air).
+const int PROJ_NB_LIQUID = 0;  // same-material liquid: couples normally
+const int PROJ_NB_AIR    = 1;  // loaded, in-range, empty: free surface, Dirichlet P=0
+const int PROJ_NB_SEALED = 2;  // solid, off-grid, different liquid, or withheld page: dropped
+
+int proj_classify_neighbor(ivec3 p, uint mat_id, int cs, int vpc) {
+    ivec2 pl = resolve_page_local(p, cs, vpc);
+    if (pl.x < 0) return PROJ_NB_SEALED;
+    int idx = world_to_flat(p);
+    if (idx < 0) return PROJ_NB_SEALED;  // defensive: page existing implies this shouldn't happen
+    uint m = voxels_a.data[idx] & 0xFFu;
+    if (m == mat_id) return PROJ_NB_LIQUID;
+    if (m == 0u) return PROJ_NB_AIR;
+    return PROJ_NB_SEALED;  // solid, or a DIFFERENT liquid -- never couple directly (Accelerate's rule)
+}
+
+// Reads pressure_buf at an arbitrary world position through the same paging as flux_buf.
+// 0.0 for a withheld/unmapped page -- callers only use this after already confirming
+// PROJ_NB_LIQUID via proj_classify_neighbor, so this is never asked to stand in for a
+// sealed or free-surface neighbour (those are handled directly in the solve loop).
+float proj_pressure_at(ivec3 p, int cs, int vpc) {
+    ivec2 pl = resolve_page_local(p, cs, vpc);
+    if (pl.x < 0) return 0.0;
+    return pressure_buf.data[pl.x * vpc + pl.y];
+}
+
+// Checkpoint 6 (surface-leveling pass, docs/PRESSURE_PROJECTION_PORT_PLAN.md /
+// FLAT_PUDDLE_HANDOFF.md section 5b). Classifies a LATERAL exchange partner. Reuses the
+// same "withheld page = sealed" discipline as proj_classify_neighbor above -- the exchange
+// amount is computed independently and identically at BOTH endpoints from this tick's
+// read-only pre-pass state (same trick Transport's compute_s_out/compute_s_in already rely
+// on), so if the neighbour's chunk isn't part of this tick's dispatch, its own invocation
+// never runs and its half of the exchange would never be applied -- a one-sided leak
+// exactly like the flux dispatch-range bug documented on Accelerate above. Treating a
+// withheld neighbour as NONE (no exchange) rather than guessing keeps this race-free.
+const int LEVEL_NB_SURFACE = 0;  // liquid, same material as the asking cell, no same-liquid directly above
+const int LEVEL_NB_DRY     = 1;  // air, sitting directly on a sealed floor (a real shelf water can spread onto)
+const int LEVEL_NB_NONE    = 2;  // sealed, withheld, submerged, or a different liquid: no exchange
+
+// BUG (found 2026-07-06, in-engine test): the original version of this function took the
+// ASKING cell's own mat_id and required the neighbour to match it exactly ("m == mat_id")
+// to be classified as LEVEL_NB_SURFACE. That works fine when a liquid surface cell asks
+// about a neighbour (mat_id is real, e.g. 3) -- but a DRY cell's own mat_id is 0 (air), so
+// a dry cell asking about a genuinely liquid neighbour got "3 == 0" -> false -> NONE,
+// meaning the dry cell could never see a surface partner to receive from at all. Result: the
+// liquid cell's own delta correctly computed a loss and applied it, but its dry neighbour's
+// independently-computed delta was always 0 -- a real one-sided leak (confirmed in-engine:
+// a lone droplet on open ground lost its entire fill over several ticks with ZERO
+// materialization anywhere nearby). Fix: classify by what is actually there (any liquid
+// material counts as a candidate SURFACE), and report which material via nb_mat_out so the
+// caller can apply the "don't mix two different liquids" guard itself -- but ONLY when the
+// caller is itself a liquid surface cell (a DRY caller has no material of its own yet, so it
+// accepts whichever single liquid it finds, mirroring Transport's existing donor-scan rule).
+// BUG (found 2026-07-06, in-engine test, after the SUBMERGED_MIN fix above): the boolean
+// "is submerged" gate re-evaluates fresh every tick against whatever fill happens to be
+// directly above right now. When that fill hovers right at the SUBMERGED_MIN boundary (the
+// real-world case: a falling stream's settle noise, e.g. the vertical solve's fy alternating
+// -6,-5,-6,-5... tick to tick), the gate flips SURFACE<->NONE on effectively every single
+// tick (confirmed in the bench: 199/200 ticks flipped) -- a 100% on/off swing of this cell's
+// entire lateral contribution, which is what produced the visible air<->liquid flicker at
+// the puddle edge under a landing stream. Fixed via a continuous damping factor -- but that
+// fix (like SUBMERGED_MIN before it) still asked "how much fill is directly above me" as a
+// PROXY for "does the pressure solve already own this cell's redistribution." That proxy is
+// wrong whenever a low-fill seam is buried inside an otherwise-uniformly-stacked blob:
+// confirmed in-engine, a fully-submerged 255-fill cell with genuinely open ~11-fill lateral
+// neighbours never transferred to them AT ALL, because vertical fill above it alone was
+// enough to zero its damping and disable LevelSurface for that cell entirely, regardless of
+// whether its lateral neighbours had real room.
+//
+// BUG (found 2026-07-06, in-engine test): fixed by asking the ACTUAL question instead of a
+// proxy for it -- BuildRHS/solve_red/solve_black already compute a real solved pressure
+// field every tick (pressure_buf). If there's a genuine pressure difference between two
+// neighbours, Correct is already pushing between them and LevelSurface should defer; if the
+// difference is ~0 (even when both cells are deeply submerged by fill), the projection has
+// no signal there at all -- the actual blind spot. Bench-confirmed (tools/fluid_prototypes/
+// level_surface_v3.py): every previously-validated scenario (flat uneven puddle, droplet,
+// thin film) has BuildRHS's divergence at or near zero everywhere, so solved P is uniformly
+// ~0 there too -- |P_self - P_neighbour| ~ 0 reduces this formula to full strength
+// automatically, identical to the old behaviour in all of those cases. Only the
+// buried-seam / genuinely-different-column-height cases differ, and in the right direction:
+// a real column-height difference (U-tube pre-settle) has a real |ΔP| and correctly defers;
+// a same-total-stacking buried seam has near-zero |ΔP| despite very different raw fill,
+// correctly letting LevelSurface act where BuildRHS structurally cannot see anything.
+//
+// This is a PER-PAIR quantity now (not a single per-cell value) -- p_self is fixed per cell,
+// but p_nb varies per neighbour, so a cell can correctly have a real gradient toward one
+// neighbour (defer) and none toward another (act), unlike the old single self_damping value
+// that vetoed ALL of a cell's neighbours at once. proj_pressure_at() already returns 0.0 for
+// any non-liquid/withheld position (the same free-surface Dirichlet convention BuildRHS/
+// Correct already use), so a dry or sealed neighbour naturally reads as P=0 here too --
+// no separate helper needed for that case.
+float proj_level_pressure_damping(float p_self, float p_nb) {
+    return clamp(1.0 - abs(p_self - p_nb) / params.proj_LEVEL_PRESSURE_MIN, 0.0, 1.0);
+}
+
+// Classifies a lateral neighbour by what is actually there (see the classify-symmetry bug
+// entry above for why this never gates on the ASKING cell's own material). No longer gates
+// on submerged-ness either -- that's now a continuous per-pair damping factor applied by the
+// caller (proj_level_pressure_damping), computed independently by both endpoints of a pair
+// from the same solved pressure field so conservation stays exact.
+int proj_level_classify(ivec3 p, int cs, int vpc, out uint nb_mat_out) {
+    nb_mat_out = 0u;
+    ivec2 pl = resolve_page_local(p, cs, vpc);
+    if (pl.x < 0) return LEVEL_NB_NONE;
+    int idx = world_to_flat(p);
+    if (idx < 0) return LEVEL_NB_NONE;
+    uint m = voxels_a.data[idx] & 0xFFu;
+    if (m != 0u && material_sim.data[m] == SIM_LIQUID) {
+        nb_mat_out = m;
+        return LEVEL_NB_SURFACE;
+    }
+    if (m == 0u) {
+        return proj_is_sealed(p - AXIS_DIR[1]) ? LEVEL_NB_DRY : LEVEL_NB_NONE;
+    }
+    return LEVEL_NB_NONE;  // solid -- never couple directly
+}
+
+// Fill of a neighbour already classified LEVEL_NB_SURFACE (0.0 for anything else, including
+// LEVEL_NB_DRY -- an empty cell contributes elevation 0, matching the bench's "treat an
+// empty floor cell as elevation y (fill 0)").
+float proj_level_fill_of(ivec3 p, int cls) {
+    if (cls != LEVEL_NB_SURFACE) return 0.0;
+    int idx = world_to_flat(p);
+    return float((voxels_a.data[idx] >> 8u) & 0xFFu);
 }
 
 // s_out(X) = min(1, fill(X) / total_out(X)), where total_out(X) is exactly what the old
@@ -568,6 +773,278 @@ void main() {
             float new_f = float(decayed) + accel;
             new_f = clamp(new_f, -axis_cap, axis_cap);
             flux_buf.data[lane] = int(round(new_f));
+        }
+        return;
+    }
+
+    // === BuildRHS: provisional-gravity-flux divergence -> div_buf (params.pass == 2) ===
+    // Pressure-projection port, Checkpoint 3. Only liquid cells get a div value (matches
+    // the bench: air/solid cells are outside the pressure domain entirely). Vertical only
+    // -- gravity has no X/Z component, so those faces never contribute (matches the
+    // bench's "F*_x are all 0, so only vertical contributes").
+    if (params.pass == 2) {
+        if (my_page < 0) return;  // nowhere to store the RHS for this chunk
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        int div_slot = my_page * vpc + my_local;
+        if (!my_is_liquid) {
+            div_buf.data[div_slot] = 0.0;
+            return;
+        }
+        float fy_up = proj_prov_fy(gpos, mat_id);                  // face p -> p+Y
+        float fy_dn = proj_prov_fy(gpos - AXIS_DIR[1], mat_id);    // face p-Y -> p
+        float d = fy_up - fy_dn;
+        // Density correction: pulls a submerged, under-full cell toward full. MASKED OFF
+        // at the free surface (no same-liquid cell directly above) -- port plan
+        // non-negotiable #2. Without the mask this force-fills legitimately-partial
+        // surface cells and breaks the rest/pressure-null state.
+        if (proj_is_liquid_same(gpos + AXIS_DIR[1], mat_id)) {
+            d += params.proj_STIFF * (255.0 - float(my_fill));
+        }
+        div_buf.data[div_slot] = d;
+        return;
+    }
+
+    // === Pressure solve: one red-black Gauss-Seidel sweep (params.pass == 3 red / == 4
+    // black) -> pressure_buf. Pressure-projection port, Checkpoint 4. Coloring is
+    // (gx+gy+gz)&1 in WORLD voxel coordinates -- must be world, not local_pos, so the
+    // checkerboard is consistent across chunk boundaries (a chunk's own size could be
+    // even, which would otherwise flip the pattern chunk-to-chunk). Per the bench's
+    // solve_pressure(): laplacian(P) = div, liquid-liquid faces couple normally,
+    // liquid-air faces are Dirichlet P=0 (free surface), solid/off-grid/withheld-page
+    // faces are Neumann (dropped) -- see proj_classify_neighbor() above.
+    if (params.pass == 3 || params.pass == 4) {
+        if (my_page < 0) return;
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        if (!my_is_liquid) return;  // pressure is only solved over the liquid domain
+
+        int my_color = (gpos.x + gpos.y + gpos.z) & 1;
+        int this_color = (params.pass == 3) ? 0 : 1;  // pass 3 = red (color 0), 4 = black (color 1)
+        if (my_color != this_color) return;
+
+        float s = 0.0;
+        int k = 0;
+        for (int axis = 0; axis < 3; axis++) {
+            for (int dir = -1; dir <= 1; dir += 2) {
+                ivec3 nb = gpos + AXIS_DIR[axis] * dir;
+                int cls = proj_classify_neighbor(nb, mat_id, cs, vpc);
+                if (cls == PROJ_NB_LIQUID) {
+                    s += proj_pressure_at(nb, cs, vpc);
+                    k += 1;
+                } else if (cls == PROJ_NB_AIR) {
+                    k += 1;  // Dirichlet P=0: contributes 0 to s, still counts toward k
+                }
+                // PROJ_NB_SEALED: dropped entirely, no k increment (Neumann).
+            }
+        }
+        if (k == 0) return;  // sealed on every side -- nothing to solve against
+
+        int p_slot = my_page * vpc + my_local;
+        float div_here = div_buf.data[p_slot];
+        float target = (s - div_here) / float(k);
+        float p_old = pressure_buf.data[p_slot];
+        pressure_buf.data[p_slot] = p_old + params.proj_OMEGA * (target - p_old);
+        return;
+    }
+
+    // === Correct: F = u* - grad(P) -> flux_buf's owned faces (params.pass == 5) ===
+    // Pressure-projection port, Checkpoint 5. Writes the SAME 3 owned lanes Accelerate
+    // (pass 0) would have written -- Transport (pass 1) is completely unchanged, reading
+    // flux_buf exactly as before regardless of which pass populated it this tick. Mirrors
+    // Accelerate's exact face-participation rules (solid/air/different-liquid handling)
+    // so the two passes gate identically; only the drive term differs (u*-grad(P) here
+    // vs the head()-based dh there). No axis_cap clamp, matching the bench's
+    // correct_flux() exactly -- an oversized request is bounded downstream by Transport's
+    // existing s_out/s_in budgeting (compute_s_out/compute_s_in), same as any other pass.
+    if (params.pass == 5) {
+        if (my_page < 0) return;
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        bool my_is_air    = (mat_id == 0u);
+
+        for (int axis = 0; axis < 3; axis++) {
+            ivec3 nb = gpos + AXIS_DIR[axis];
+            uint nv  = read_a(nb);
+            uint nm  = nv & 0xFFu;
+            int lane = my_page * vpc * 3 + my_local * 3 + axis;
+
+            bool nb_is_liquid = (nm != 0u && material_sim.data[nm] == SIM_LIQUID);
+            bool nb_is_air    = (nm == 0u);
+
+            if ((!my_is_liquid && !my_is_air) || (!nb_is_liquid && !nb_is_air)) {
+                flux_buf.data[lane] = 0;
+                continue;
+            }
+            if (!my_is_liquid && !nb_is_liquid) {
+                flux_buf.data[lane] = 0;
+                continue;
+            }
+            if (my_is_liquid && nb_is_liquid && mat_id != nm) {
+                flux_buf.data[lane] = 0;
+                continue;
+            }
+
+            uint active_mat = my_is_liquid ? mat_id : nm;
+
+            float p_here = proj_pressure_at(gpos, cs, vpc);
+            float p_nb   = proj_pressure_at(nb, cs, vpc);
+            float grad   = p_nb - p_here;
+
+            float u_star = (axis == 1) ? proj_prov_fy(gpos, active_mat) : 0.0;
+            float f = u_star - grad;
+
+            flux_buf.data[lane] = int(round(f));
+        }
+        return;
+    }
+
+    // === LevelSurface: fractional lateral fill exchange, free surface only (params.pass ==
+    // 6). Checkpoint 6 -- bench-validated fix for the flat-puddle design gap
+    // (tools/fluid_prototypes/height_level_prototype.py, FLAT_PUDDLE_HANDOFF.md section 5b).
+    // BuildRHS's divergence only ever sees VERTICAL stacking (provisional gravity flux +
+    // the submerged density correction), so a single flat layer of uneven water has
+    // div==0 everywhere -- with the free-surface P=0 Dirichlet BC also true at every cell,
+    // the Poisson solve's unique solution is P==0 exactly, so the pressure solve can never
+    // move it no matter how uneven it actually is. This pass sidesteps the solve entirely:
+    // a small, conservative, surface-elevation-driven diffusion applied directly to the
+    // surface layer, dispatched AFTER Transport (and after any projection passes) each
+    // sub-step. Uses the same "compute both endpoints independently from read-only
+    // pre-pass state" trick Transport's compute_s_out/compute_s_in already rely on for
+    // race-free, lock-free parallelism -- no face ownership needed, conservation holds by
+    // construction (see proj_level_classify's header comment). Writes via the changelog
+    // like every other pass -- never touches voxels_a directly (single-writer discipline).
+    if (params.pass == 6) {
+        int self_cls = LEVEL_NB_NONE;
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        if (my_is_liquid) {
+            self_cls = LEVEL_NB_SURFACE;
+        } else if (mat_id == 0u) {
+            self_cls = proj_is_sealed(gpos - AXIS_DIR[1]) ? LEVEL_NB_DRY : LEVEL_NB_NONE;
+        }
+        if (self_cls == LEVEL_NB_NONE) return;  // solid, or a non-fillable dry cell
+
+        float self_fill = (self_cls == LEVEL_NB_SURFACE) ? float(my_fill) : 0.0;
+        // Superseded the old per-cell "submerged" early-return (see proj_level_pressure_damping's
+        // header comment): damping is now PER-PAIR, so a cell can legitimately defer toward one
+        // neighbour (real pressure gradient) while still acting toward another (none) -- no
+        // single self-only gate can express that, so there is no early-return here anymore.
+        float p_self = proj_pressure_at(gpos, cs, vpc);
+        int delta = 0;
+        uint donor_mat = 0u;
+
+        // Lateral only (X, Z) -- gravity/vertical stacking is BuildRHS's job, never this
+        // pass's. AXIS_DIR[0] = X, AXIS_DIR[2] = Z; axis 1 (Y) is skipped entirely.
+        for (int axis = 0; axis < 3; axis += 2) {
+            for (int dir = -1; dir <= 1; dir += 2) {
+                ivec3 nb = gpos + AXIS_DIR[axis] * dir;
+                uint nb_mat;
+                int nb_cls = proj_level_classify(nb, cs, vpc, nb_mat);
+                if (nb_cls == LEVEL_NB_NONE) continue;
+                if (self_cls == LEVEL_NB_DRY && nb_cls == LEVEL_NB_DRY) continue;  // two empties: nothing to exchange
+                // Two different liquids never couple directly (mirrors Accelerate's rule) --
+                // only meaningful when SELF is itself a liquid surface cell; a DRY self has
+                // no material of its own yet, so it accepts whichever single liquid it finds.
+                if (self_cls == LEVEL_NB_SURFACE && nb_cls == LEVEL_NB_SURFACE && nb_mat != mat_id) continue;
+
+                float nb_fill = proj_level_fill_of(nb, nb_cls);
+                float diff = self_fill - nb_fill;
+                if (abs(diff) < params.proj_LEVEL_MIN) continue;
+
+                // BUG (found 2026-07-06, in-engine test): summing diff*RATE per direction
+                // UNNORMALIZED lets total outflow reach up to 4*RATE (all 4 lateral sides
+                // active at once) in a single tick -- the Python bench never caught this
+                // because it only ever tested a 1D row (exactly one active neighbor per
+                // side). Confirmed in-engine: a single droplet on open flat ground with all
+                // 4 sides free lost ~80% of its fill per tick (51->10->2->0, four
+                // consecutive ~80% cuts) and the scripted U-tube's 3x3 cross-section arms
+                // drained/scattered through the same mechanism. Fix: divide by a fixed
+                // LEVEL_DEGREE (max lateral neighbor count) so total per-tick outflow is
+                // capped at LEVEL_RATE regardless of how many sides are active -- same
+                // symmetric pairwise math, correctly normalized.
+                const float LEVEL_DEGREE = 4.0;
+                // BUG (found 2026-07-06, in-engine test, "flickering at the floor"): a
+                // boolean submerged gate re-evaluated fresh every tick flips this cell's
+                // ENTIRE contribution on/off whenever the fill directly above hovers near
+                // a threshold (e.g. a falling stream's settle noise) -- bench-confirmed
+                // 199/200 ticks flipping. Fixed with a continuous damping factor.
+                //
+                // SUPERSEDED (2026-07-06, see BUG_LOG.md and proj_level_pressure_damping's
+                // header comment): that continuous factor was still keyed off VERTICAL fill
+                // above SELF alone, as a proxy for "does the pressure solve already own this
+                // cell." A buried low-fill seam inside an otherwise-uniformly-stacked blob
+                // broke the proxy: vertical fill above a 255-full cell said "submerged" even
+                // though a genuinely open lateral neighbour existed right beside it --
+                // confirmed in-engine (a fully-submerged cell with ~11-fill lateral
+                // neighbours never transferred to them at all). Fixed by asking the ACTUAL
+                // question directly, per pair: does the already-solved pressure field see a
+                // real gradient here? A same-total-stacking buried seam reads as
+                // |P_self - P_neighbour| ~ 0 (correctly acts); a genuine column-height
+                // difference reads as a real |ΔP| (correctly defers to Correct's own push).
+                // Bench-validated in tools/fluid_prototypes/level_surface_v3.py /
+                // level_surface_v3_check.py (buried-seam + genuine-height-difference +
+                // full regression suite, ALL PASSED).
+                float p_nb = proj_pressure_at(nb, cs, vpc);
+                float pair_damping = proj_level_pressure_damping(p_self, p_nb);
+
+                // BUG (found 2026-07-06, in-engine test: real, sustained mass loss on any
+                // puddle with cells that have 2+ active lateral neighbours -- confirmed via
+                // debug_conservation_check showing near-constant "fill lost" every tick,
+                // never balancing out, unlike ordinary +-1 rounding noise). The original
+                // version summed every active pair's contribution into a single float
+                // (delta_f) and rounded ONCE at the end. Conservation requires each PAIR's
+                // contribution to cancel exactly between its two cells -- but round(a+b) !=
+                // round(a) + round(b) in general, so once a cell has more than one active
+                // neighbour, its aggregate-then-rounded total has no guaranteed relationship
+                // to the sum of what its individual neighbours independently rounded on
+                // their own side. That mismatch is a real, structural leak, not noise -- and
+                // it explains why the loss was consistently one-directional rather than
+                // randomly distributed. The Python bench never caught this because it models
+                // fill as continuous floats and never introduces an integer rounding step at
+                // all. Fix: round PER PAIR, immediately, before summing. round(x) and
+                // round(-x) are exact negatives of each other, so two cells independently
+                // rounding the same pair's amount always get exactly opposite integers --
+                // pairwise cancellation holds regardless of how many other neighbours either
+                // cell has, because summing already-integer amounts preserves exact equality
+                // (unlike summing floats and rounding the aggregate). Uses roundEven(), not
+                // round() -- GLSL's round() has IMPLEMENTATION-DEFINED tie-breaking at exact
+                // .5 boundaries, not guaranteed symmetric under negation on all hardware;
+                // roundEven() is spec-guaranteed round(x) == -round(-x), which this fix's
+                // entire cancellation guarantee depends on.
+                int pair_delta = int(roundEven(diff * (params.proj_LEVEL_RATE / LEVEL_DEGREE) * pair_damping));
+                delta -= pair_delta;  // give toward the lower side, take from the higher side
+                if (pair_delta != 0 && self_cls == LEVEL_NB_DRY && nb_cls == LEVEL_NB_SURFACE) {
+                    donor_mat = nb_mat;
+                }
+            }
+        }
+        if (delta == 0) return;
+
+        int old_fill = int(self_cls == LEVEL_NB_SURFACE ? my_fill : 0u);
+        int new_fill = clamp(old_fill + delta, 0, 255);
+        if (new_fill == old_fill) return;
+
+        uint new_voxel;
+        if (new_fill == 0) {
+            new_voxel = 0u;
+        } else if (self_cls == LEVEL_NB_DRY) {
+            if (donor_mat == 0u) return;  // no valid donor found this tick -- spurious, skip (mirrors Transport)
+            new_voxel = donor_mat | (uint(new_fill) << 8u);
+        } else {
+            new_voxel = (my_voxel & 0xFFFF00FFu) | (uint(new_fill) << 8u);
+        }
+
+        int applied = new_fill - old_fill;
+        atomicAdd(conservation.delta, applied);
+        if (applied > gain_tracker.amount) {
+            gain_tracker.amount   = applied;
+            gain_tracker.flat_idx = my_flat;
+        }
+
+        uint log_slot = atomicAdd(changelog.count, 1u);
+        if (log_slot < MAX_CHANGELOG) {
+            changelog.entries[log_slot * 2u]     = uint(my_flat);
+            changelog.entries[log_slot * 2u + 1u] = new_voxel;
+        }
+        if (abs(applied) >= params.settle_threshold) {
+            mark_dirty(my_flat, vpc);
         }
         return;
     }
