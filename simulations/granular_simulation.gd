@@ -20,6 +20,13 @@ var _chunk_manager: ChunkManager
 var _active_chunks: Dictionary = {}  # Vector3i → int (consecutive idle frames, 0 = active this frame)
 var _frame: int = 0
 
+# Sub-steps per simulation tick — higher = faster-falling sand, more GPU cost. Each
+# sub-step is one checkerboard-parity dispatch (granular_sim.comp gates on
+# `params.frame % 2`), so grains only get a chance to move on every OTHER sub-step;
+# at 1 (the old fixed behaviour) a full tick only advances one parity, which reads as
+# slow motion for a voxel size this small. Mirrors FluidSimulation.steps_per_tick.
+@export var steps_per_tick: int = 1
+
 # 64 bytes covers 512 slots (512 / 32 * 4) — exactly the full fixed world (8³ chunks).
 # If buffer_grow ever pushes capacity past 512, _dirty_chunks_buf must also grow.
 const DIRTY_BUF_BYTES := 64
@@ -87,20 +94,16 @@ func get_active_chunk_positions() -> Array[Vector3i]:
 
 
 func step() -> void:
-	_frame += 1
 	if _active_chunks.is_empty() or _pipeline.is_empty():
 		return
 	if not _orchestrator.is_grid_valid():
 		return
-	# Reset dirty bitmask and changelog before dispatch.
-	var zero_dirty := PackedByteArray(); zero_dirty.resize(DIRTY_BUF_BYTES); zero_dirty.fill(0)
-	_compute.buffer_update(_dirty_chunks_buf, 0, zero_dirty)
-	_orchestrator.reset_changelog()
 
 	var grid_min  := _orchestrator.get_grid_min()
 	var grid_span := _orchestrator.get_grid_span()
-	_upload_global_params(grid_min, grid_span, _frame)
 
+	# Dispatch range is fixed for the whole tick (re-derived next real step() call) —
+	# same convention FluidSimulation uses for its flux/phi lists across sub-steps.
 	var active_list := _active_chunks.keys()
 	var active_count := active_list.size()
 	_upload_chunk_list(active_list)
@@ -110,25 +113,43 @@ func step() -> void:
 	var zero_list := _build_zero_list(active_list)
 	_upload_zero_chunk_list(zero_list)
 	var zero_uniforms := _build_zero_uniforms()
-	_compute.run(_zero_pipeline, zero_uniforms, zero_list.size() * 4, 4, 4)
-	_compute.submit()
-	_compute.sync()
-
-	# Granular simulation — each grain atomically claims its destination via CAS.
 	var uniforms := _build_uniforms()
-	_compute.run(_pipeline, uniforms, active_count * 4, 4, 4)
-	_compute.submit()
-	_compute.sync()
 
-	# Download dirty bitmask immediately post-sync — just a memcopy, no GPU stall.
-	# The bitmask replaces _extract_changed_chunks (was O(131k) GDScript loop).
-	var bitmask: PackedByteArray = _compute.download_range(_dirty_chunks_buf, 0, DIRTY_BUF_BYTES)
+	var zero_dirty     := PackedByteArray(); zero_dirty.resize(DIRTY_BUF_BYTES); zero_dirty.fill(0)
+	var merged_bitmask := PackedByteArray(); merged_bitmask.resize(DIRTY_BUF_BYTES); merged_bitmask.fill(0)
 
-	# Patch _voxel_buf_a on the GPU from the changelog (no CPU extraction).
-	_orchestrator.apply_changelog()
+	for _s in range(steps_per_tick):
+		_frame += 1
 
-	# Decode bitmask → dirty chunk positions.
-	var changed: Array[Vector3i] = _decode_dirty_bitmask(bitmask)
+		# Reset dirty bitmask and changelog before this sub-step's dispatch.
+		_compute.buffer_update(_dirty_chunks_buf, 0, zero_dirty)
+		_orchestrator.reset_changelog()
+		_upload_global_params(grid_min, grid_span, _frame)
+
+		_compute.run(_zero_pipeline, zero_uniforms, zero_list.size() * 4, 4, 4)
+		_compute.submit()
+		_compute.sync()
+
+		# Granular simulation — each grain atomically claims its destination via CAS.
+		_compute.run(_pipeline, uniforms, active_count * 4, 4, 4)
+		_compute.submit()
+		_compute.sync()
+
+		# Download dirty bitmask immediately post-sync — just a memcopy, no GPU stall.
+		var bitmask: PackedByteArray = _compute.download_range(_dirty_chunks_buf, 0, DIRTY_BUF_BYTES)
+
+		# Patch _voxel_buf_a on the GPU from the changelog (no CPU extraction).
+		_orchestrator.apply_changelog()
+
+		# OR dirty bits across sub-steps — a chunk that only moved on ONE parity this
+		# tick must still count as changed.
+		for i in range(DIRTY_BUF_BYTES / 4):
+			var a := merged_bitmask.decode_u32(i * 4)
+			var c := bitmask.decode_u32(i * 4)
+			merged_bitmask.encode_u32(i * 4, a | c)
+
+	# Decode merged bitmask → dirty chunk positions.
+	var changed: Array[Vector3i] = _decode_dirty_bitmask(merged_bitmask)
 	if not changed.is_empty():
 		# Stamp the simulation mask on every chunk sand moved into or out of.
 		# apply_changelog only patches voxels_a (GPU) and never updates block_data or
