@@ -51,6 +51,7 @@ var _sim_active_buf: RID  # 1 u32 per voxel slot; zeroed before sim, set on grai
 var _chunk_table: RID
 var _changelog_buf: RID      # layout: [u32 count | (flat_idx u32, new_value u32) × count]
 var _material_sim_buf: RID   # 256 u32s: material_id → SimulationClass (flat cache on GPU)
+var _material_flow_buf: RID  # 256 floats: material_id → MaterialDef.flow (fluid_flux.comp viscosity)
 var _grid_min: Vector3i = Vector3i.ZERO
 var _grid_span: Vector3i = Vector3i.ZERO
 var _chunk_to_slot: Dictionary = {}   # Vector3i → slot index
@@ -104,6 +105,8 @@ func _exit_tree() -> void:
 	_free_voxel_buffers()
 	if _material_sim_buf.is_valid():
 		_compute.free_rid(_material_sim_buf)
+	if _material_flow_buf.is_valid():
+		_compute.free_rid(_material_flow_buf)
 	if _surface_out_buf.is_valid():
 		_compute.free_rid(_surface_out_buf)
 	if _surface_params_buf.is_valid():
@@ -128,6 +131,19 @@ func _build_material_cache() -> void:
 	for i in range(256):
 		buf.encode_s32(i * 4, _material_simulation[i])
 	_material_sim_buf = _compute.buffer_upload(buf)
+
+	# Per-material flow (viscosity) cache — fluid_flux.comp binding 13. Defaults to 1.0
+	# (thin/water) for every id, INCLUDING unregistered ones, so a material that somehow
+	# isn't in _material_db.materials never silently freezes (a 0.0 default would zero
+	# g_eff/cap_scale in the shader's viscosity formula and stop that liquid from flowing).
+	if _material_flow_buf.is_valid():
+		_compute.free_rid(_material_flow_buf)
+	var flow_buf := PackedByteArray(); flow_buf.resize(256 * 4)
+	for i in range(256):
+		flow_buf.encode_float(i * 4, 1.0)
+	for def in _material_db.materials:
+		flow_buf.encode_float(def.id * 4, def.flow)
+	_material_flow_buf = _compute.buffer_upload(flow_buf)
 
 
 func _process(delta: float) -> void:
@@ -162,6 +178,7 @@ func swap_voxel_bufs() -> void:
 
 func get_changelog_buf() -> RID: return _changelog_buf
 func get_material_sim_buf() -> RID: return _material_sim_buf
+func get_material_flow_buf() -> RID: return _material_flow_buf
 
 func reset_changelog() -> void:
 	var zero := PackedByteArray(); zero.resize(4); zero.fill(0)

@@ -75,7 +75,7 @@ Index: `(z * cs² + y * cs + x) * VOXEL_STRIDE`. The 4-byte layout is identical 
 ### Player Controls
 - Left/right click: add/remove voxel. Placement snaps to the exact face under the crosshair (no mid-air placement) unless the sphere-visual indicator (`V`) is toggled on, in which case placement is distance-tracked and can be pushed out into open air — see `Player/player_controller.gd`'s `_add_placement_voxel()`.
 - `B`: spawn sphere of selected material
-- `1-4` / mouse wheel: select material
+- `1-5` / mouse wheel: select material
 - `F`: toggle fly mode
 - `C`: toggle collision debug visualization
 - `Escape`: release mouse

@@ -105,16 +105,18 @@ const SIM_BITS: Array[int] = [0, 1, 2, 4, 8]  # indexed by SimulationClass value
 
 **Default materials:**
 
-| ID | Name | Phase | Simulation | Gravity |
-|----|------|-------|------------|---------|
-| 0 | AIR | GAS | NONE | NONE |
-| 1 | ROCK | SOLID | NONE | NONE |
-| 2 | SAND | SOLID | GRANULAR | DOWN |
-| 3 | WATER | LIQUID | LIQUID | DOWN |
-| 4 | GLASS | SOLID | NONE | NONE |
-| 5 | FIRE | EFFECT | EFFECT | UP |
-| 6 | SMOKE | GAS | GAS | UP |
-| 7 | OIL | LIQUID | LIQUID | DOWN |
+| ID | Name | Phase | Simulation | Gravity | Flow |
+|----|------|-------|------------|---------|------|
+| 0 | AIR | GAS | NONE | NONE | — |
+| 1 | ROCK | SOLID | NONE | NONE | — |
+| 2 | SAND | SOLID | GRANULAR | DOWN | — |
+| 3 | WATER | LIQUID | LIQUID | DOWN | 1.0 |
+| 4 | GLASS | SOLID | NONE | NONE | — |
+| 5 | FIRE | EFFECT | EFFECT | UP | — |
+| 6 | SMOKE | GAS | GAS | UP | — |
+| 7 | OIL | LIQUID | LIQUID | DOWN | 0.69 |
+
+**`flow` (2026-07-10, `MaterialDef.flow`, LIQUID materials only):** per-material viscosity scalar consumed by `fluid_flux.comp`'s existing single-knob viscosity formula (`VISCOSITY_NOTES.md`) — `effective_flow = FluidSimulation.flow (global slider) * material_flow.data[active_mat]` (a new 256-float GPU buffer, `WorldOrchestrator._build_material_cache()` → `get_material_flow_buf()`, binding 13 in `fluid_flux.comp`). 1.0 = thin/water (bit-identical to the pre-per-material-flow shader); lower = thicker (damp eases toward 0.6, `g_dt`/`axis_cap` scale down). Oil (0.69) is the first material to actually exercise this — it's the same physics as the global slider, just per-material instead of a single world-wide knob. Two different liquids never exchange flux directly regardless of `flow` (pre-existing same-material-only gating in Pass A), so water and oil stay separated at a shared boundary; oil simply moves more sluggishly than water once flowing.
 
 ---
 
@@ -1242,22 +1244,24 @@ Uses the same CAS + changelog infrastructure as `granular_sim.comp`. Identical b
 
 #### Phase 7b — Granular-fluid displacement swap
 
-**Status: ✅ COMPLETE — `try_displace` implemented in `granular_sim.comp`, including a 3-level water relocation (sideways at water's height → sideways at sand's old height → rise above sand as last resort).**
+**Status: ✅ COMPLETE — `try_displace_priority` implemented in `granular_sim.comp`, a 3-level water relocation (sideways at water's height → sideways one level above water → rise into the granular voxel's old slot as last resort), shared identically by BOTH the straight-down and diagonal-down fall paths.**
 
-Granular and fluid run **sequentially** in the same tick (granular→apply_changelog→fluid). `try_displace` in `granular_sim.comp` swaps sand into a water cell and relocates the water to sand's old position:
+**GAP FIX (2026-07-10):** originally, only the straight-down fall path had the 3-level priority (inline at the call site); the diagonal-down path called a separate, simpler `try_displace` that unconditionally teleported the displaced water straight to the granular voxel's old slot with no sideways attempt at all — despite this doc previously (inaccurately) claiming "same pattern applied to the 4 diagonal-down destinations." Since sand's diagonal fall is tried via 4 shuffled lateral offsets and is at least as common as straight-down in practice, this meant a large fraction of sand-into-water displacement was silently skipping the sideways-first behavior. Fixed by generalizing the priority logic into one function, `try_displace_priority(water_pos, ...)`, parameterized by the liquid's actual position rather than assuming it's directly below the granular voxel — both call sites now use it.
 
-1. Granular: `try_displace(df, sand_voxel, water_voxel, my_flat, vpc)` — CAS claims df for sand (same as `try_move`), then writes `water_voxel` unconditionally to `voxels_b[my_flat]`, logs both as changelog entries.
-2. `apply_changelog`: A gets sand at df, water at my_flat.
-3. Fluid: reads updated A — sees water at my_flat, simulates it normally.
+Granular and fluid run **sequentially** in the same tick (granular→apply_changelog→fluid). `try_displace_priority` in `granular_sim.comp` swaps the granular voxel into a liquid cell and relocates the liquid:
 
-No conflict: B is re-zeroed by `zero_slots` before each dispatch. `voxels_b[my_flat]` is this thread's exclusive source slot — no other thread can write it. The water's fill byte travels intact with the displaced voxel.
+1. Granular: `try_displace_priority(water_pos, my_voxel, their_voxel, my_flat, vpc, lat)` — CAS claims `water_pos` for the granular voxel (same pattern as `try_move`), then searches for a sideways destination for the liquid (level 1: lateral neighbours of `water_pos`; level 2: lateral neighbours one level above `water_pos`) before falling back to writing the liquid unconditionally into `voxels_b[my_flat]` (last resort — only when truly enclosed, e.g. a sealed 1-wide shaft).
+2. `apply_changelog`: A gets the granular voxel at `water_pos`, and the liquid at wherever it was relocated (sideways destination, or `my_flat` in the last-resort case).
+3. Fluid: reads updated A — sees the relocated liquid, simulates it normally.
 
-Fall path:
+No conflict: B is re-zeroed by `zero_slots` before each dispatch. `voxels_b[my_flat]` is this thread's exclusive source slot — no other thread can write it, which is also the safety invariant the last-resort fallback depends on (see the INVARIANT comment on `try_displace_priority` in the shader — the fallback target must always be `my_flat`, never a newly-CAS'd cell, or a granular voxel could claim `water_pos` with no guaranteed destination for the displaced liquid, a silent mass-conservation bug). The liquid's fill byte travels intact with the displaced voxel.
+
+Fall path (identical for both straight-down and the 4 diagonal-down destinations):
 - Destination is **air**: `try_move` (existing, unchanged).
-- Destination is **liquid**: `try_displace` (new).
+- Destination is **liquid**: `try_displace_priority`.
 - Destination is **solid/granular**: skip (existing, unchanged).
 
-Same pattern applied to the 4 diagonal-down destinations.
+**Not yet built (proposed for Fable 5 analysis, 2026-07-10):** this is still a whole-voxel swap — the granular voxel and the liquid trade slots atomically, with no partial-fill redistribution. A further idea floated for discussion: instead of a hard swap, a falling granular voxel could push the liquid's *fill* value outward incrementally (rate controlled by the liquid's `flow` scalar — see the per-material viscosity work above), leaving a partial-fill/air trace behind it (cavitation-like), with a future per-granular-material "displacement rate" modifier (e.g. denser granular materials like a hypothetical iron dust pushing fill outward faster than sand) as a natural companion to liquid `density`/`flow`. This would also generalize toward rigid bodies falling into liquid using the same displacement mechanism. Not designed or bench-validated yet — see the liquid-density proposal being drafted for Fable 5 (same session).
 
 #### Phase 7c — Fill semantics roadmap (Option B → C)
 
@@ -1766,6 +1770,7 @@ Ordered by priority. Update this section as work is completed or new items are d
 
 ### Active / Next Up
 
+- [ ] **Fluid viscosity — single global `flow` knob, PORTED TO GLSL (2026-07-09), pending in-editor verification.** Bench-validated first (2026-07-08, `tools/fluid_prototypes/python/viscosity.py` + `test_viscosity.py`, full results in `VISCOSITY_NOTES.md`): a knob-isolation matrix showed damp-alone reads as "slow water", g_dt-alone as "slow to start, then thin", cap-alone is invisible for spreading (it governs pour/fall rate under large pressure instead), and only the combined profile reads as genuinely thick — so one designer scalar `flow` (0 < flow ≤ 1; ~0.5 syrup, ~0.25 thick, ~0.1 honey dollop) maps to all three (`damp → 0.6 + (damp−0.6)·flow`, `g_dt·flow`, `axis_cap·flow`). Port: `FluidSimulation.flow` export → `SimParams` (56→60 bytes) → applied in Pass A only (the engine's one accel site), with `flow ≥ 1.0` special-cased to the exact pre-viscosity arithmetic — the default is bit-identical (proven in-bench via world-state hash). Bench gates all green: viscous U-tube still equalizes (with a measured yield-stress-like dead zone at low flow — accel < 0.5 rounds to 0, so thick fluids hold small imbalances; keep flow ≥ ~0.85 where precise leveling matters), viscous lake settles AND sleeps, existing phi suite unchanged. **Per-material `flow` (MaterialDef export + 256-float buffer keyed by `active_mat` — form already bench-validated) deliberately deferred until a second liquid (oil) exists.**
 - [x] **Fluid never-settles bug** ✅ FIXED & VERIFIED (2026-07-04) — See `docs/BUG_LOG.md` "FIXED (2026-07-04...)" entry for full details. Root cause was Pass A's Y-axis forcing having no hydrostatic equilibrium (`dh*g_dt*gravity_bias - gravity_force`, where a column at perfect rest still generated constant nonzero forcing every tick). Fixed by replacing with elevation/piezometric head, `(dh - FILL_CAP) * g_dt * gravity_bias`, deleting `gravity_force` entirely (export + `SimParams` field, buffer shrunk 56→52 bytes). In-editor verification confirmed a flat settled lake reaches exact zero flux, pouring water spreads and fully settles, and disturbing a settled surface nearby doesn't reawaken an already-stable voxel.
 - [x] **Fluid pipeline compressed 4→2 dispatches** ✅ FIXED & VERIFIED (2026-07-06, Phase 7e Step 9) — `fluid_flux.comp`'s Scale-Outflow/Scale-Inflow passes (which rewrote `flux_buf` lanes twice and needed a sign-based no-double-write proof) are deleted. Transport now recomputes each cell's conservation-scale factor (`s_out`/`s_in`) inline as a pure function of already-synced `flux_buf`/`voxels_a` data — `compute_s_out()`/`compute_s_in()` in the shader — instead of reading it back from a buffer a prior pass wrote. Conservation holds by construction (both endpoints of a face compute the same deterministic function of the same stable inputs), with no shared writes anywhere. `fluid_simulation.gd`'s dispatch loop does Accelerate → Transport only (`pass` 0/1, was 0-3). A real dispatch-range leak was found in `compute_s_out`/`compute_s_in` during Build B testing (see the entry immediately below) and fixed (`page<0` now returns `0.0` instead of `1.0` — see `docs/BUG_LOG.md`). In-editor verification (2026-07-04) after the Build B revert confirmed stability: no growth, no leaks, no cellular-automaton-style artifacts.
 - [x] **U-pipe / connected-vessel hydrostatics — attempted, REVERTED, needs a different approach** ✅ REVERTED & VERIFIED CLEAN (2026-07-04) — attempted 2026-07-07 as "Build B": a persistent piezometric-head relaxation field, `phead()`, replacing `head()` in Pass A's `dh` computation to give pressure visibility across horizontal connections. Passed a standalone Python prototype and small-scale single/two-voxel GPU tests, but real in-editor testing at scale found it unstable — water visibly "boiling" out of a test-tube shaft, severe mass loss even after fixing the dispatch-range leak above, and the core U-tube goal still not working (water sprayed out one arm instead of equalizing). Reverted in full back to the 4→2-compression baseline (the dispatch-range leak fix was kept since it's a real, independent bug); in-editor re-verification after the revert confirmed the baseline is stable again. Handed off for a fresh design pass — see `docs/BUG_LOG.md` for the full write-up of what was tried and why it broke, so the next attempt doesn't retread the same ground. **UPDATE (2026-07-04): a fresh design now exists and is validated in a 2D bench** — see the next item and `docs/BUG_LOG.md` "DESIGN (2026-07-04): connected-vessel hydrostatics — SOLVED IN A 2D BENCH via pressure projection". Build B's whole approach (a max/envelope-propagated head field) was proven *structurally* unable to work: max-propagation makes pressure uniform-at-each-elevation, deleting the lateral gradient that drives equalization. Do not rebuild a relaxation-max field.

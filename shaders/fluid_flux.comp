@@ -96,6 +96,14 @@ layout(set = 0, binding = 2, std430) readonly buffer SimParams {
     // needed in-shader — the CPU dispatch loop (fluid_simulation.gd) tracks which physical
     // buffer holds the current value and feeds it in here every dispatch.
     int phi_read_buf;
+    // Viscosity (2026-07-09, bench-validated: tools/fluid_prototypes/python/viscosity.py +
+    // VISCOSITY_NOTES.md). Single global "flow" scalar, 0 < flow <= 1: 1 = thin/water,
+    // smaller = thicker — an overall multiplier applied on TOP of each material's own
+    // MaterialFlow value (binding 13, added 2026-07-10 once oil became the second liquid;
+    // see the VISCOSITY block in Pass A). effective_flow = flow * material_flow.data[active_mat]
+    // >= 1.0 takes the exact unscaled code path, so water (MaterialFlow=1.0) at this
+    // default is bit-identical to the pre-viscosity shader.
+    float flow;
 } params;
 layout(set = 0, binding = 3, std430) readonly buffer MaterialSim { uint data[256]; } material_sim;
 layout(set = 0, binding = 4, std430)          buffer Changelog {
@@ -133,6 +141,12 @@ layout(set = 0, binding = 10, std430) buffer GainTracker { int flat_idx; int amo
 // workgroups). params.phi_read_buf selects which one is source for the current dispatch.
 layout(set = 0, binding = 11, std430) coherent buffer PhiBufA { int data[]; } phi_buf_a;
 layout(set = 0, binding = 12, std430) coherent buffer PhiBufB { int data[]; } phi_buf_b;
+// Per-material flow scalar (2026-07-10) — 256 floats, material_id -> MaterialDef.flow.
+// Built/uploaded by WorldOrchestrator._build_material_cache() alongside material_sim,
+// defaulting to 1.0 for any unregistered id so a missing entry can never silently freeze
+// a liquid. Lets different liquids (water=1.0, oil=0.69) run the SAME viscosity formula
+// (see the axis loop below) at different thickness, with no separate physics path.
+layout(set = 0, binding = 13, std430) readonly buffer MaterialFlow { float data[256]; } material_flow;
 
 const uint SIM_LIQUID    = 2u;
 const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGELOG_ENTRIES
@@ -563,6 +577,29 @@ void main() {
         bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
         bool my_is_air    = (mat_id == 0u);
 
+        // VISCOSITY (2026-07-09, extended 2026-07-10 to be PER-MATERIAL) — the single-knob
+        // flow profile from the bench (tools/fluid_prototypes/python/viscosity.py::flow_profile,
+        // measured results in VISCOSITY_NOTES.md). Originally a single global params.flow
+        // slider applied identically to every liquid; now scaled per-face by the ACTIVE
+        // material's own intrinsic MaterialFlow value (binding 13, material_flow.data[id],
+        // set from MaterialDef.flow — water=1.0, oil=0.69), so different liquids can have
+        // different thickness without a separate physics model — oil is just "water with a
+        // lower flow scalar" through the exact same formula. Water's flow=1.0 makes this
+        // term a no-op (bit-identical to the pre-material-flow behaviour); the derived values
+        // below are now computed per-axis, inside the loop, because they depend on
+        // active_mat, which is only known once that face's liquid side is resolved:
+        //   damp_eff  — eases toward 0.6 as flow drops: kills slosh AND lowers steady-state
+        //               flow speed (equilibrium |flux| ~ accel/(1-damp): 0.97 -> ~33x accel,
+        //               0.6 -> ~2.5x).
+        //   g_eff     — g_dt scaled: sluggish response to new pressure differences. NOTE the
+        //               bench-measured dead zone: accel magnitudes under 0.5 round to zero,
+        //               so low flow coarsens U-tube equalization precision (yield-stress-ish;
+        //               keep flow >= ~0.85 where sub-voxel leveling matters).
+        //   cap_scale — axis_cap scaled: the pour/fall throughput ceiling (bench showed this
+        //               knob is invisible for shallow spreading but governs flow under LARGE
+        //               pressure).
+        // effective_flow >= 1.0 takes the exact pre-viscosity arithmetic — bit-identical default.
+
         for (int axis = 0; axis < 3; axis++) {
             ivec3 nb = gpos + AXIS_DIR[axis];
             uint nv  = read_a(nb);
@@ -622,6 +659,21 @@ void main() {
             // regardless of which side of the face this thread's voxel is on.
             uint active_mat = my_is_liquid ? mat_id : nm;
 
+            // PER-MATERIAL VISCOSITY — see the comment block above the axis loop. The
+            // material actually flowing through this face (active_mat) supplies its own
+            // flow scalar; the global params.flow slider still applies on top (as an
+            // overall tunable), so effective_flow is their product. Water's MaterialFlow
+            // entry is 1.0, so this is a no-op for water regardless of active_mat lookup.
+            float effective_flow = params.flow * material_flow.data[active_mat];
+            float damp_eff  = params.damp;
+            float g_eff     = params.g_dt;
+            float cap_scale = 1.0;
+            if (effective_flow < 1.0) {
+                damp_eff  = 0.6 + (params.damp - 0.6) * effective_flow;
+                g_eff     = params.g_dt * effective_flow;
+                cap_scale = effective_flow;
+            }
+
             // Hydrostatic head, not raw fill — a flat fill difference can't tell a deep
             // column from a shallow one (see head()). Air always reads as head 0. A liquid
             // cell has head > 0, empty air below always reads head 0, so dh is always
@@ -679,8 +731,8 @@ void main() {
             int dh = phi_read(gpos, active_mat) - phi_read(nb, active_mat);
 
             float accel = (axis == 1)
-                ? (float(dh) - float(FILL_CAP)) * params.g_dt * params.gravity_bias
-                : float(dh) * params.g_dt;
+                ? (float(dh) - float(FILL_CAP)) * g_eff * params.gravity_bias
+                : float(dh) * g_eff;
 
             // FIX (2026-07-02, follow-up to the freezing-columns bug above): narrowing the
             // g_dt/gravity_bias export ranges was NOT enough. head() adds 255 per full cell
@@ -698,7 +750,9 @@ void main() {
             // past what X/Z are capped at, Y keeps a proportionally bigger share of the
             // outflow budget even when every axis is fully saturated, instead of losing
             // that distinction the instant they tie.
-            float axis_cap = (axis == 1) ? float(FILL_CAP) * params.gravity_bias : float(FILL_CAP);
+            // cap_scale (VISCOSITY, see the block above the axis loop) throttles the ceiling
+            // for thick fluids — 1.0 at default flow, so base*1.0 stays bit-identical.
+            float axis_cap = ((axis == 1) ? float(FILL_CAP) * params.gravity_bias : float(FILL_CAP)) * cap_scale;
 
             // FIX (2026-07-02, "water never settles" bug): round(old_f * damp) has a fixed
             // point for damp=0.97 and small integer magnitudes -- round(n * 0.97) == n for
@@ -720,7 +774,7 @@ void main() {
             // forcing this tick, not decay) still gets normal rounding on the final sum --
             // only the carried-over persistence term needed the fix.
             float old_f = float(flux_buf.data[lane]);
-            int decayed = int(old_f * params.damp);
+            int decayed = int(old_f * damp_eff);  // damp_eff == params.damp at default flow
             float new_f = float(decayed) + accel;
             new_f = clamp(new_f, -axis_cap, axis_cap);
             flux_buf.data[lane] = int(round(new_f));

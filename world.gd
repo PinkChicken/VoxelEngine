@@ -90,8 +90,10 @@ func _unhandled_input(event: InputEvent) -> void:
 			world_orchestrator.debug_load_voxel_snapshot()
 
 
-# Scripted U-tube acceptance-test scene (2026-07-04, Checkpoint 4/5 tooling — see
-# docs/PRESSURE_PROJECTION_PORT_PLAN.md). Hand-carving with the sphere/single-voxel edit
+# Scripted U-tube acceptance-test scene (2026-07-04, Checkpoint 4/5 tooling — originally
+# built for the pressure-projection effort, later reused as the acceptance rig for
+# phi-flood, the design that actually shipped; see docs/PHI_FLOOD_PORT_PLAN.md and
+# docs/BUG_LOG.md for current status). Hand-carving with the sphere/single-voxel edit
 # tools produced inconsistent, hard-to-reproduce geometry (uneven connector width, unclear
 # arm volumes) that polluted the bottom-gradient measurement -- this builds an exact,
 # known-volume rig instead: a solid rock shell (guaranteed sealed regardless of

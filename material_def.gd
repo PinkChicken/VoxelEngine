@@ -35,3 +35,8 @@ enum GravityMode {
 @export var gravity: int = GravityMode.NONE
 @export var color: Color = Color.WHITE
 @export var transparent: bool = false
+# Per-material viscosity scalar for LIQUID simulation (fluid_flux.comp's MaterialFlow
+# buffer, WorldOrchestrator._build_material_cache()). 1.0 = thin/water (bit-identical to
+# the pre-per-material-flow shader); smaller = thicker (eases toward sluggish per the
+# viscosity formula — see VISCOSITY_NOTES.md). Ignored by non-liquid materials.
+@export_range(0.05, 1.0, 0.01) var flow: float = 1.0

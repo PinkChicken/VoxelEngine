@@ -1,7 +1,14 @@
+class_name HotBar
 extends CanvasLayer
 
-const MATERIAL_IDS := [1, 2, 3, 4]
-const MATERIAL_NAMES := ["ROCK", "SAND", "WATER", "GLASS"]
+# Single source of truth for hotbar slot -> material id mapping. player_controller.gd's
+# key/scroll-wheel selection reads MATERIAL_IDS directly (via the HotBar class name)
+# instead of keeping its own copy — a second copy previously existed only implicitly
+# (player_controller.gd assumed slot index == material id, which happened to hold only
+# because ids 1-4 matched slots 1-4; that assumption silently breaks the instant a
+# material's id doesn't equal its hotbar position, e.g. OIL below).
+const MATERIAL_IDS := [1, 2, 3, 4, 7]
+const MATERIAL_NAMES := ["ROCK", "SAND", "WATER", "GLASS", "OIL"]
 
 var _player: CharacterBody3D
 var _material_db: MaterialDB
@@ -88,7 +95,7 @@ func _build_ui() -> void:
 	add_child(_paused_label)
 
 	var hint = Label.new()
-	hint.text = "1-4 or scroll to select"
+	hint.text = "1-5 or scroll to select"
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	hint.add_theme_font_size_override("font_size", 12)
 	hint.add_theme_color_override("font_color", Color(1, 1, 1, 0.5))

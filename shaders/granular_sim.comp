@@ -102,20 +102,75 @@ bool try_move(int df, uint my_voxel, int my_flat, int vpc) {
     return true;
 }
 
-// Swap with a liquid voxel: sand claims destination via CAS, liquid goes to sand's old slot.
+// Swap with a liquid voxel: granular material claims water_pos via CAS, and the displaced
+// water is relocated in PRIORITY ORDER — sideways at its own height, then sideways one
+// level up, only rising directly into my_flat (this thread's own vacated slot) as a last
+// resort (gap fix, 2026-07-10: previously only the straight-down fall path tried sideways
+// first — the diagonal-fall path always teleported water straight to my_flat with no
+// sideways attempt at all; this single function now backs BOTH paths, parameterized by
+// water_pos so it works regardless of which direction the granular voxel is falling).
+//
 // their_voxel is the liquid voxel read from voxels_a — its fill byte travels intact.
-// my_flat is this thread's exclusive source slot; the unconditional write is safe.
-bool try_displace(int df, uint my_voxel, uint their_voxel, int my_flat, int vpc) {
+// lat[] is the same shuffled lateral-offset array the caller already built for its own
+// diagonal-fall search, reused here so sideways relocation isn't axis-biased either.
+//
+// INVARIANT (do not break without re-deriving safety): the level-3 fallback target is
+// ALWAYS my_flat, never a newly-CAS'd cell. my_flat is this thread's own exclusive source
+// slot, provably free at this point in the tick, so this function can never fail to find
+// SOME destination for the displaced water once it has claimed water_pos. If the fallback
+// target were changed to something else that requires its own CAS (e.g. "directly above
+// water_pos"), that CAS could lose a race, leaving water_pos claimed for the granular voxel
+// with nowhere for its water to go — a silent mass-conservation bug, not a cosmetic one.
+bool try_displace_priority(ivec3 water_pos, uint my_voxel, uint their_voxel, int my_flat, int vpc, ivec3 lat[4]) {
+    int df = world_to_flat(water_pos);
+    if (df < 0) return false;
     uint old = atomicCompSwap(voxels_b.data[df], 0u, my_voxel);
     if (old != 0u) return false;
-    uint log_slot = atomicAdd(changelog.count, 2u);
-    if (log_slot + 1u < MAX_CHANGELOG) {
-        changelog.entries[log_slot * 2u]             = uint(df);
-        changelog.entries[log_slot * 2u + 1u]        = my_voxel;
-        changelog.entries[(log_slot + 1u) * 2u]      = uint(my_flat);
-        changelog.entries[(log_slot + 1u) * 2u + 1u] = their_voxel;
+
+    ivec3 up = ivec3(0, 1, 0);
+    int water_dst = -1;
+    // Level 1: sideways at the liquid's own height.
+    for (int i = 0; i < 4 && water_dst < 0; i++) {
+        ivec3 p = water_pos + lat[i];
+        if ((read_a(p) & 0xFFu) == 0u) {
+            int sd = world_to_flat(p);
+            if (sd >= 0 && atomicCompSwap(voxels_b.data[sd], 0u, their_voxel) == 0u) water_dst = sd;
+        }
     }
-    voxels_b.data[my_flat] = their_voxel;
+    // Level 2: sideways one level above the liquid (still not touching my_flat).
+    for (int i = 0; i < 4 && water_dst < 0; i++) {
+        ivec3 p = water_pos + up + lat[i];
+        if ((read_a(p) & 0xFFu) == 0u) {
+            int sd = world_to_flat(p);
+            if (sd >= 0 && atomicCompSwap(voxels_b.data[sd], 0u, their_voxel) == 0u) water_dst = sd;
+        }
+    }
+
+    if (water_dst >= 0) {
+        // Water went sideways — 3 changelog entries (df->sand, water_dst->water, my_flat->air).
+        uint log_slot = atomicAdd(changelog.count, 3u);
+        if (log_slot + 2u < MAX_CHANGELOG) {
+            changelog.entries[log_slot * 2u]             = uint(df);
+            changelog.entries[log_slot * 2u + 1u]        = my_voxel;
+            changelog.entries[(log_slot + 1u) * 2u]      = uint(water_dst);
+            changelog.entries[(log_slot + 1u) * 2u + 1u] = their_voxel;
+            changelog.entries[(log_slot + 2u) * 2u]      = uint(my_flat);
+            changelog.entries[(log_slot + 2u) * 2u + 1u] = 0u;
+        }
+        voxels_b.data[my_flat] = 0u;
+        mark_dirty(water_dst, vpc);
+    } else {
+        // Truly trapped (e.g. a sealed 1-wide shaft) — water rises into my_flat, the one
+        // slot guaranteed free (see the INVARIANT note above). Last resort, not the common case.
+        uint log_slot = atomicAdd(changelog.count, 2u);
+        if (log_slot + 1u < MAX_CHANGELOG) {
+            changelog.entries[log_slot * 2u]             = uint(df);
+            changelog.entries[log_slot * 2u + 1u]        = my_voxel;
+            changelog.entries[(log_slot + 1u) * 2u]      = uint(my_flat);
+            changelog.entries[(log_slot + 1u) * 2u + 1u] = their_voxel;
+        }
+        voxels_b.data[my_flat] = their_voxel;
+    }
     sim_active.data[my_flat] = 1u;
     mark_dirty(my_flat, vpc);
     mark_dirty(df, vpc);
@@ -198,75 +253,7 @@ void main() {
             int df = world_to_flat(below);
             if (df >= 0 && try_move(df, my_voxel, my_flat, vpc)) return;
         } else if (material_sim.data[dest_mat] == SIM_LIQUID) {
-            int df = world_to_flat(below);
-            if (df >= 0) {
-                uint old = atomicCompSwap(voxels_b.data[df], 0u, my_voxel);
-                if (old == 0u) {
-                    // Sand claimed the water slot. Try to displace water outward in
-                    // priority order — never teleport above sand unless truly trapped.
-                    //
-                    // Level 1: horizontal neighbours of water cell (same height as water).
-                    //   = diagonal-below of sand — zeroed by the expanded granular pre-pass.
-                    // Level 2: horizontal neighbours at sand's old height (one level up).
-                    //   = zeroed by the horizontal offsets in the expanded pre-pass.
-                    // Level 3: directly above sand (sand's old slot) — last resort.
-
-                    // Level 1: horizontal neighbours of water cell (same height, shuffled).
-                    // Level 2: horizontal neighbours at sand's old height (one level up).
-                    ivec3 l1[4], l2[4];
-                    for (int i = 0; i < 4; i++) {
-                        l1[i] = below + lat[i];
-                        l2[i] = gpos  + lat[i];
-                    }
-
-                    int water_dst = -1;
-                    // Level 1
-                    for (int i = 0; i < 4 && water_dst < 0; i++) {
-                        if ((read_a(l1[i]) & 0xFFu) == 0u) {
-                            int sd = world_to_flat(l1[i]);
-                            if (sd >= 0 && atomicCompSwap(voxels_b.data[sd], 0u, dest) == 0u)
-                                water_dst = sd;
-                        }
-                    }
-                    // Level 2
-                    for (int i = 0; i < 4 && water_dst < 0; i++) {
-                        if ((read_a(l2[i]) & 0xFFu) == 0u) {
-                            int sd = world_to_flat(l2[i]);
-                            if (sd >= 0 && atomicCompSwap(voxels_b.data[sd], 0u, dest) == 0u)
-                                water_dst = sd;
-                        }
-                    }
-
-                    if (water_dst >= 0) {
-                        // Water went sideways — 3 changelog entries.
-                        uint log_slot = atomicAdd(changelog.count, 3u);
-                        if (log_slot + 2u < MAX_CHANGELOG) {
-                            changelog.entries[log_slot * 2u]             = uint(df);
-                            changelog.entries[log_slot * 2u + 1u]        = my_voxel;
-                            changelog.entries[(log_slot + 1u) * 2u]      = uint(water_dst);
-                            changelog.entries[(log_slot + 1u) * 2u + 1u] = dest;
-                            changelog.entries[(log_slot + 2u) * 2u]      = uint(my_flat);
-                            changelog.entries[(log_slot + 2u) * 2u + 1u] = 0u;
-                        }
-                        voxels_b.data[my_flat] = 0u;
-                        mark_dirty(water_dst, vpc);
-                    } else {
-                        // Truly trapped — water rises above sand (last resort).
-                        uint log_slot = atomicAdd(changelog.count, 2u);
-                        if (log_slot + 1u < MAX_CHANGELOG) {
-                            changelog.entries[log_slot * 2u]             = uint(df);
-                            changelog.entries[log_slot * 2u + 1u]        = my_voxel;
-                            changelog.entries[(log_slot + 1u) * 2u]      = uint(my_flat);
-                            changelog.entries[(log_slot + 1u) * 2u + 1u] = dest;
-                        }
-                        voxels_b.data[my_flat] = dest;
-                    }
-                    sim_active.data[my_flat] = 1u;
-                    mark_dirty(my_flat, vpc);
-                    mark_dirty(df, vpc);
-                    return;
-                }
-            }
+            if (try_displace_priority(below, my_voxel, dest, my_flat, vpc, lat)) return;
         }
     }
 
@@ -279,8 +266,13 @@ void main() {
             int df = world_to_flat(d);
             if (df >= 0 && try_move(df, my_voxel, my_flat, vpc)) return;
         } else if (material_sim.data[dest_mat] == SIM_LIQUID) {
-            int df = world_to_flat(d);
-            if (df >= 0 && try_displace(df, my_voxel, dest, my_flat, vpc)) return;
+            // GAP FIX (2026-07-10): previously called the raw (non-priority) try_displace
+            // here, which always teleported water straight to my_flat with NO sideways
+            // attempt — inconsistent with the straight-down path just above, and the most
+            // common case in practice (sand's shuffled lateral fall order means diagonal
+            // hits at least as often as straight-down). try_displace_priority (see its
+            // definition/INVARIANT comment above) now backs both paths identically.
+            if (try_displace_priority(d, my_voxel, dest, my_flat, vpc, lat)) return;
         }
     }
 }

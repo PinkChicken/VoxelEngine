@@ -79,6 +79,7 @@ func _default_materials() -> Array[MaterialDef]:
 	water.simulation = MaterialDef.SimulationClass.LIQUID
 	water.gravity = MaterialDef.GravityMode.DOWN
 	water.color = Color(0.2, 0.4, 0.9, 0.7)
+	water.flow = 1.0  # thin — the viscosity baseline every other liquid is scaled against
 
 	var glass := MaterialDef.new()
 	glass.id = 4; glass.name = "GLASS"
@@ -108,6 +109,7 @@ func _default_materials() -> Array[MaterialDef]:
 	oil.simulation = MaterialDef.SimulationClass.LIQUID
 	oil.gravity = MaterialDef.GravityMode.DOWN
 	oil.color = Color(0.2, 0.15, 0.05, 0.85)
+	oil.flow = 0.69  # thicker than water — runs through the same viscosity formula (fluid_flux.comp)
 
 	return [air, rock, sand, water, glass, fire, smoke, oil]
 

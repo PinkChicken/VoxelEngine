@@ -15,8 +15,9 @@ extends Node
 var _prev_pressing_right: bool = false
 var _editing: bool = false   # true while any mouse button is held
 
-const HOTBAR_SIZE := 4
 const HOTBAR_KEYS := [KEY_1, KEY_2, KEY_3, KEY_4, KEY_5]
+# Hotbar slot count/id mapping is NOT duplicated here — read from HotBar.MATERIAL_IDS
+# (HUD/hot_bar.gd) so there is exactly one place that defines "slot N = material id X".
 
 var gravity: float = ProjectSettings.get_setting("physics/3d/default_gravity")
 var fly_mode: bool = true
@@ -183,18 +184,31 @@ func _handle_material_selection(event: InputEvent) -> void:
 				get_viewport().set_input_as_handled()
 		else:
 			if event.button_index == MOUSE_BUTTON_WHEEL_UP:
-				_select_material(body.selected_material + 1)
+				_select_material(_current_hotbar_slot() + 1)
 			elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-				_select_material(body.selected_material - 1)
+				_select_material(_current_hotbar_slot() - 1)
+
+
+func _current_hotbar_slot() -> int:
+	# Inverse of the index in HotBar.MATERIAL_IDS -> 1-based slot for the currently
+	# selected material id, so scroll-wheel can step by SLOT (not by raw material id,
+	# which is not contiguous once ids and slot order diverge, e.g. OIL = id 7).
+	var i := HotBar.MATERIAL_IDS.find(body.selected_material)
+	return (i + 1) if i >= 0 else 1
 
 
 func _select_material(index: int) -> void:
+	# index is a 1-based HOTBAR SLOT, not a material id — must be mapped through
+	# HotBar.MATERIAL_IDS (see the comment near HOTBAR_KEYS above). Slot index only
+	# happened to equal material id before OIL (id 7) was added at slot 5.
+	var slot_count := HotBar.MATERIAL_IDS.size()
 	if index < 1:
-		index = HOTBAR_SIZE
-	elif index > HOTBAR_SIZE:
+		index = slot_count
+	elif index > slot_count:
 		index = 1
-	body.selected_material = index
-	body.material_changed.emit(index)
+	var material_id: int = HotBar.MATERIAL_IDS[index - 1]
+	body.selected_material = material_id
+	body.material_changed.emit(material_id)
 
 
 func _input(event: InputEvent) -> void:

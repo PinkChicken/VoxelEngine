@@ -32,7 +32,7 @@ class_name FluidSimulation extends VoxelSimulation
 
 var _compute
 var _flux_pipeline: Dictionary = {}   # fluid_flux.comp — Accelerate / Scale / Transport
-var _flux_params_buf: RID             # 56-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, settle_threshold, phi_read_buf)
+var _flux_params_buf: RID             # 60-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, settle_threshold, phi_read_buf, flow)
 var _flux_chunk_list_buf: RID         # active + 6 face neighbours — flux dispatch range
 var _flux_chunk_list_capacity: int = 0
 var _dirty_chunks_buf: RID
@@ -252,6 +252,21 @@ func _debug_print_watch() -> void:
 # change keeps the chunk awake indefinitely).
 @export_range(1, 20, 1) var settle_threshold: int = 3
 
+# flow: single-knob viscosity, 0 < flow <= 1 — 1.0 = thin/water (bit-identical to the
+# pre-viscosity shader, special-cased), smaller = thicker. Bench-validated 2026-07-08
+# (tools/fluid_prototypes/python/viscosity.py + VISCOSITY_NOTES.md, knob-isolation
+# spread matrix + viscous U-tube + settle/sleep gates): inside Pass A it eases damp
+# toward 0.6 (kills slosh AND lowers steady-state flow speed) and scales g_dt +
+# axis_cap linearly (sluggish response + throttled pour/fall throughput). Rough feel:
+# ~0.5 syrupy, ~0.25 thick, ~0.1 honey dollop that barely creeps yet still sleeps.
+# CAVEAT (measured, not hidden): low flow coarsens U-tube equalization — accel
+# magnitudes under 0.5 round to zero, a yield-stress-like dead zone (a thick fluid
+# holds small imbalances; at flow=0.4 the bench U-tube froze at a ~3.5% residual gap).
+# Keep >= ~0.85 if sub-voxel leveling precision matters. Currently GLOBAL (all
+# liquids); per-material (MaterialDef + a 256-float buffer keyed by active_mat, form
+# already bench-validated) is the planned follow-up once a second liquid (oil) exists.
+@export_range(0.05, 1.0, 0.01) var flow: float = 1.0
+
 const DIRTY_BUF_BYTES := 64
 
 
@@ -263,7 +278,7 @@ func _ready() -> void:
 		_flux_pipeline = _compute.compile_shader(_load_flux_shader(), 4)
 		if _flux_pipeline.is_empty():
 			push_error("FluidSimulation: fluid_flux.comp compile failed")
-		var fp := PackedByteArray(); fp.resize(56); fp.fill(0)  # damp, g_dt, gravity_bias, settle_threshold, phi_read_buf
+		var fp := PackedByteArray(); fp.resize(60); fp.fill(0)  # damp, g_dt, gravity_bias, settle_threshold, phi_read_buf, flow
 		_flux_params_buf = _compute.buffer_upload(fp)
 		_flux_chunk_list_capacity = 256
 		var fl := PackedByteArray(); fl.resize(_flux_chunk_list_capacity * 12); fl.fill(0)
@@ -789,12 +804,13 @@ func _build_flux_uniforms() -> Array:
 		u.call(11, _phi_buf_a),  # phi-flood (2026-07-08) — always bound, even for passes
 		u.call(12, _phi_buf_b),  # (e.g. Transport) that never touch it; same convention
 		                          # already used for conservation/gain_tracker above.
+		u.call(13, _orchestrator.get_material_flow_buf()),  # per-material viscosity (2026-07-10)
 	]
 
 
 func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pass_idx: int, phi_read_buf: int = 0) -> void:
 	var cs := _chunk_manager.chunk_size
-	var p := PackedByteArray(); p.resize(56)
+	var p := PackedByteArray(); p.resize(60)
 	p.encode_s32(0,  cs)
 	p.encode_s32(4,  grid_min.x)
 	p.encode_s32(8,  grid_min.y)
@@ -812,6 +828,8 @@ func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pa
 	# as source. Irrelevant for Transport (pass 1, never touches phi) and for PhiSeed
 	# (pass 2, always writes phi_buf_a regardless) — harmless to upload a default there.
 	p.encode_s32(52, phi_read_buf)
+	# Viscosity (2026-07-09) — global flow scalar, only read by Pass A. See the export.
+	p.encode_float(56, flow)
 	_compute.buffer_update(_flux_params_buf, 0, p)
 
 
