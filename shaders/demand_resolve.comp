@@ -1,0 +1,276 @@
+#version 450
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// demand_resolve.comp — GLSL port of tools/fluid_prototypes/python/phi_demand.py +
+// phi_demand_parallel.py (docs/PHI_FILL_SAND_PLAN.md §3-c). Resolves the demand queue
+// granular_sim.comp writes (see try_displace_demand there) by walking the connected
+// liquid body outward from each demand's origin to find a genuinely dischargeable cell
+// — the same test fluid_flux.comp's phi-flood wake logic already uses — instead of a
+// fixed local anchor. Dispatched by GranularSimulation right after granular_sim.comp,
+// still within the same tick, BEFORE FluidSimulation's own step begins, so a resolved
+// deposit is ordinary fill by the time phi-flood computes this tick's field.
+//
+// TRUE PARALLEL execution, validated in phi_demand_parallel.py before this was written:
+// every invocation (one per demand) reads ONLY voxels_a (frozen — nothing here writes
+// it) and writes ONLY into demand_accum (an atomicAdd accumulator), so results are
+// identical regardless of dispatch order/interleaving. fill is one BYTE packed inside a
+// u32 voxel value (material/fill/temp/flags) — a raw atomicAdd on the packed voxel
+// itself would corrupt the temp/flags bytes the moment fill overflows past 255, so
+// demand_accum is a SEPARATE per-voxel-slot uint scratch buffer, matching the existing
+// sim_active_buf/dirty_chunks_buf pattern, not the packed buffer.
+//
+// Pass 0 (WALK): one invocation per demand queue entry. Bounded local-array BFS
+// (frontier[64]/visited[64] -- the Python bench measured a worst case of 20 hops in its
+// hardest tested scene, so 64 gives real headroom without a dynamic structure GLSL
+// doesn't have). Writes accumulate via atomicAdd(demand_accum). The FIRST thread to
+// touch a given cell this tick (atomicAdd's previous value == 0) also appends that
+// cell's position to touched_cells, exactly once per distinct cell regardless of how
+// many demands' walks landed there -- this is what lets pass 1 dispatch once per
+// TOUCHED CELL instead of once per demand (multiple demands landing on the same cell
+// must be clamped/applied together, exactly once, not once per contributing demand).
+//
+// Pass 1 (APPLY): one invocation per touched_cells entry. Reads the accumulated total,
+// clamps to FILL_CAP, writes the correctly-packed voxel value via the changelog (single-
+// writer discipline, same as every other sim). Genuine excess (multiple demands
+// together over-subscribed a cell's real headroom -- confirmed to happen for real in
+// the parallel-emulated Python validation, not a hypothetical) is appended to
+// demand_requeue for GranularSimulation to fold into NEXT tick's demand queue, never
+// silently dropped -- the same discipline the sequential/parallel Python fixes both
+// landed on after an earlier version measured real mass loss from clamp-and-discard.
+
+layout(set = 0, binding = 0, std430) readonly buffer VoxelBufA { uint data[]; } voxels_a;
+layout(set = 0, binding = 1, std430) readonly buffer ChunkTable { int data[]; } chunk_table;
+layout(set = 0, binding = 2, std430) readonly buffer Params {
+    int chunk_size;
+    int grid_min_x; int grid_min_y; int grid_min_z;
+    int grid_span_x; int grid_span_y; int grid_span_z;
+    int pass;              // 0 = walk/accumulate, 1 = apply/clamp/requeue
+    int settle_threshold;  // same field fluid's phi wake logic reads -- rest_tol basis
+} params;
+layout(set = 0, binding = 3, std430) buffer DemandQueue {
+    uint count;
+    int entries[];  // interleaved: origin_x, origin_y, origin_z, (material | amount<<8)
+} demand_queue;
+layout(set = 0, binding = 4, std430) buffer DemandAccum { uint data[]; } demand_accum;  // per voxel slot
+layout(set = 0, binding = 5, std430) buffer TouchedCells {
+    uint count;
+    int entries[];  // interleaved: x, y, z per touched cell
+} touched_cells;
+layout(set = 0, binding = 6, std430) buffer Changelog {
+    uint count;
+    uint entries[];
+} changelog;
+layout(set = 0, binding = 7, std430) buffer DemandRequeue {
+    uint count;
+    int entries[];  // same interleaved format as DemandQueue -- consumed by GranularSimulation
+} demand_requeue;
+
+const uint MAX_CHANGELOG = 524288u;
+const uint MAX_TOUCHED   = 65536u;
+const uint MAX_REQUEUE   = 65536u;
+const int  FILL_CAP      = 255;
+const int  WALK_CAP      = 64;  // see file header -- bench-measured worst case is 20
+
+ivec3 world_to_chunk(ivec3 gpos) {
+    float cs = float(params.chunk_size);
+    return ivec3(floor(float(gpos.x) / cs), floor(float(gpos.y) / cs), floor(float(gpos.z) / cs));
+}
+
+int world_to_flat(ivec3 gpos) {
+    int cs = params.chunk_size;
+    int vpc = cs * cs * cs;
+    ivec3 cp = world_to_chunk(gpos);
+    ivec3 lcp = cp - ivec3(params.grid_min_x, params.grid_min_y, params.grid_min_z);
+    if (lcp.x < 0 || lcp.x >= params.grid_span_x ||
+        lcp.y < 0 || lcp.y >= params.grid_span_y ||
+        lcp.z < 0 || lcp.z >= params.grid_span_z) return -1;
+    int tbl = lcp.z * params.grid_span_x * params.grid_span_y + lcp.y * params.grid_span_x + lcp.x;
+    int slot = chunk_table.data[tbl];
+    if (slot < 0) return -1;
+    ivec3 lp = gpos - cp * cs;
+    return slot * vpc + lp.z * cs * cs + lp.y * cs + lp.x;
+}
+
+uint read_a(ivec3 gpos) {
+    int idx = world_to_flat(gpos);
+    return (idx >= 0) ? voxels_a.data[idx] : 0u;
+}
+
+const ivec3 NEIGH6[6] = ivec3[6](
+    ivec3(1,0,0), ivec3(-1,0,0), ivec3(0,1,0), ivec3(0,-1,0), ivec3(0,0,1), ivec3(0,0,-1)
+);
+
+// Same test extra_correction_pass's wake logic already uses in fluid_flux.comp
+// (DEFAULT_WAKE_MARGIN block): air above (can push out) or fill has a correctable
+// deficit -- NOT sealed-and-(near-)full. Sealed-under-solid-and-full never qualifies.
+bool is_dischargeable_liquid(ivec3 pos, uint mat) {
+    uint v = read_a(pos);
+    if ((v & 0xFFu) != mat) return false;
+    int f = int((v >> 8u) & 0xFFu);
+    ivec3 above = pos + ivec3(0, 1, 0);
+    uint am = read_a(above) & 0xFFu;
+    int rest_tol = max(1, params.settle_threshold - 1);
+    if (am != 0u && f >= FILL_CAP - rest_tol) return false;
+    return true;
+}
+
+// Writes up to `amt` into demand_accum at pos via atomicAdd; the first invocation to
+// touch a cell this tick (previous accumulator value was 0) records it in touched_cells
+// so pass 1 knows to visit it exactly once. Mirrors phi_demand_parallel.py's
+// accumulator exactly -- headroom clamping happens in pass 1, not here.
+void accumulate(ivec3 pos, int amt) {
+    if (amt <= 0) return;
+    int idx = world_to_flat(pos);
+    if (idx < 0) return;
+    uint prev = atomicAdd(demand_accum.data[idx], uint(amt));
+    if (prev == 0u) {
+        uint slot = atomicAdd(touched_cells.count, 1u);
+        if (slot < MAX_TOUCHED) {
+            touched_cells.entries[slot * 3]     = pos.x;
+            touched_cells.entries[slot * 3 + 1] = pos.y;
+            touched_cells.entries[slot * 3 + 2] = pos.z;
+        }
+    }
+}
+
+void pass_walk(int demand_idx) {
+    ivec3 origin = ivec3(demand_queue.entries[demand_idx * 4],
+                         demand_queue.entries[demand_idx * 4 + 1],
+                         demand_queue.entries[demand_idx * 4 + 2]);
+    int mat_amt = demand_queue.entries[demand_idx * 4 + 3];
+    uint mat = uint(mat_amt) & 0xFFu;
+    // 0xFF (int literal, NOT 0xFFu) -- mat_amt >> 8 is `int`, and GLSL has no implicit
+    // int<->uint conversion for binary operators (unlike C); mixing int & uint here
+    // would fail to compile.
+    int remaining = (mat_amt >> 8) & 0xFF;
+    if (remaining <= 0) return;
+
+    // Bounded local-array BFS -- see file header for why 64 is safe headroom.
+    ivec3 visited[WALK_CAP];
+    int visited_count = 0;
+    ivec3 frontier[WALK_CAP];
+    int frontier_head = 0;
+    int frontier_tail = 0;
+
+    visited[visited_count++] = origin;
+    for (int i = 0; i < 6 && frontier_tail < WALK_CAP; i++) {
+        ivec3 p = origin + NEIGH6[i];
+        if ((read_a(p) & 0xFFu) == mat) {
+            frontier[frontier_tail++] = p;
+        }
+        if (visited_count < WALK_CAP) visited[visited_count++] = p;
+    }
+
+    while (frontier_head < frontier_tail && remaining > 0) {
+        ivec3 pos = frontier[frontier_head++];
+
+        if (is_dischargeable_liquid(pos, mat)) {
+            uint v = read_a(pos);
+            int f = int((v >> 8u) & 0xFFu);
+            if (f < FILL_CAP) {
+                int take = min(remaining, FILL_CAP - f);
+                accumulate(pos, take);
+                remaining -= take;
+            } else {
+                ivec3 above = pos + ivec3(0, 1, 0);
+                uint av = read_a(above);
+                uint am = av & 0xFFu;
+                int af = (am == mat) ? int((av >> 8u) & 0xFFu) : 0;
+                if (am == 0u || am == mat) {
+                    int take = min(remaining, FILL_CAP - af);
+                    accumulate(above, take);
+                    remaining -= take;
+                }
+            }
+            if (remaining <= 0) break;
+        }
+
+        if (frontier_tail >= WALK_CAP) continue;  // out of local room -- fall through to origin below
+        for (int i = 0; i < 6 && frontier_tail < WALK_CAP; i++) {
+            ivec3 p = pos + NEIGH6[i];
+            bool seen = false;
+            for (int j = 0; j < visited_count; j++) {
+                if (visited[j] == p) { seen = true; break; }
+            }
+            if (seen) continue;
+            if (visited_count < WALK_CAP) visited[visited_count++] = p;
+            if ((read_a(p) & 0xFFu) == mat) {
+                frontier[frontier_tail++] = p;
+            }
+        }
+    }
+
+    if (remaining > 0) {
+        // Exhausted the local walk (or hit WALK_CAP) with leftover -- fall back to
+        // origin, same INVARIANT-protected target every other displacement mode uses.
+        // Whether origin actually has room by the time pass 1 applies this is NOT
+        // knowable here (another demand's walk may also target it) -- resolved,
+        // clamped, and requeued if needed in pass 1, never assumed safe here.
+        accumulate(origin, remaining);
+    }
+}
+
+void pass_apply(int touched_idx) {
+    ivec3 pos = ivec3(touched_cells.entries[touched_idx * 3],
+                      touched_cells.entries[touched_idx * 3 + 1],
+                      touched_cells.entries[touched_idx * 3 + 2]);
+    int idx = world_to_flat(pos);
+    if (idx < 0) return;
+    uint amount = demand_accum.data[idx];
+    if (amount == 0u) return;
+
+    uint v = voxels_a.data[idx];
+    uint cur_mat = v & 0xFFu;
+    int cur_fill = int((v >> 8u) & 0xFFu);
+    // material is uniform per drain (granular only ever queues one liquid material at a
+    // time in this engine today); a cell already holding a genuinely different material
+    // is a real conflict, not routed further here -- same "occupied" case the Python
+    // validation tracks. Determine the material from ANY demand that could have reached
+    // here: since only same-material walks ever accumulate into a cell, cur_mat==0
+    // (air) or cur_mat==the-liquid-being-displaced are the only valid cases.
+    uint mat = cur_mat;
+    if (mat == 0u) {
+        // Materializing into air -- the material isn't stored anywhere at this cell yet.
+        // Recover it from the demand queue: any entry whose walk could have reached here
+        // shares the same material (single-material-per-drain, see above), so read it
+        // from entry 0 if present. Safe because pass_apply only runs when count > 0.
+        mat = uint(demand_queue.entries[3]) & 0xFFu;
+    }
+
+    int new_fill = min(FILL_CAP, cur_fill + int(amount));
+    int excess = (cur_fill + int(amount)) - new_fill;
+
+    uint new_voxel = (new_fill == 0) ? 0u : (mat | (uint(new_fill) << 8u));
+    uint log_slot = atomicAdd(changelog.count, 1u);
+    if (log_slot < MAX_CHANGELOG) {
+        changelog.entries[log_slot * 2u]     = uint(idx);
+        changelog.entries[log_slot * 2u + 1u] = new_voxel;
+    }
+
+    if (excess > 0) {
+        uint rq = atomicAdd(demand_requeue.count, 1u);
+        if (rq < MAX_REQUEUE) {
+            demand_requeue.entries[rq * 4]     = pos.x;
+            demand_requeue.entries[rq * 4 + 1] = pos.y;
+            demand_requeue.entries[rq * 4 + 2] = pos.z;
+            demand_requeue.entries[rq * 4 + 3] = int(mat | (uint(excess) << 8u));
+        }
+    }
+
+    demand_accum.data[idx] = 0u;  // clear for next tick's dispatch (no separate zero pass needed)
+}
+
+void main() {
+    // Explicit int cast, matching this codebase's established convention (e.g.
+    // granular_sim.comp's `int chunk_idx = int(gl_WorkGroupID.x) / 4;`) -- avoids
+    // relying on GLSL's implicit int<->uint conversion rules, which this file does
+    // not assume anywhere else either (see the pass_walk mat_amt comment).
+    int idx = int(gl_GlobalInvocationID.x);
+    if (params.pass == 0) {
+        if (idx >= int(demand_queue.count)) return;
+        pass_walk(idx);
+    } else {
+        if (idx >= int(touched_cells.count)) return;
+        pass_apply(idx);
+    }
+}

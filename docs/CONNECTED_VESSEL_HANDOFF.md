@@ -1,6 +1,21 @@
 # Connected-Vessel Hydrostatics (the "U-tube test") — Handoff
 
-**Status (2026-07-07):** unsolved. Two serious attempts have been tried and set aside. `master` currently runs the original flux-only system, which is known — and now precisely understood — to be structurally unable to pass this test. This document is the single entry point for whoever picks this up next: what the test actually requires, everything tried so far and why each attempt failed, why the *current* shipped system can't pass it either, and what a solution actually needs to be able to do.
+> **⚠️ SUPERSEDED (2026-07-08) — this problem is SOLVED.** The `phi-flood` design (a third
+> attempt, after the two documented below) passed the U-tube test and is shipped on
+> `master` in `shaders/fluid_flux.comp`, confirmed working in-editor. **Do not pick this up
+> as an open problem.** Current status: `docs/PHI_FLOOD_PORT_PLAN.md`. Permanent record:
+> `docs/BUG_LOG.md` → "PORTED & VERIFIED IN-EDITOR (2026-07-08)". One narrower open bug
+> remains against the shipped design (not this whole problem) — the "flat lake ripple",
+> see `tools/fluid_prototypes/python/test_pile_ripple.py` and `docs/BUG_LOG.md`.
+>
+> This document is kept **only** as the historical record of the first two failed
+> attempts (Build B, pressure-projection) — exactly the kind of "don't retry this" record
+> this project's `BUG_LOG.md` discipline values. It is still cross-referenced from
+> `shaders/fluid_flux.comp` and `fluid_simulation.gd` as background for *why* the
+> straight-up `head()` scan is structurally blind to horizontal connections. Read it for
+> that context or for failed-attempt history — not as a live task.
+
+**Status (2026-07-07, ORIGINAL — see banner above for current status):** unsolved. Two serious attempts have been tried and set aside. `master` currently runs the original flux-only system, which is known — and now precisely understood — to be structurally unable to pass this test. This document is the single entry point for whoever picks this up next: what the test actually requires, everything tried so far and why each attempt failed, why the *current* shipped system can't pass it either, and what a solution actually needs to be able to do.
 
 ---
 

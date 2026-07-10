@@ -80,6 +80,8 @@ func _unhandled_input(event: InputEvent) -> void:
 				print("[FluidWatch] now watching chunk %s local %s (world %s)" % [cp, lp, target])
 		elif event.keycode == KEY_U:
 				build_utube_test_scene()
+		elif event.keycode == KEY_K:
+				build_sand_cluster_test_scene()
 		elif event.keycode == KEY_DOWN:
 			# Debug rewind tool (2026-07-07) -- save the canonical voxel buffer to a CPU-side
 			# snapshot so a test scenario can be captured once and replayed: build the scene,
@@ -156,3 +158,86 @@ func build_utube_test_scene() -> void:
 	simulation_runtime.paused = true
 	get_node("HotBar").set_paused(true)
 	print("[UTubeBuilder] built U-tube at %s (arm height %d, gap %d) -- sim paused, press P to run" % [origin, UTUBE_ARM_HEIGHT, UTUBE_GAP])
+
+
+# Scripted sand-into-water acceptance-test scene (2026-07-10, KEY_K) -- a DIRECT,
+# term-by-term port of the "cluster" scene from
+# tools/fluid_prototypes/python/scenes.py::build_sand_pool(pool_half=8, pool_depth=4,
+# cluster_half=2, cluster_h=3, drop_h=2), the exact rig the phi_demand mechanism
+# (docs/PHI_FILL_SAND_PLAN.md) was validated against in the Python bench before any
+# GLSL was touched. This is the in-engine acceptance rig for whenever that mechanism is
+# ported -- same two-stage discipline as the U-tube/phi-flood rig above (bench-validate
+# in Python first, then confirm the SAME scripted geometry in-editor). Until the port
+# lands, this scene still shows the CURRENTLY SHIPPED try_displace_priority behaviour
+# (the diagonal-fall gap fix from this session) -- useful right now as a "before"
+# baseline, and ready to re-run unchanged as the "after" check once phi_demand ports.
+#
+# Deliberately mirrors scenes.py's Y arithmetic TERM FOR TERM (not re-derived from a
+# different convention) -- including its one real quirk: origin.y itself stays solid
+# (matches ROCK bowl's own base, one voxel below the first carved row), and the water
+# pool's own centre/half math leaves it starting 1 voxel above that carved floor, not
+# flush with it. That gap is not a bug here; it is exactly what was Python-validated,
+# and "fixing" it would make this rig test different geometry than the bench proved.
+# Two deliberate deviations, both purely cosmetic (never touch the water/sand geometry
+# itself): GLASS instead of ROCK for the shell (same substitution build_utube_test_scene
+# already makes, same reason -- watch it happen, don't just trust the numbers), and the
+# shell is stretched taller than scenes.py's own bowl so the sand cluster's STARTING
+# position is also inside the visible glass box instead of floating above an open roof.
+const CLUSTER_POOL_HALF_XZ := 8   # scenes.py pool_half
+const CLUSTER_POOL_DEPTH   := 4   # scenes.py pool_depth
+const CLUSTER_SAND_HALF_XZ := 2   # scenes.py cluster_half -> 5x5 footprint
+const CLUSTER_SAND_HEIGHT  := 3   # scenes.py cluster_h
+const CLUSTER_DROP_HEIGHT  := 2   # scenes.py drop_h
+const CLUSTER_WALL         := 2   # glass shell thickness (cosmetic only, see note above)
+const CLUSTER_HEADROOM     := 3   # extra glass roof clearance above the sand's start (cosmetic only)
+
+func build_sand_cluster_test_scene() -> void:
+	var origin = raymarch_renderer.get_cursor_remove_pos()
+	if origin == null:
+		print("[SandClusterBuilder] no voxel under cursor -- aim at solid ground first")
+		return
+
+	# --- direct port of scenes.py::build_sand_pool's Y arithmetic (cy = origin.y) ---
+	var depth = CLUSTER_POOL_DEPTH + 2                              # scenes.py: depth
+	var bowl_center_y = origin.y + depth / 2                        # scenes.py: bowl_center[1]
+	var inner_center_y = origin.y + depth / 2 + 1                   # scenes.py: inner_center[1]
+	var inner_half_y = depth / 2                                    # scenes.py: inner_half[1]
+	var floor_y = origin.y + 1                                      # scenes.py: floor_y
+	var water_center_y = floor_y + CLUSTER_POOL_DEPTH / 2            # scenes.py: water_center[1]
+	var water_half_y = (CLUSTER_POOL_DEPTH - 1) / 2                  # scenes.py: water_half[1]
+	var surface_y = floor_y + CLUSTER_POOL_DEPTH - 1                 # scenes.py: surface_y
+	var sand_bottom_y = surface_y + 1 + CLUSTER_DROP_HEIGHT          # scenes.py: sand_bottom
+	var sand_center_y = sand_bottom_y + (CLUSTER_SAND_HEIGHT - 1) / 2  # scenes.py: sand_center[1]
+	var sand_half_y = (CLUSTER_SAND_HEIGHT - 1) / 2                  # scenes.py: sand_half[1]
+	var sand_top_y = sand_bottom_y + CLUSTER_SAND_HEIGHT - 1
+
+	# --- shell: cosmetic only -- GLASS instead of ROCK, stretched to also contain the
+	# sand cluster's starting position (scenes.py's own bowl only needs to contain the
+	# water pool, since it doesn't care about visual containment of the fall). Centered
+	# independently of inner_center_y/bowl_center_y above -- this is the one place this
+	# function does NOT mirror scenes.py term-for-term, by design (see comment above). ---
+	var shell_top_y = sand_top_y + CLUSTER_HEADROOM
+	var shell_bottom_y = origin.y - CLUSTER_WALL
+	var shell_center_y = (shell_bottom_y + shell_top_y) / 2
+	var shell_half_y = (shell_top_y - shell_bottom_y) / 2
+	var shell_center := Vector3i(origin.x, shell_center_y, origin.z)
+	var shell_half := Vector3i(CLUSTER_POOL_HALF_XZ + CLUSTER_WALL, shell_half_y, CLUSTER_POOL_HALF_XZ + CLUSTER_WALL)
+	world_orchestrator.edit_box(shell_center, shell_half, EditDispatcher.EditOp.ADD, Chunk.Mat.GLASS)
+
+	# --- everything below this line is the direct scenes.py port, unchanged ---
+	var inner_center := Vector3i(origin.x, inner_center_y, origin.z)
+	var inner_half := Vector3i(CLUSTER_POOL_HALF_XZ, inner_half_y, CLUSTER_POOL_HALF_XZ)
+	world_orchestrator.edit_box(inner_center, inner_half, EditDispatcher.EditOp.REMOVE)
+
+	var water_center := Vector3i(origin.x, water_center_y, origin.z)
+	var water_half := Vector3i(CLUSTER_POOL_HALF_XZ, water_half_y, CLUSTER_POOL_HALF_XZ)
+	world_orchestrator.edit_box(water_center, water_half, EditDispatcher.EditOp.ADD, Chunk.Mat.WATER)
+
+	var sand_center := Vector3i(origin.x, sand_center_y, origin.z)
+	var sand_half := Vector3i(CLUSTER_SAND_HALF_XZ, sand_half_y, CLUSTER_SAND_HALF_XZ)
+	world_orchestrator.edit_box(sand_center, sand_half, EditDispatcher.EditOp.ADD, Chunk.Mat.SAND)
+
+	simulation_runtime.paused = true
+	get_node("HotBar").set_paused(true)
+	print("[SandClusterBuilder] built sand-cluster rig at %s (pool half %d depth %d, cluster %dx%d half %d, drop %d) -- sim paused, press P to run" \
+		% [origin, CLUSTER_POOL_HALF_XZ, CLUSTER_POOL_DEPTH, CLUSTER_SAND_HALF_XZ * 2 + 1, CLUSTER_SAND_HALF_XZ * 2 + 1, CLUSTER_SAND_HALF_XZ, CLUSTER_DROP_HEIGHT])

@@ -6,6 +6,34 @@ Split out from `ARCHITECTURE.md` (2026-07-02) once that file grew too large to c
 
 ---
 
+### FIXED (2026-07-10): three bugs caught while porting `phi_demand` sand↔water displacement to GLSL
+
+Found while writing `shaders/demand_resolve.comp` and wiring it up in `simulations/granular_simulation.gd`, before any in-editor run — all caught by re-reading the code against known invariants, not by observed failures.
+
+1. **GLSL int/uint mix.** `int remaining = (mat_amt >> 8) & 0xFFu;` mixes an `int` with a `uint` literal, which GLSL rejects. Fixed to `& 0xFF`. Also proactively converted every index-typed variable in the new shader (`demand_idx`, `touched_idx`, etc.) from `uint` to `int` throughout, matching this codebase's existing convention of explicit casting rather than relying on implicit GLSL int/uint conversion (see `granular_sim.comp`'s `int chunk_idx = int(gl_WorkGroupID.x) / 4;`).
+2. **Params buffer size mismatch.** `_demand_resolve_params_buf` was allocated 32 bytes in `_ready()`, but the shader's `Params` struct has 9 ints (36 bytes — the extra field is `settle_threshold`). Fixed the allocation to 36 bytes.
+3. **Toggle buffer stuck at 1.** `_demand_mode_params_buf` was only ever written the value `1`, inside an `if use_phi_demand_displacement:` branch — never written `0` if the export were toggled off at runtime. Fixed to unconditionally write the current boolean state at the top of `step()` every tick.
+
+**Rule to remember:** for any GPU toggle buffer, always write the *current* state every tick — writing only the "on" value inside a conditional silently pins the shader's behavior to whatever the first non-zero write was.
+
+---
+
+### DIAGNOSED (2026-07-09): water "encapsulates" a falling sand mass — root-caused in the Python bench (bench-validated fix `block_combo` chosen, not yet ported to GLSL)
+
+**Symptom (SAND_LIQUID_DENSITY_HANDOFF §2):** dropping a sand cluster into water makes water appear to wrap/climb the falling mass for ~8–10 ticks before settling normally.
+
+**Root cause — NOT a logic bug and NOT primarily contention.** Reproduced on a faithful port of `granular_sim.comp` (`tools/fluid_prototypes/python/granular.py`, coupled granular→fluid per the engine ordering). Three measured components, in order of size: (1) *structural* — `try_displace_priority` levels 1/2 require an **air** cell adjacent to the impacted water voxel; submerged under a cluster footprint those cells are water (level 1) or the cluster's own sand (level 2), so level 3 fires almost every displacement (195 level-3 vs 35 level-2 in the 5x5x3 cluster scene) and teleports water up into the mass; (2) *swap-sinking interleave* — inherent to whole-voxel swaps: every sinking grain swaps one water voxel up behind itself, so a multi-layer mass pumps water up through its own interior one layer per tick; (3) *contention* — snapshot-A air cells lost to neighbouring grains' CAS, falling through to level 3 anyway (~3–4 events per impact; the handoff's headline hypothesis, real but minor). The handoff's stage-2 assumption ("pool wider than the footprint ⇒ level 3 never triggers") is wrong — "sideways" only sees the cells adjacent to the impacted voxel.
+
+**Fix chosen in the bake-off (`block_combo`, see `tools/fluid_prototypes/python/SAND_DISPLACEMENT_NOTES.md` for the full matrix):** when the grain is buried (granular directly above) — (a) no air candidate in snapshot A → skip displacement unless `randf < 0.125` (percolation escape, prevents the sealed-plug deadlock that pure blocking causes); (b) air existed but every relocation CAS lost → `atomicExchange` the claimed water cell back to 0 (nothing logged yet — safe) and retry next tick. Halves interior pumping (peak 20→15 coupled, 18→9 granular-only), keeps single-grain/sealed-shaft/sealed-plug/conservation green. INVARIANT (level-3 fallback = `my_flat`) untouched.
+
+**Failed approaches (don't retry):** wider lateral search (radius 2 + xz diagonals) — no help, distant cells are still water/sand; relocating water up the same-liquid column to the first air cell — no help, lifts water higher; hard blocking without the percolation escape — sealed 3x3 sand plug floats on water forever; "column hop" (water leapfrogs the sand stack to the air above it) — *worse*, hopped water lands on the still-falling mass and re-buries.
+
+**Ceiling / rule to remember:** discrete air-targeted relocation cannot be artifact-free when submerged — there is no air to target, and any local answer either pumps water through the mass or piles it on top. The full fix is the handoff's §3 direction (hand displaced volume to the fluid solver as fill/flux, Phase 7e Step 8), where the pressure field can move volume *through* water.
+
+**§3 explored same session, NOT adopted — see `tools/fluid_prototypes/python/SAND_DISPLACEMENT_NOTES.md` §5 for the full writeup.** Built the Step 8 impulse mechanism (`granular.py mode="impulse"` + `cavitation.py`'s `ImpulseFluidSim`) to check "if we're bench-validating anyway, does the real fix beat block_combo." Found and fixed a real mass-creation bug first: anchoring the impulse at the impact cell (now sand, but conventionally still stores `fill=255`) makes `compute_s_out` treat it as a full liquid donor with no material check, materializing water at neighbours from nothing (+928 fill/tick measured) — the impulse must anchor on the cell that actually holds the displaced water (`my_flat`/`gpos`), not the collision point. With that fixed, the mechanism does NOT beat `block_combo` on this symptom at any tested magnitude (0–220): a single unconfined water voxel already fully disperses in 1 tick via existing gravity/head flow with no impulse at all, and in the cluster scene the ~9-tick artifact duration is set by the avalanche's own landing cadence, not by dispersal speed — confirmed by a hybrid test (block_combo + impulse-on-fallback) that changed peak_interior by exactly 0. `block_combo` remains the recommendation for §2; the impulse mechanism is the right architecture for Step 8's actual motivating use case (splash/jet feel) but is a different fix for a different problem, not a substitute here.
+
+---
+
 ### FIXED (2026-07-10): sand's diagonal fall into water skipped sideways-displacement priority — always teleported water straight up
 
 **Symptom:** Sand displacing water via a diagonal fall (4 shuffled diagonal-down candidates in `granular_sim.comp`) always relocated the displaced water directly to the sand's old position (one level up, offset back toward where the sand came from) — never attempted to push the water sideways first, unlike the straight-down fall path a few lines above it, which already tried sideways at two levels before falling back to "up." `ARCHITECTURE.md`'s Phase 7b section claimed "same pattern applied to the 4 diagonal-down destinations," which was not true — a doc/code mismatch, not just a behavioral gap.

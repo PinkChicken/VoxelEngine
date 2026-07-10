@@ -36,6 +36,26 @@ layout(set = 0, binding = 7, std430)          buffer DirtyChunks  { uint data[];
 // 1 u32 per voxel slot (same indexing as voxels_a/b): set to 1 when grain moves, zeroed by zero_slots.
 layout(set = 0, binding = 8, std430)          buffer SimActiveBuf { uint data[]; } sim_active;
 
+// --- phi_demand mechanism (2026-07-10, docs/PHI_FILL_SAND_PLAN.md) ---
+// Toggle lives in its own tiny buffer, NOT the shared SimParams struct above (which
+// zero_slots.comp also binds at binding 3 with an identical, independently-maintained
+// layout -- growing SimParams here would silently desync that shader's own copy).
+// Default 0 (off): existing try_displace_priority behaviour is completely untouched
+// when this is 0, byte for byte -- this whole block is new, additive code.
+layout(set = 0, binding = 9, std430) readonly buffer DemandModeParams { int enabled; } demand_mode;
+// Demand queue: granular appends (origin, material, amount) here instead of
+// searching for a destination itself -- see try_displace_demand below. Consumed by
+// demand_resolve.comp, dispatched by GranularSimulation right after this shader,
+// still within the SAME tick, before FluidSimulation's own step begins -- so a
+// resolved deposit is ordinary fill by the time phi-flood computes this tick's field.
+layout(set = 0, binding = 10, std430) buffer DemandQueue {
+    uint count;
+    // interleaved: origin_x, origin_y, origin_z, (material | amount<<8), ...
+    int entries[];
+} demand_queue;
+const uint MAX_DEMANDS = 65536u;  // far below MAX_CHANGELOG -- demands are one per
+                                   // grain-into-liquid contact, much rarer than moves.
+
 const uint SIM_GRANULAR  = 1u;
 const uint SIM_LIQUID    = 2u;
 const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGELOG_ENTRIES
@@ -177,6 +197,41 @@ bool try_displace_priority(ivec3 water_pos, uint my_voxel, uint their_voxel, int
     return true;
 }
 
+// Direct port of granular.py::_try_displace_demand (docs/PHI_FILL_SAND_PLAN.md §3-c).
+// No lateral search at all -- not even a single hop. CAS-claim water_pos for the grain
+// (same INVARIANT target as try_displace_priority); my_flat becomes AIR in the
+// changelog exactly like the "water went sideways" branch above. The displaced water's
+// FILL is queued as a pure demand -- (origin=gpos, material, amount), no target cell
+// chosen here at all -- for demand_resolve.comp to place via a non-local search that
+// only the fluid pass has the information to do correctly (see that shader).
+bool try_displace_demand(ivec3 water_pos, uint my_voxel, uint their_voxel, int my_flat, int vpc, ivec3 gpos) {
+    int df = world_to_flat(water_pos);
+    if (df < 0) return false;
+    uint old = atomicCompSwap(voxels_b.data[df], 0u, my_voxel);
+    if (old != 0u) return false;
+
+    uint log_slot = atomicAdd(changelog.count, 2u);
+    if (log_slot + 1u < MAX_CHANGELOG) {
+        changelog.entries[log_slot * 2u]             = uint(df);
+        changelog.entries[log_slot * 2u + 1u]        = my_voxel;
+        changelog.entries[(log_slot + 1u) * 2u]      = uint(my_flat);
+        changelog.entries[(log_slot + 1u) * 2u + 1u] = 0u;
+    }
+    voxels_b.data[my_flat] = 0u;
+    sim_active.data[my_flat] = 1u;
+    mark_dirty(my_flat, vpc);
+    mark_dirty(df, vpc);
+
+    uint dq_slot = atomicAdd(demand_queue.count, 1u);
+    if (dq_slot < MAX_DEMANDS) {
+        demand_queue.entries[dq_slot * 4]     = gpos.x;
+        demand_queue.entries[dq_slot * 4 + 1] = gpos.y;
+        demand_queue.entries[dq_slot * 4 + 2] = gpos.z;
+        demand_queue.entries[dq_slot * 4 + 3] = int(their_voxel & 0xFFFFu); // material | amount<<8
+    }
+    return true;
+}
+
 float randf(int seed) {
     uint h = uint(seed);
     h ^= h >> 16u;
@@ -253,7 +308,9 @@ void main() {
             int df = world_to_flat(below);
             if (df >= 0 && try_move(df, my_voxel, my_flat, vpc)) return;
         } else if (material_sim.data[dest_mat] == SIM_LIQUID) {
-            if (try_displace_priority(below, my_voxel, dest, my_flat, vpc, lat)) return;
+            if (demand_mode.enabled != 0) {
+                if (try_displace_demand(below, my_voxel, dest, my_flat, vpc, gpos)) return;
+            } else if (try_displace_priority(below, my_voxel, dest, my_flat, vpc, lat)) return;
         }
     }
 
@@ -272,7 +329,9 @@ void main() {
             // common case in practice (sand's shuffled lateral fall order means diagonal
             // hits at least as often as straight-down). try_displace_priority (see its
             // definition/INVARIANT comment above) now backs both paths identically.
-            if (try_displace_priority(d, my_voxel, dest, my_flat, vpc, lat)) return;
+            if (demand_mode.enabled != 0) {
+                if (try_displace_demand(d, my_voxel, dest, my_flat, vpc, gpos)) return;
+            } else if (try_displace_priority(d, my_voxel, dest, my_flat, vpc, lat)) return;
         }
     }
 }

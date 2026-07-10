@@ -1,5 +1,10 @@
 # Possible Solutions — Connected-Vessel Hydrostatics (U-tube)
 
+> **⚠️ SUPERSEDED (2026-07-08) — a solution was chosen and shipped.** Phi-flood (family
+> ranked #1 below) is what actually got built, ported to GLSL, and verified in-editor —
+> see `docs/PHI_FLOOD_PORT_PLAN.md` and `docs/BUG_LOG.md`. Kept as historical record of
+> the option space that was considered, not as an open decision.
+
 **Companion to `CONNECTED_VESSEL_HANDOFF.md`.** That document defines the problem, the
 failed attempts, and the acceptance criteria (first-fill equalization **and** reactivity after
 settling, no false-rest, fast enough to develop against, ideally preserves flux feel). This
