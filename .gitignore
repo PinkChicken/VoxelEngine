@@ -11,3 +11,17 @@ Reference_Three.pdf
 # Python bytecode cache (tools/fluid_prototypes/ and any future Python tooling)
 __pycache__/
 *.pyc
+
+# Local-only: the Python fluid-prototype bench suite (design/validation tooling
+# and its regression tests) — stays on disk for local iteration, not pushed.
+tools/fluid_prototypes/python/
+
+# Local-only: CLAUDE.md is project-specific assistant guidance, not meant for
+# the remote repo.
+CLAUDE.md
+
+# Local-only: design notes / handoff markdown. ARCHITECTURE.md and
+# docs/BUG_LOG.md remain the single source of truth and stay tracked.
+*.md
+!ARCHITECTURE.md
+!docs/BUG_LOG.md
