@@ -421,7 +421,18 @@ func _load_demand_resolve_shader() -> String:
 # Not yet verified in-editor -- see the use_phi_demand_displacement export comment.
 
 func _ensure_demand_accum_capacity() -> void:
-	var needed := _orchestrator.get_voxel_buf_capacity()
+	# FIX (re-confirmed 2026-07-12, docs/BUG_LOG.md "_ensure_demand_accum_capacity() sized
+	# its scratch buffer to the chunk-slot count..."): get_voxel_buf_capacity() returns the
+	# number of CHUNK SLOTS the voxel buffer is sized for, not the voxel count — but
+	# demand_accum is indexed by the FULL FLAT VOXEL INDEX (slot * vpc + local), same as
+	# voxels_a itself. Must multiply by chunk_size^3 or every accumulate() write beyond the
+	# first ~512 voxels lands out of bounds and is silently discarded by the GPU (confirmed
+	# via direct buffer probe in the original investigation — no crash, no validation error,
+	# just demand_accum reading back 0 for any real flat index). This was written once
+	# before, bench-verified, then reverted along with unrelated density-stacking work in
+	# the same file — see the bug log entry for why it needs re-applying independently.
+	var cs := _chunk_manager.chunk_size
+	var needed := _orchestrator.get_voxel_buf_capacity() * cs * cs * cs
 	if needed <= _demand_accum_capacity and _demand_accum_buf.is_valid():
 		return
 	if _demand_accum_buf.is_valid():

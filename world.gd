@@ -81,7 +81,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		elif event.keycode == KEY_U:
 				build_utube_test_scene()
 		elif event.keycode == KEY_K:
-				build_sand_cluster_test_scene()
+				build_density_test_tube_scene()
 		elif event.keycode == KEY_DOWN:
 			# Debug rewind tool (2026-07-07) -- save the canonical voxel buffer to a CPU-side
 			# snapshot so a test scenario can be captured once and replayed: build the scene,
@@ -90,6 +90,20 @@ func _unhandled_input(event: InputEvent) -> void:
 			world_orchestrator.debug_save_voxel_snapshot()
 		elif event.keycode == KEY_UP:
 			world_orchestrator.debug_load_voxel_snapshot()
+		elif event.keycode == KEY_T:
+			# Density-trigger debug tint (2026-07-12, docs/BUG_LOG.md "SOLVED IN BENCH
+			# (2026-07-11)") — step 1 of the oil-water port: flips BOTH halves of the
+			# tint (FluidSimulation writes the per-voxel buffer, RaymarchRenderer reads
+			# it) together, since neither alone shows anything. Every OIL voxel directly
+			# under a WATER voxel should flash bright magenta while this is on. Pour
+			# water onto an oil pool (hotbar slot 5 = OIL, 3 = WATER) and watch: no tint
+			# at all means the pass isn't reaching the GPU/dispatch; tint that only
+			# appears where expected (and only there) confirms the plumbing works before
+			# any real displacement mechanism gets written on top of it.
+			var on := not fluid_simulation.debug_density_trigger_tint
+			fluid_simulation.debug_density_trigger_tint = on
+			raymarch_renderer.debug_density_touch_tint = on
+			print("[DensityTint] %s" % ("ON — oil-under-water voxels will flash magenta" if on else "off"))
 
 
 # Scripted U-tube acceptance-test scene (2026-07-04, Checkpoint 4/5 tooling — originally
@@ -241,3 +255,85 @@ func build_sand_cluster_test_scene() -> void:
 	get_node("HotBar").set_paused(true)
 	print("[SandClusterBuilder] built sand-cluster rig at %s (pool half %d depth %d, cluster %dx%d half %d, drop %d) -- sim paused, press P to run" \
 		% [origin, CLUSTER_POOL_HALF_XZ, CLUSTER_POOL_DEPTH, CLUSTER_SAND_HALF_XZ * 2 + 1, CLUSTER_SAND_HALF_XZ * 2 + 1, CLUSTER_SAND_HALF_XZ, CLUSTER_DROP_HEIGHT])
+
+
+# Scripted liquid-density-sorting acceptance-test scene (2026-07-12, KEY_K -- REPLACES the
+# sand-cluster binding above; build_sand_cluster_test_scene() itself is untouched and
+# still callable, just no longer bound to a key). A sealed glass tube with WATER on top
+# and OIL on the bottom — the WRONG order (water is denser, so oil should rise to the
+# top) — plus a few isolated OIL droplets sprinkled inside the water layer. Two separate
+# cases under test in one rig, both relevant to the momentum/buoyancy port:
+#   1. The bulk flat-interface case (the whole oil/water boundary) — a wide, flat layer
+#      that must sort straight up without fragmenting.
+#   2. The isolated-droplet case (each sprinkled oil voxel, surrounded by water on all
+#      4 horizontal sides) — a lone riser, exercised separately from the bulk interface.
+# Built with EXACT, known geometry specifically so a reported bug ("water floats on oil
+# until I edit something, then it all drops at once") can be diagnosed against a known
+# starting fill count instead of an ad-hoc hand-placed scene — compare the printed
+# baseline below against F6's live dump (WorldOrchestrator.debug_dump_fluid_stats()).
+const TESTTUBE_HALF_XZ      := 2   # 5x5 interior cross-section
+const TESTTUBE_OIL_HEIGHT   := 10  # bottom layer — OIL, correct position
+const TESTTUBE_WATER_HEIGHT := 10  # top layer — WATER, WRONG position (denser above lighter)
+const TESTTUBE_HEADROOM     := 3   # empty air above the water, inside the sealed tube
+const TESTTUBE_WALL         := 2   # glass shell thickness
+# Local (x, y-offset-from-water-centre, z) positions for the sprinkled oil droplets —
+# spread across different heights/offsets within the water layer, not just one spot.
+const TESTTUBE_SPRINKLE: Array[Vector3i] = [
+	Vector3i(0, -3, 0), Vector3i(1, 0, 1), Vector3i(-1, 2, -1),
+]
+
+func build_density_test_tube_scene() -> void:
+	var origin = raymarch_renderer.get_cursor_remove_pos()
+	if origin == null:
+		print("[DensityTestTube] no voxel under cursor -- aim at solid ground first")
+		return
+
+	var oil_bottom_y = origin.y + 1
+	var oil_top_y = oil_bottom_y + TESTTUBE_OIL_HEIGHT - 1
+	var water_bottom_y = oil_top_y + 1
+	var water_top_y = water_bottom_y + TESTTUBE_WATER_HEIGHT - 1
+	var interior_top_y = water_top_y + TESTTUBE_HEADROOM
+
+	# --- sealed glass shell (open nowhere -- a real test tube, not an open-top bowl) ---
+	var shell_center_y = (origin.y + interior_top_y) / 2
+	var shell_half_y = (interior_top_y - origin.y) / 2 + TESTTUBE_WALL
+	var shell_center := Vector3i(origin.x, shell_center_y, origin.z)
+	var shell_half := Vector3i(TESTTUBE_HALF_XZ + TESTTUBE_WALL, shell_half_y, TESTTUBE_HALF_XZ + TESTTUBE_WALL)
+	world_orchestrator.edit_box(shell_center, shell_half, EditDispatcher.EditOp.ADD, Chunk.Mat.GLASS)
+
+	var inner_half := Vector3i(TESTTUBE_HALF_XZ, shell_half_y - TESTTUBE_WALL, TESTTUBE_HALF_XZ)
+	world_orchestrator.edit_box(shell_center, inner_half, EditDispatcher.EditOp.REMOVE)
+
+	# --- oil layer (bottom, correct) ---
+	var oil_center := Vector3i(origin.x, (oil_bottom_y + oil_top_y) / 2, origin.z)
+	var oil_half := Vector3i(TESTTUBE_HALF_XZ, (oil_top_y - oil_bottom_y) / 2, TESTTUBE_HALF_XZ)
+	world_orchestrator.edit_box(oil_center, oil_half, EditDispatcher.EditOp.ADD, Chunk.Mat.OIL)
+
+	# --- water layer (top, WRONG -- this is the state that needs sorting) ---
+	var water_center := Vector3i(origin.x, (water_bottom_y + water_top_y) / 2, origin.z)
+	var water_half := Vector3i(TESTTUBE_HALF_XZ, (water_top_y - water_bottom_y) / 2, TESTTUBE_HALF_XZ)
+	world_orchestrator.edit_box(water_center, water_half, EditDispatcher.EditOp.ADD, Chunk.Mat.WATER)
+
+	# --- sprinkled isolated oil droplets inside the water layer ---
+	for off in TESTTUBE_SPRINKLE:
+		var p := Vector3i(origin.x + off.x, water_center.y + off.y, origin.z + off.z)
+		world_orchestrator.edit_box(p, Vector3i.ZERO, EditDispatcher.EditOp.ADD, Chunk.Mat.OIL)
+
+	# --- known baseline (computed from geometry, not read back from the GPU) ---
+	var cross_section := (2 * TESTTUBE_HALF_XZ + 1) * (2 * TESTTUBE_HALF_XZ + 1)
+	var oil_fill := cross_section * TESTTUBE_OIL_HEIGHT * 255
+	var water_fill := cross_section * TESTTUBE_WATER_HEIGHT * 255
+	# Sprinkled oil REPLACES water voxels it overwrites -- adjust both totals so the
+	# printed baseline matches what's actually in the world, not just the two boxes'
+	# nominal volumes.
+	var sprinkle_count := TESTTUBE_SPRINKLE.size()
+	water_fill -= sprinkle_count * 255
+	oil_fill += sprinkle_count * 255
+
+	simulation_runtime.paused = true
+	get_node("HotBar").set_paused(true)
+	print("[DensityTestTube] built at %s: oil height=%d (bottom, correct) water height=%d (top, WRONG) %d sprinkled oil droplet(s) in water" \
+		% [origin, TESTTUBE_OIL_HEIGHT, TESTTUBE_WATER_HEIGHT, sprinkle_count])
+	print("[DensityTestTube] baseline fill: oil=%d water=%d (compare against F6's live dump — WorldOrchestrator.debug_dump_fluid_stats() — after running)" \
+		% [oil_fill, water_fill])
+	print("[DensityTestTube] sim paused: P to run, T for the density debug tint, F6 for live fill stats")

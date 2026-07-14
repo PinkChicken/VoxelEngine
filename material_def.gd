@@ -40,3 +40,12 @@ enum GravityMode {
 # the pre-per-material-flow shader); smaller = thicker (eases toward sluggish per the
 # viscosity formula — see VISCOSITY_NOTES.md). Ignored by non-liquid materials.
 @export_range(0.05, 1.0, 0.01) var flow: float = 1.0
+# Per-material density scalar for density-ordered liquid stacking (fluid_flux.comp's
+# MaterialDensity buffer, WorldOrchestrator._build_material_cache()) — 2026-07-12,
+# generalizing what was previously hardcoded to WATER/OIL in the trigger pass. 0.0
+# (default) means "not a density-sorted material": the trigger only considers a pair
+# when BOTH sides have density > 0, so solids/gases/unregistered ids never accidentally
+# participate just by touching a real liquid. Relative scale only matters, not absolute
+# units — water=1.0 is the baseline every other liquid is set relative to; any liquid
+# with a SMALLER positive density than a neighbouring liquid floats above it.
+@export_range(0.0, 5.0, 0.01) var density: float = 0.0

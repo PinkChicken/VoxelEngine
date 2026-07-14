@@ -147,8 +147,26 @@ layout(set = 0, binding = 12, std430) coherent buffer PhiBufB { int data[]; } ph
 // a liquid. Lets different liquids (water=1.0, oil=0.69) run the SAME viscosity formula
 // (see the axis loop below) at different thickness, with no separate physics path.
 layout(set = 0, binding = 13, std430) readonly buffer MaterialFlow { float data[256]; } material_flow;
+// Density-trigger debug tint (2026-07-12, docs/BUG_LOG.md "SOLVED IN BENCH
+// (2026-07-11)") — one uint per full flat voxel index, written ONLY by pass 5
+// (DensityTouchDebug, see below), read by raymarch.comp to force a visible tint.
+// Always bound (fluid_simulation.gd's debug_density_trigger_tint gates the pass-5
+// DISPATCH, not this binding) so toggling it never changes the uniform set's shape.
+layout(set = 0, binding = 14, std430) buffer DensityTouchBuffer { uint data[]; } density_touch;
+
+// Per-material density lookup (2026-07-12) — 0.0 = not a density-sorted material (see
+// MaterialDef.density's own comment for why 0.0, not 1.0, is the safe default). Mirrors
+// MaterialFlow (binding 13) exactly: built by WorldOrchestrator._build_material_cache()
+// from MaterialDef.density. Retained for the momentum/buoyancy port (buoyancy's density
+// comparison); the old density-stacking mechanism that first introduced it was torn out
+// 2026-07-14 (see ARCHITECTURE.md's momentum/buoyancy to-do item).
+layout(set = 0, binding = 21, std430) readonly buffer MaterialDensity { float data[256]; } material_density;
 
 const uint SIM_LIQUID    = 2u;
+// Hardcoded material ids (material_db.gd defaults / Chunk.Mat enum). Used by the debug
+// tint (pass 5); the density-stacking passes that also used them were removed 2026-07-14.
+const uint MAT_WATER = 3u;
+const uint MAT_OIL   = 7u;
 const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGELOG_ENTRIES
 // Hoisted to file scope (was local to main()'s pass==0 block) so the phi-flood helpers
 // below (file-scope, defined before main()) can share it — one full voxel's worth of fill.
@@ -235,6 +253,42 @@ const ivec3 AXIS_DIR[3] = ivec3[3](ivec3(1, 0, 0), ivec3(0, 1, 0), ivec3(0, 0, 1
 void mark_dirty(int flat_idx, int vpc) {
     int chunk_slot = flat_idx / vpc;
     atomicOr(dirty_chunks.data[uint(chunk_slot) >> 5u], 1u << (uint(chunk_slot) & 31u));
+}
+
+// Cross-material air-cell ownership (re-applied 2026-07-12 after the 2026-07-10 revert —
+// see docs/BUG_LOG.md "two different liquids near the same air cell..." for the original
+// find, and "designated_liquid()'s fixed scan order..." for the frame-parity follow-up;
+// both ported here together since the second fix is a direct patch to the first).
+// Deterministic, snapshot-only pick of which liquid material an AIR cell belongs to THIS
+// TICK. An air cell with two different liquid neighbours (e.g. water resting on a ragged
+// oil surface) must not let both drive flux into/out of it in the same tick — Transport's
+// delta_f is a single unlabeled scalar sum across all 6 faces, so if two different
+// materials both contribute, whichever the (separate) label heuristic points to gets
+// credited with the WHOLE delta, silently converting the other material's contribution
+// into itself. Gating every air<->liquid face in Accelerate against this SAME owner
+// (Transport's fill_mat inference calls this too — see pass==1 below) prevents that: only
+// the owner's faces get real accel, so its own compute_s_out sees no outflow through them
+// either — conservation stays symmetric by construction.
+// Scan order alternates by frame parity ((params.frame & 1) ? reverse : forward) — a FIXED
+// order made the winner a pure function of static geometry (scattered water droplets
+// resting on an oil pancake systematically won ownership of every nearby air cell forever,
+// since neither material was moving away, freezing the oil's own Y-axis settling across
+// much of its exposed surface). A losing material is now blocked at most every OTHER tick,
+// not permanently. Returns 0u (AIR, never a valid material id) as the sentinel for "no
+// liquid neighbour found" — callers already treat 0u as "no owner" by existing convention.
+uint designated_liquid(ivec3 gpos) {
+    bool reverse = (params.frame & 1) == 1;
+    for (int i = 0; i < 6; i++) {
+        int idx = reverse ? (5 - i) : i;
+        int axis2 = idx / 2;
+        int sgn = (idx % 2 == 0) ? 1 : -1;
+        ivec3 sn = gpos + sgn * AXIS_DIR[axis2];
+        uint sm = read_a(sn) & 0xFFu;
+        if (sm != 0u && material_sim.data[sm] == SIM_LIQUID) {
+            return sm;
+        }
+    }
+    return 0u;
 }
 
 // Phase 7e Step 3 — hydrostatic head.
@@ -654,6 +708,25 @@ void main() {
                 continue;
             }
 
+            // Cross-material air-cell ownership (re-applied 2026-07-12, see
+            // designated_liquid()'s declaration) — an air cell touching two DIFFERENT
+            // liquids on different faces may only accelerate against its designated
+            // owner this tick; every other liquid's face into it is zeroed here at the
+            // source, so its own compute_s_out sees zero outflow through that face too.
+            if (my_is_air && nb_is_liquid) {
+                uint owner = designated_liquid(gpos);
+                if (owner != 0u && owner != nm) {
+                    flux_buf.data[lane] = 0;
+                    continue;
+                }
+            } else if (nb_is_air && my_is_liquid) {
+                uint owner = designated_liquid(nb);
+                if (owner != 0u && owner != mat_id) {
+                    flux_buf.data[lane] = 0;
+                    continue;
+                }
+            }
+
             // Exactly one side holds a liquid (or both hold the same one) — active_mat is
             // whichever material is actually present, so head() reads the right column
             // regardless of which side of the face this thread's voxel is on.
@@ -830,23 +903,17 @@ void main() {
         if (is_air && delta <= 0) return;              // air with net outflow: nothing to move
         if (is_liquid && my_fill == 0u && delta <= 0) return;
 
-        // Air receiving inbound flux materializes as liquid — scan all 6 neighbours for
-        // the donor's material (mirrors the same scan proven correct in Phase 7d's Pass 1;
-        // the source design's pseudocode omits this — see ARCHITECTURE.md Step 6 note).
+        // Air receiving inbound flux materializes as liquid. Re-applied 2026-07-12: this
+        // now calls designated_liquid() — the SAME owner-selection Accelerate just gated
+        // against above — instead of its own separate fixed 6-neighbour scan. Labeling and
+        // gating using two independently-maintained copies of "pick a liquid neighbour"
+        // could disagree about which material a given cell's inflow belongs to the moment
+        // either one changes without the other (see docs/BUG_LOG.md "two different liquids
+        // near the same air cell..." — this mismatch is exactly how real water volume got
+        // silently relabeled as oil there).
         uint fill_mat = mat_id;
         if (is_air) {
-            ivec3 scan[6];
-            scan[0] = gpos + AXIS_DIR[0]; scan[1] = gpos - AXIS_DIR[0];
-            scan[2] = gpos + AXIS_DIR[1]; scan[3] = gpos - AXIS_DIR[1];
-            scan[4] = gpos + AXIS_DIR[2]; scan[5] = gpos - AXIS_DIR[2];
-            for (int i = 0; i < 6; i++) {
-                uint nv = read_a(scan[i]);
-                uint nm = nv & 0xFFu;
-                if (nm != 0u && material_sim.data[nm] == SIM_LIQUID) {
-                    fill_mat = nm;
-                    break;
-                }
-            }
+            fill_mat = designated_liquid(gpos);
             if (fill_mat == 0u) return;  // no liquid neighbour found — spurious delta, skip
         }
 
@@ -974,6 +1041,37 @@ void main() {
                 }
             }
         }
+        return;
+    }
+
+    // === DensityTouchDebug (params.pass == 5) ===
+    // Step 1 of the oil-water waterfall port (docs/BUG_LOG.md "SOLVED IN BENCH
+    // (2026-07-11)") — proves a GLSL change actually reaches live dispatch before any
+    // real displacement mechanism is written, per the still-open 2026-07-10 mystery
+    // (three bench-validated fixes each reported "looks exactly the same" in-editor).
+    // Deliberately the SIMPLEST possible trigger check: straight-down only, no diagonal
+    // reach, no displacement, no changelog write, no mass movement of any kind. Each
+    // invocation writes ONLY its own flat slot (self-write, no neighbour writes) so
+    // there is no CAS/race to reason about.
+    //
+    // FIX (2026-07-12, in-editor report: water voxels tinting magenta too): the flat
+    // slot index (my_flat) is reused across materials as voxels move — a slot that WAS
+    // a qualifying oil cell (touch=1) can have water flow into that exact same slot
+    // next tick once the oil moves on. The original version only ever wrote this slot
+    // when mat_id == MAT_OIL, silently skipping every non-oil voxel — so a slot's `1`
+    // survived untouched after its material changed out from under it, showing up as
+    // tint on whatever now occupies that position. Fix: unconditionally overwrite every
+    // DISPATCHED voxel's own slot each tick (0 unless it currently qualifies) so the
+    // buffer always reflects the CURRENT tick's material at that position, not
+    // whichever material last happened to qualify there.
+    if (params.pass == 5) {
+        uint touch = 0u;
+        if (mat_id == MAT_OIL) {
+            ivec3 above = gpos + AXIS_DIR[1];
+            uint av = read_a(above);
+            touch = ((av & 0xFFu) == MAT_WATER) ? 1u : 0u;
+        }
+        density_touch.data[my_flat] = touch;
         return;
     }
 }

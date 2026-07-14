@@ -52,6 +52,8 @@ var _chunk_table: RID
 var _changelog_buf: RID      # layout: [u32 count | (flat_idx u32, new_value u32) × count]
 var _material_sim_buf: RID   # 256 u32s: material_id → SimulationClass (flat cache on GPU)
 var _material_flow_buf: RID  # 256 floats: material_id → MaterialDef.flow (fluid_flux.comp viscosity)
+var _material_density_buf: RID  # 256 floats: material_id → MaterialDef.density (density-ordered
+								 # liquid stacking, 2026-07-12) — 0.0 default = not density-sorted
 var _grid_min: Vector3i = Vector3i.ZERO
 var _grid_span: Vector3i = Vector3i.ZERO
 var _chunk_to_slot: Dictionary = {}   # Vector3i → slot index
@@ -107,6 +109,8 @@ func _exit_tree() -> void:
 		_compute.free_rid(_material_sim_buf)
 	if _material_flow_buf.is_valid():
 		_compute.free_rid(_material_flow_buf)
+	if _material_density_buf.is_valid():
+		_compute.free_rid(_material_density_buf)
 	if _surface_out_buf.is_valid():
 		_compute.free_rid(_surface_out_buf)
 	if _surface_params_buf.is_valid():
@@ -145,6 +149,18 @@ func _build_material_cache() -> void:
 		flow_buf.encode_float(def.id * 4, def.flow)
 	_material_flow_buf = _compute.buffer_upload(flow_buf)
 
+	# Per-material density cache (2026-07-12) — fluid_flux.comp binding 21. Defaults to
+	# 0.0 (NOT density-sorted) for every id, including unregistered ones — unlike flow's
+	# "default to 1.0 so nothing silently freezes," the safe default here is EXCLUSION:
+	# a material nobody configured a density for should never accidentally participate
+	# in density-ordered stacking just because it happens to be SIM_LIQUID.
+	if _material_density_buf.is_valid():
+		_compute.free_rid(_material_density_buf)
+	var density_buf := PackedByteArray(); density_buf.resize(256 * 4)
+	for def in _material_db.materials:
+		density_buf.encode_float(def.id * 4, def.density)
+	_material_density_buf = _compute.buffer_upload(density_buf)
+
 
 func _process(delta: float) -> void:
 	_compute.downloads_this_frame = 0
@@ -179,6 +195,7 @@ func swap_voxel_bufs() -> void:
 func get_changelog_buf() -> RID: return _changelog_buf
 func get_material_sim_buf() -> RID: return _material_sim_buf
 func get_material_flow_buf() -> RID: return _material_flow_buf
+func get_material_density_buf() -> RID: return _material_density_buf
 
 func reset_changelog() -> void:
 	var zero := PackedByteArray(); zero.resize(4); zero.fill(0)

@@ -109,6 +109,16 @@ func buffer_update(rid: RID, offset: int, data: PackedByteArray) -> void:
 	rd.buffer_update(rid, offset, data.size(), data)
 
 
+# GPU-side buffer-to-buffer copy (2026-07-12) — no CPU readback involved at all, unlike
+# download_range()+buffer_update() used together to "carry" data between two GPU buffers.
+# Scheduling matches buffer_update()'s existing convention in this codebase: issued into
+# the same command stream, no explicit submit()/sync() required here — ordering against
+# whatever dispatch reads the destination next is guaranteed by program order, same as
+# every existing buffer_update() call before a dependent _compute.run().
+func buffer_copy(src_rid: RID, dst_rid: RID, src_offset: int, dst_offset: int, size: int) -> void:
+	rd.buffer_copy(src_rid, dst_rid, src_offset, dst_offset, size)
+
+
 func download(buffer_rid: RID) -> PackedByteArray:
 	return rd.buffer_get_data(buffer_rid)
 

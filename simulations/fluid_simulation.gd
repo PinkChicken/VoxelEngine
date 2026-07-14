@@ -32,7 +32,7 @@ class_name FluidSimulation extends VoxelSimulation
 
 var _compute
 var _flux_pipeline: Dictionary = {}   # fluid_flux.comp — Accelerate / Scale / Transport
-var _flux_params_buf: RID             # 60-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, settle_threshold, phi_read_buf, flow)
+var _flux_params_buf: RID             # 64-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, settle_threshold, phi_read_buf, flow)
 var _flux_chunk_list_buf: RID         # active + 6 face neighbours — flux dispatch range
 var _flux_chunk_list_capacity: int = 0
 var _dirty_chunks_buf: RID
@@ -105,6 +105,15 @@ var _conservation_buf: RID
 # pinpoints WHERE the single largest gain each tick happens instead of guessing further.
 # 8 bytes: [flat_idx: s32, amount: s32]. Plain (non-atomic) write on the shader side.
 var _gain_tracker_buf: RID
+# Density-trigger debug tint scratch (2026-07-12, see debug_density_trigger_tint) — one
+# uint per FULL FLAT VOXEL INDEX (slot * vpc + local, same convention as voxels_a/
+# changelog), NOT per chunk slot. Sized via get_voxel_buf_capacity() * chunk_size^3 —
+# get_voxel_buf_capacity() returns chunk-slot count; multiplying is mandatory here (see
+# docs/BUG_LOG.md "_ensure_demand_accum_capacity() sized its scratch buffer to the
+# chunk-slot count..." — the exact bug this sizing must not repeat).
+var _density_touch_buf: RID
+var _density_touch_capacity: int = 0
+
 var _orchestrator: WorldOrchestrator
 var _chunk_manager: ChunkManager
 var _active_chunks: Dictionary = {}
@@ -127,6 +136,24 @@ var _frame: int = 0
 # GPU readback that forces a sync every sub-step; see the in-step() comment for why this
 # was left on by default during the leak investigation and needs to be off otherwise.
 @export var debug_conservation_check: bool = false
+
+# Density-trigger debug tint (2026-07-12) — step 1 of the oil-water waterfall port
+# (docs/BUG_LOG.md "SOLVED IN BENCH (2026-07-11)"). Before porting the real
+# DensityLowestSurfaceFluidSim mechanism, get a definitive in-editor answer to the
+# still-open 2026-07-10 mystery (three bench-validated GLSL changes each reported as
+# "looks exactly the same" in-editor) — an unmissable visual marker on the exact voxels
+# a new pass touches, so a future mechanism's silence can't be mistaken for "not
+# dispatching" again. This pass does ONE thing and nothing else: every dispatched voxel
+# unconditionally overwrites its OWN flat slot in _density_touch_buf with 1 if it's
+# currently an OIL voxel directly under WATER, else 0 (self-write only — no neighbour
+# writes, no CAS, no race to reason about; and self-clearing — a slot that stops
+# qualifying, including because a DIFFERENT material now occupies that flat index, goes
+# back to 0 the next time it's dispatched, rather than showing stale tint on whatever
+# moved in). No voxel data is mutated, no changelog entry is written, no mass moves.
+# Purely additive and fully inert when false (pass 5 is skipped entirely; the buffer
+# stays allocated at minimum size so the renderer's uniform set never has to add/remove
+# a binding).
+@export var debug_density_trigger_tint: bool = false
 
 # Full per-voxel diagnostic dump (fill, own 3 owned lanes, 3 incoming neighbour-owned
 # lanes) — factored out (2026-07-03) so both the fixed watch target AND the
@@ -278,7 +305,7 @@ func _ready() -> void:
 		_flux_pipeline = _compute.compile_shader(_load_flux_shader(), 4)
 		if _flux_pipeline.is_empty():
 			push_error("FluidSimulation: fluid_flux.comp compile failed")
-		var fp := PackedByteArray(); fp.resize(60); fp.fill(0)  # damp, g_dt, gravity_bias, settle_threshold, phi_read_buf, flow
+		var fp := PackedByteArray(); fp.resize(64); fp.fill(0)  # damp, g_dt, gravity_bias, settle_threshold, phi_read_buf, flow
 		_flux_params_buf = _compute.buffer_upload(fp)
 		_flux_chunk_list_capacity = 256
 		var fl := PackedByteArray(); fl.resize(_flux_chunk_list_capacity * 12); fl.fill(0)
@@ -290,6 +317,10 @@ func _ready() -> void:
 		var gb := PackedByteArray(); gb.resize(8)
 		gb.encode_s32(0, -1); gb.encode_s32(4, 0)  # flat_idx=-1 (no candidate yet), amount=0
 		_gain_tracker_buf = _compute.buffer_upload(gb)
+		var dt := PackedByteArray(); dt.resize(4); dt.fill(0)
+		_density_touch_capacity = 1
+		_density_touch_buf = _compute.buffer_upload(dt)
+
 	var runtime := get_parent()
 	if runtime.has_method("register_simulation"):
 		runtime.register_simulation(self)
@@ -300,7 +331,7 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	if Performance.has_custom_monitor("Voxel/fluid_active_chunks"):
 		Performance.remove_custom_monitor("Voxel/fluid_active_chunks")
-	for rid in [_flux_params_buf, _flux_chunk_list_buf, _dirty_chunks_buf, _flux_buf, _flux_page_table_buf, _conservation_buf, _gain_tracker_buf, _phi_buf_a, _phi_buf_b]:
+	for rid in [_flux_params_buf, _flux_chunk_list_buf, _dirty_chunks_buf, _flux_buf, _flux_page_table_buf, _conservation_buf, _gain_tracker_buf, _phi_buf_a, _phi_buf_b, _density_touch_buf]:
 		if rid.is_valid():
 			_compute.free_rid(rid)
 
@@ -374,6 +405,7 @@ func step() -> void:
 	# Safety net: add_candidates() normally allocates pages, but if it ran before the
 	# grid was valid (e.g. very first tick), retry here before the dispatch needs them.
 	_ensure_flux_page_table()
+	_ensure_density_touch_capacity()
 	for cp in _active_chunks:
 		if _flux_page_table_buf.is_valid() and not _flux_chunk_table.has(cp):
 			_allocate_flux_page(cp)
@@ -544,6 +576,19 @@ func step() -> void:
 			flux_bitmask = _compute.download_range(_dirty_chunks_buf, 0, DIRTY_BUF_BYTES)
 			_orchestrator.apply_changelog()
 
+			# Density-trigger debug tint (pass 5, 2026-07-12) — see
+			# debug_density_trigger_tint's declaration. Same flux_list/flux_count
+			# dispatch range as Accelerate/Transport (still current — the loop hasn't
+			# re-uploaded a different chunk list since). Read-only against voxels_a
+			# (already synced by Transport's apply_changelog above); writes only its
+			# own scratch buffer, never voxels_a/changelog, so it cannot affect
+			# simulation results regardless of whether the toggle is on.
+			if debug_density_trigger_tint:
+				_upload_flux_params(grid_min, grid_span, _frame, 5)  # DensityTouchDebug
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
+
 			_debug_print_watch()
 
 			# Automatic conservation check (2026-07-02) — GPU-side, no manual F6 diffing
@@ -657,6 +702,27 @@ func step() -> void:
 
 
 # --- Internal ---
+
+func get_density_touch_buf() -> RID:
+	return _density_touch_buf
+
+
+# Grows _density_touch_buf to cover every currently-allocated voxel slot (see the field's
+# declaration for the sizing rule and the exact bug this must not repeat). Called
+# unconditionally every step() — like phi_buf_a/phi_buf_b, this stays allocated and bound
+# regardless of debug_density_trigger_tint so the render uniform set's binding list never
+# changes shape when the toggle flips; only the pass-5 dispatch itself is gated.
+func _ensure_density_touch_capacity() -> void:
+	var cs := _chunk_manager.chunk_size
+	var needed := _orchestrator.get_voxel_buf_capacity() * cs * cs * cs
+	if needed <= _density_touch_capacity and _density_touch_buf.is_valid():
+		return
+	if _density_touch_buf.is_valid():
+		_compute.free_rid(_density_touch_buf)
+	_density_touch_capacity = max(needed, 1)
+	var buf := PackedByteArray(); buf.resize(_density_touch_capacity * 4); buf.fill(0)
+	_density_touch_buf = _compute.buffer_upload(buf)
+
 
 # Allocates the GPU-side page-table mirror, sized to grid_span (chunk_pos → page index,
 # -1 = no page). grid_span is fixed once WorldOrchestrator._init_grid() runs and never
@@ -803,14 +869,20 @@ func _build_flux_uniforms() -> Array:
 		u.call(10, _gain_tracker_buf),
 		u.call(11, _phi_buf_a),  # phi-flood (2026-07-08) — always bound, even for passes
 		u.call(12, _phi_buf_b),  # (e.g. Transport) that never touch it; same convention
-		                          # already used for conservation/gain_tracker above.
+								  # already used for conservation/gain_tracker above.
 		u.call(13, _orchestrator.get_material_flow_buf()),  # per-material viscosity (2026-07-10)
+		u.call(14, _density_touch_buf),  # density-trigger debug tint (2026-07-12, see
+										  # debug_density_trigger_tint) — always bound,
+										  # only pass 5 ever writes it.
+		u.call(21, _orchestrator.get_material_density_buf()),  # per-material density
+												  # (2026-07-12) — generalizes the
+												  # trigger away from hardcoded WATER/OIL.
 	]
 
 
 func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pass_idx: int, phi_read_buf: int = 0) -> void:
 	var cs := _chunk_manager.chunk_size
-	var p := PackedByteArray(); p.resize(60)
+	var p := PackedByteArray(); p.resize(64)
 	p.encode_s32(0,  cs)
 	p.encode_s32(4,  grid_min.x)
 	p.encode_s32(8,  grid_min.y)

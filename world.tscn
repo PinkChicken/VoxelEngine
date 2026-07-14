@@ -64,6 +64,7 @@ detail_amplitude = 0.0
 [node name="ChunkManager" type="Node" parent="." unique_id=1418435786 node_paths=PackedStringArray("terrain")]
 script = ExtResource("5_036b0")
 terrain = NodePath("../Terrain")
+water_depth = 0
 metadata/_custom_type_script = "uid://bj1af4npflt6d"
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=387717411]
@@ -101,7 +102,6 @@ watch_chunk = Vector3i(0, -1, 0)
 watch_local = Vector3i(0, 0, 0)
 steps_per_tick = 3
 gravity_bias = 1.6
-settle_threshold = 1
 
 [node name="MaterialDB" type="Node" parent="." unique_id=1815152731]
 script = ExtResource("8_udhof")
