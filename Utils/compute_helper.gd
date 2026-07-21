@@ -71,6 +71,16 @@ func run(pipeline_data: Dictionary, uniforms: Array,
 		push_error("Invalid pipeline data")
 		return
 	var set = rd.uniform_set_create(uniforms, pipeline_data.shader, 0)
+	# uniform_set_create can transiently return an invalid RID — e.g. when a bound buffer
+	# was just freed+realloc'd on a capacity grow and its old RID got reused, leaving a
+	# stale entry in RenderingDevice's internal uniform-set cache. Binding/dispatching/
+	# freeing a null set otherwise throws three cascading errors per occurrence
+	# ("uniform_set is null" → "uniforms never supplied" → "free invalid ID: 0").n Skip
+	# this one dispatch instead; the caller re-supplies fresh uniforms next call. A single
+	# skipped dispatch is invisible in practice (e.g. one phi-flood iteration of many).
+	if not set.is_valid():
+		push_warning("compute_helper.run(): uniform_set_create returned an invalid set; skipping dispatch")
+		return
 	var list = rd.compute_list_begin()
 	rd.compute_list_bind_compute_pipeline(list, pipeline_data.pipeline)
 	rd.compute_list_bind_uniform_set(list, set, 0)

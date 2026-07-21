@@ -32,7 +32,7 @@ class_name FluidSimulation extends VoxelSimulation
 
 var _compute
 var _flux_pipeline: Dictionary = {}   # fluid_flux.comp — Accelerate / Scale / Transport
-var _flux_params_buf: RID             # 64-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, settle_threshold, phi_read_buf, flow)
+var _flux_params_buf: RID             # 64-byte params for fluid_flux.comp (incl. pass, damp, g_dt, gravity_bias, settle_threshold, phi_read_buf, flow, tint_mode)
 var _flux_chunk_list_buf: RID         # active + 6 face neighbours — flux dispatch range
 var _flux_chunk_list_capacity: int = 0
 var _dirty_chunks_buf: RID
@@ -113,6 +113,41 @@ var _gain_tracker_buf: RID
 # chunk-slot count..." — the exact bug this sizing must not repeat).
 var _density_touch_buf: RID
 var _density_touch_capacity: int = 0
+# Shared CAS claim scratch (2026-07-14) — one uint per FULL FLAT VOXEL INDEX, same sizing
+# rule as _density_touch_buf above. Pass 6 zeroes it; used by any claim-based resolution
+# pass (currently BuoyancyExchange, pass 8) so parallel exchanges/moves can't collide.
+var _momentum_claim_buf: RID
+var _momentum_claim_capacity: int = 0
+# Per-voxel fill history (2026-07-16, see stuck_rest_ticks) — one uint per FULL FLAT VOXEL
+# INDEX, same sizing rule as _density_touch_buf above. Low 16 bits = last-seen
+# (material|fill) u16, high 16 = consecutive unchanged tick count (saturating). Written
+# only by fluid_flux.comp pass 10 (FillHistoryUpdate), read by buoy_at_rest(). Persistent —
+# never zeroed between ticks (the whole point is remembering across ticks); a reused chunk
+# slot's stale entry self-corrects on the next pass-10 dispatch (content mismatch resets).
+var _fill_history_buf: RID
+var _fill_history_capacity: int = 0
+
+# --- Momentum punch demand queue (Phase 5 port step 2b/3, 2026-07-15, see use_punch) ---
+# Written by fluid_flux.comp pass 9 (MomentumPunch); drained by momentum_resolve.comp's
+# own separate pipeline. Same interleaved shape as the old (deleted) density-stacking
+# demand queue: {count, entries[]}, 4 ints/entry (origin_x,y,z, material|amount<<8).
+var _punch_demand_queue_buf: RID
+var _punch_demand_accum_buf: RID       # per FULL FLAT VOXEL INDEX — atomicAdd accumulator
+var _punch_demand_accum_capacity: int = 0
+var _punch_touched_cells_buf: RID      # {count, entries[]} — 4 ints/entry (x,y,z,material)
+var _punch_demand_requeue_buf: RID     # {count, entries[]} — carried into next substep's queue
+const MAX_PUNCH_DEMAND_ENTRIES := 262144  # must match momentum_resolve.comp / fluid_flux.comp's own literal
+var _momentum_resolve_pipeline: Dictionary = {}
+var _momentum_resolve_params_buf: RID  # 40 bytes: chunk_size, grid_min xyz, grid_span xyz, pass, settle_threshold, rescue
+# Standing punch-demand backlog (2026-07-17) — the queue count left over after each
+# resolve cycle's requeue carry-forward (one 4-byte readback per cycle). Nonzero while the
+# active set is empty = the frozen-forever state the F6 punch-queue dump exposed (269,404
+# fill stranded in one orphaned entry after a submerged-sphere plunge): nothing dirty for
+# 4+ ticks emptied the active set, so the resolver never ran again and the queued mass
+# stayed missing from the world indefinitely. has_work() reports true while this is
+# nonzero so SimulationRuntime keeps calling step(), and step()'s idle path then runs
+# _rescue_punch_backlog() — see both below.
+var _punch_backlog: int = 0
 
 var _orchestrator: WorldOrchestrator
 var _chunk_manager: ChunkManager
@@ -137,23 +172,98 @@ var _frame: int = 0
 # was left on by default during the leak investigation and needs to be off otherwise.
 @export var debug_conservation_check: bool = false
 
-# Density-trigger debug tint (2026-07-12) — step 1 of the oil-water waterfall port
-# (docs/BUG_LOG.md "SOLVED IN BENCH (2026-07-11)"). Before porting the real
-# DensityLowestSurfaceFluidSim mechanism, get a definitive in-editor answer to the
-# still-open 2026-07-10 mystery (three bench-validated GLSL changes each reported as
-# "looks exactly the same" in-editor) — an unmissable visual marker on the exact voxels
-# a new pass touches, so a future mechanism's silence can't be mistaken for "not
-# dispatching" again. This pass does ONE thing and nothing else: every dispatched voxel
-# unconditionally overwrites its OWN flat slot in _density_touch_buf with 1 if it's
-# currently an OIL voxel directly under WATER, else 0 (self-write only — no neighbour
-# writes, no CAS, no race to reason about; and self-clearing — a slot that stops
-# qualifying, including because a DIFFERENT material now occupies that flat index, goes
-# back to 0 the next time it's dispatched, rather than showing stale tint on whatever
-# moved in). No voxel data is mutated, no changelog entry is written, no mass moves.
-# Purely additive and fully inert when false (pass 5 is skipped entirely; the buffer
-# stays allocated at minimum size so the renderer's uniform set never has to add/remove
-# a binding).
+# Buoyancy trigger tint (Phase 1 of the momentum/buoyancy port, 2026-07-14) — an
+# unmissable in-editor marker on exactly the voxels buoyancy.py's trigger would fire on,
+# written BEFORE the mutating exchange resolution (Phase 2), per the debug-tint-before-
+# mutation discipline the 2026-07-10 "bench-valid but no visible in-editor effect"
+# mystery taught (three bench-validated GLSL changes each reported as "looks exactly the
+# same" — a new pass's silence must never again be mistaken for "not dispatching"). This
+# pass (fluid_flux.comp pass 5) does ONE thing: every dispatched voxel overwrites its OWN
+# flat slot in _density_touch_buf with 1 if it's a LIGHTER liquid, at rest, with a DENSER
+# different liquid it could rise into (straight-up always, diagonal-up if isolated —
+# buoyancy.py's trigger exactly), else 0 (self-write only — no neighbour writes, no CAS,
+# no race; and self-clearing — a slot that stops qualifying, including because a DIFFERENT
+# material now occupies that flat index, goes back to 0 next dispatch, never showing stale
+# tint on whatever moved in). No voxel data is mutated, no changelog entry is written, no
+# mass moves. Purely additive and fully inert when false (pass 5 is skipped entirely; the
+# buffer stays allocated at minimum size so the renderer's uniform set never changes shape).
 @export var debug_density_trigger_tint: bool = false
+
+# Which trigger the tint (pass 5) visualizes: 0 = buoyancy (lighter liquid at rest that
+# could rise), 2 = punch (liquid arriving with real downward flux over bulk lighter
+# liquid). Mode 1 (the retired push-aside momentum trigger) is no longer set by any
+# toggle. Set by world.gd's KEY_T (buoyancy) / KEY_H (punch) toggles. Only meaningful
+# while debug_density_trigger_tint is true.
+@export var tint_mode: int = 0
+
+# REMOVED (2026-07-15): the single-hop push-aside MomentumPush (use_momentum_push,
+# passes 6/7, KEY_M/KEY_G) — superseded by the momentum-graded punch + min-Y demand
+# resolver validated in tools/fluid_prototypes/python/momentum_demand.py. See
+# ARCHITECTURE.md's momentum/buoyancy to-do item for the full history.
+
+# Buoyancy (Phase 4 of the momentum/buoyancy port, 2026-07-14) — the liquid-interaction
+# "aha": a LIGHTER liquid at rest with a DENSER different liquid above it trades places
+# (lighter rises, denser sinks), so water sinks into oil, oil rises, a mixed pool sorts.
+# Direct 2-cell exchange (pass 8) — exact conservation, no air needed. Rest-gated, so it
+# acts on calm liquid and defers anything still falling. Port of buoyancy.py's validated
+# exchange resolution. Runs after Transport in its own changelog cycle. Toggle in-editor
+# with KEY_N (see world.gd). Defaulted to true 2026-07-16 — this is the shipped mechanism,
+# not an experimental toggle; defaulting it off meant every fresh test session silently
+# needed KEY_N pressed first or was testing base-flux-only behaviour without realizing it
+# (cost real diagnostic time chasing symptoms that were actually just "buoyancy is off").
+@export var use_buoyancy: bool = true
+
+# Buoyancy rest tolerance (raw flux units) — max |flux| on a cell's own+behind lanes for
+# it to still count as "at rest" for the buoyancy exchange AND the pass-5 buoyancy tint.
+# The bench (momentum_demand.py, "SETTLE SPEED" knob) mapped this: 0 waits for dead-still
+# (slow, ~920-tick settle); ~40-50 sorts nearly-still cells (~4.6x faster) while STILL
+# holding climb=0; CEILING ~100 — above it buoyancy fires on MOVING stream cells, oil rises
+# into the stream, and the chimney returns. Default 40 = the validated fast-and-clean sweet
+# spot; do not exceed ~80.
+@export_range(0, 64, 1) var buoy_rest_flux: int = 40
+
+# Fill-history rest override (2026-07-16 port of momentum_demand.py's stuck_rest_ticks —
+# the "water film permanently stuck on oil" fix, LIQUID_INTERACTION_HANDOFF.md §3.2). A
+# liquid cell whose (material|fill) bytes have been byte-identical for this many
+# consecutive ticks counts as at rest for the buoyancy exchange no matter what the flux
+# field claims: phi-flood re-saturates a partial-fill surface cell's own upward lane every
+# tick whether the cell is moving or not, so flux magnitude can't distinguish "still
+# splashing" from "structurally stuck" — actual content change can. Bench-validated at 12:
+# waterfall suite holds climb_events=0 AND the test_stuck_film.py FILM repro (the first
+# bench reproduction of the in-editor stick) sorts in ~N+1 ticks. -1 disables (pre-fix
+# behaviour). Backed by _fill_history_buf + fluid_flux.comp pass 10 (FillHistoryUpdate).
+@export var stuck_rest_ticks: int = 12
+
+# Momentum punch knobs (Phase 5 port of momentum_demand.py, 2026-07-15) — the CRATER
+# STRENGTH group. A liquid cell whose downward flux reaches punch_threshold craters
+# straight down through `reach = 1 + (F - punch_threshold)/punch_scale` (capped at
+# max_reach) bulk-lighter cells. LOWER threshold/scale = stronger crater; both hold climb=0
+# (displaced oil only ever routes down/laterally). Validated defaults 120/90/3 (see the
+# bench KNOBS table). Only read by the punch tint (pass 5 mode 2) and the punch pass.
+@export var punch_threshold: int = 120
+@export var punch_scale: int = 90
+@export_range(1, 12, 1) var max_reach: int = 3
+
+# Punch demand-resolve walk cap (2026-07-17) — how many cells the min-Y BFS searches for a
+# dischargeable surface per demand, live-tunable from the Inspector. Was a hard-coded 64 in
+# momentum_resolve.comp; the in-editor submerged-sphere test stranded a demand whose deep,
+# buried origin couldn't reach a distant rising surface within 64 (see docs/BUG_LOG.md's
+# buried-origin entry). Clamped in-shader to WALK_CAP_MAX=512 (the visited[] array is a
+# fixed compile-time size; only the loop bound is dynamic). Raise this to test whether reach
+# alone lets deep displaced oil route out; the bench uses 512.
+@export_range(8, 128, 1) var punch_walk_cap: int = 64
+
+# Momentum punch (Phase 5 port step 2b/3, 2026-07-15) — the actual mutation: a fast-falling
+# liquid craters straight down through bulk lighter liquid (pass 9), queuing each displaced
+# cell as a demand drained by momentum_resolve.comp's min-Y walk (pass 0 walk + pass 1
+# apply). Port of tools/fluid_prototypes/python/momentum_demand.py's validated
+# MomentumDemandFluidSim — denser-into-lighter, different-material, bulk-only (see
+# punch_candidate()'s own comment for why material-agnostic was rejected), no bubble
+# landing, fallback rise only into same-material headroom (never bare air) — the exact
+# combination the bench proved gives climb=0 AND full sorting AND sealed-basin
+# conservation. Toggle in-editor with KEY_J. Defaulted to true 2026-07-16, same reasoning
+# as use_buoyancy above — this is the shipped mechanism, not an experimental toggle.
+@export var use_punch: bool = true
 
 # Full per-voxel diagnostic dump (fill, own 3 owned lanes, 3 incoming neighbour-owned
 # lanes) — factored out (2026-07-03) so both the fixed watch target AND the
@@ -305,7 +415,7 @@ func _ready() -> void:
 		_flux_pipeline = _compute.compile_shader(_load_flux_shader(), 4)
 		if _flux_pipeline.is_empty():
 			push_error("FluidSimulation: fluid_flux.comp compile failed")
-		var fp := PackedByteArray(); fp.resize(64); fp.fill(0)  # damp, g_dt, gravity_bias, settle_threshold, phi_read_buf, flow
+		var fp := PackedByteArray(); fp.resize(84); fp.fill(0)  # ...flow, tint_mode, buoy_rest_flux, punch knobs, stuck_rest_ticks
 		_flux_params_buf = _compute.buffer_upload(fp)
 		_flux_chunk_list_capacity = 256
 		var fl := PackedByteArray(); fl.resize(_flux_chunk_list_capacity * 12); fl.fill(0)
@@ -320,6 +430,27 @@ func _ready() -> void:
 		var dt := PackedByteArray(); dt.resize(4); dt.fill(0)
 		_density_touch_capacity = 1
 		_density_touch_buf = _compute.buffer_upload(dt)
+		var mc := PackedByteArray(); mc.resize(4); mc.fill(0)
+		_momentum_claim_capacity = 1
+		_momentum_claim_buf = _compute.buffer_upload(mc)
+		var fh := PackedByteArray(); fh.resize(4); fh.fill(0)
+		_fill_history_capacity = 1
+		_fill_history_buf = _compute.buffer_upload(fh)
+
+		# --- Momentum punch demand-queue buffers (2026-07-15, see use_punch) ---
+		var pdq := PackedByteArray(); pdq.resize(4 + MAX_PUNCH_DEMAND_ENTRIES * 16); pdq.fill(0)
+		_punch_demand_queue_buf = _compute.buffer_upload(pdq)
+		var ptc := PackedByteArray(); ptc.resize(4 + MAX_PUNCH_DEMAND_ENTRIES * 16); ptc.fill(0)
+		_punch_touched_cells_buf = _compute.buffer_upload(ptc)
+		var pdr := PackedByteArray(); pdr.resize(4 + MAX_PUNCH_DEMAND_ENTRIES * 16); pdr.fill(0)
+		_punch_demand_requeue_buf = _compute.buffer_upload(pdr)
+		_momentum_resolve_pipeline = _compute.compile_shader(_load_momentum_resolve_shader(), 4)
+		if _momentum_resolve_pipeline.is_empty():
+			push_error("FluidSimulation: momentum_resolve.comp compile failed")
+		var mrp := PackedByteArray(); mrp.resize(44); mrp.fill(0)
+		_momentum_resolve_params_buf = _compute.buffer_upload(mrp)
+		# _punch_demand_accum_buf sized lazily in step() once the voxel buffer's real
+		# capacity is known (mirrors _density_touch_buf's own growth pattern above).
 
 	var runtime := get_parent()
 	if runtime.has_method("register_simulation"):
@@ -331,7 +462,8 @@ func _ready() -> void:
 func _exit_tree() -> void:
 	if Performance.has_custom_monitor("Voxel/fluid_active_chunks"):
 		Performance.remove_custom_monitor("Voxel/fluid_active_chunks")
-	for rid in [_flux_params_buf, _flux_chunk_list_buf, _dirty_chunks_buf, _flux_buf, _flux_page_table_buf, _conservation_buf, _gain_tracker_buf, _phi_buf_a, _phi_buf_b, _density_touch_buf]:
+	for rid in [_flux_params_buf, _flux_chunk_list_buf, _dirty_chunks_buf, _flux_buf, _flux_page_table_buf, _conservation_buf, _gain_tracker_buf, _phi_buf_a, _phi_buf_b, _density_touch_buf, _momentum_claim_buf, _fill_history_buf,
+			_punch_demand_queue_buf, _punch_demand_accum_buf, _punch_touched_cells_buf, _punch_demand_requeue_buf, _momentum_resolve_params_buf]:
 		if rid.is_valid():
 			_compute.free_rid(rid)
 
@@ -349,7 +481,100 @@ func add_candidates(chunk_positions: Array[Vector3i]) -> void:
 
 
 func has_work() -> bool:
-	return not _active_chunks.is_empty()
+	# Backlog counts as work (2026-07-17): without it, SimulationRuntime drops this sim
+	# from its active list the moment the chunk set empties, and a stranded demand backlog
+	# (mass in flight, invisible to world-fill stats) freezes forever. See _punch_backlog.
+	return not _active_chunks.is_empty() or (use_punch and _punch_backlog > 0)
+
+
+# Zero the punch demand queue + backlog (2026-07-17). Call when a test scene is rebuilt:
+# the queue is a persistent GPU buffer that survives scene edits, so successive KEY_L
+# rebuilds otherwise ACCUMULATE stranded demands from prior builds — and because each build
+# can use a different world origin, an old entry's coordinates point into empty space in the
+# new scene (observed: an entry at z=-23, outside a pool at z in [-8,8], reading as air).
+# That pollution makes the queue dump un-diagnosable; clearing on rebuild keeps each test clean.
+func clear_punch_queue() -> void:
+	if not _punch_demand_queue_buf.is_valid():
+		return
+	var zero4 := PackedByteArray(); zero4.resize(4); zero4.fill(0)
+	_compute.buffer_update(_punch_demand_queue_buf, 0, zero4)
+	_punch_backlog = 0
+
+
+# --- Exact snapshot of ALL persistent fluid state (2026-07-17) ------------------------
+# WorldOrchestrator's voxel snapshot (KEY_DOWN/KEY_UP) only captures voxels_a — but the
+# flux model keeps PERSISTENT per-tick state the old comment predates: the flux field
+# itself (never zeroed between ticks — that's the whole model), the punch demand queue
+# (in-flight displaced mass), the fill-history counters, and the CPU-side paging/active/
+# frame bookkeeping. Restoring voxels alone leaves all of that stale, so a mid-sim
+# save→restore→replay diverges. These two methods capture and re-upload that state
+# EXACTLY, so a restore reproduces the identical trajectory. world.gd calls them right
+# after the orchestrator's own save/load (restore MUST run after the orchestrator's load,
+# which emits chunks_committed and perturbs _active_chunks/paging — we overwrite it here).
+# NOTE: untested in-editor at time of writing (no local Godot); verify a mid-plunge
+# save→run→restore→run reproduces bit-identical F6/PunchQueue output.
+var _debug_fluid_snapshot: Dictionary = {}
+
+func debug_save_snapshot() -> void:
+	if not _flux_buf.is_valid():
+		return
+	var cs := _chunk_manager.chunk_size
+	var vpc := cs * cs * cs
+	var span := _orchestrator.get_grid_span()
+	var span_total: int = span.x * span.y * span.z
+	_debug_fluid_snapshot = {
+		"flux_buf": _compute.download_range(_flux_buf, 0, _flux_page_capacity * vpc * 3 * 4),
+		"flux_page_capacity": _flux_page_capacity,
+		"page_table": (_compute.download_range(_flux_page_table_buf, 0, span_total * 4)
+			if (_flux_page_table_buf.is_valid() and span_total > 0) else PackedByteArray()),
+		"queue": _compute.download_range(_punch_demand_queue_buf, 0, 4 + MAX_PUNCH_DEMAND_ENTRIES * 16),
+		"fill_history": _compute.download_range(_fill_history_buf, 0, _fill_history_capacity * 4),
+		"chunk_table": _flux_chunk_table.duplicate(true),
+		"page_idle": _flux_page_idle.duplicate(true),
+		"active_chunks": _active_chunks.duplicate(true),
+		"punch_backlog": _punch_backlog,
+		"frame": _frame,
+	}
+	print("[FluidSnapshot] saved: flux %d B, queue backlog=%d, active=%d, pages_used=%d" %
+		[_debug_fluid_snapshot["flux_buf"].size(), _punch_backlog, _active_chunks.size(), _flux_chunk_table.size()])
+
+
+func debug_restore_snapshot() -> void:
+	if _debug_fluid_snapshot.is_empty():
+		return
+	var s := _debug_fluid_snapshot
+	# Ensure the live buffers are at least as large as the saved payloads before uploading.
+	_ensure_flux_buf_capacity(int(s["flux_page_capacity"]))
+	_ensure_fill_history_capacity()
+	_ensure_flux_page_table()
+	var flux_bytes: PackedByteArray = s["flux_buf"]
+	if _flux_buf.is_valid():
+		_compute.buffer_update(_flux_buf, 0, flux_bytes)
+	var pt: PackedByteArray = s["page_table"]
+	if _flux_page_table_buf.is_valid() and not pt.is_empty():
+		_compute.buffer_update(_flux_page_table_buf, 0, pt)
+	_compute.buffer_update(_punch_demand_queue_buf, 0, s["queue"])
+	var fh: PackedByteArray = s["fill_history"]
+	if _fill_history_buf.is_valid() and fh.size() <= _fill_history_capacity * 4:
+		_compute.buffer_update(_fill_history_buf, 0, fh)
+	# Restore CPU bookkeeping. Rebuild the freelist from scratch (every page index not used
+	# by the restored chunk_table) rather than restoring a saved copy — this stays correct
+	# no matter what pages the orchestrator's chunks_committed discovery allocated between
+	# the voxel restore and this call, so save/restore cycles can't leak or double-hand pages.
+	_flux_chunk_table = s["chunk_table"].duplicate(true)
+	_flux_page_idle = s["page_idle"].duplicate(true)
+	_active_chunks = s["active_chunks"].duplicate(true)
+	_punch_backlog = int(s["punch_backlog"])
+	_frame = int(s["frame"])
+	var used := {}
+	for p in _flux_chunk_table.values():
+		used[p] = true
+	_flux_freelist = []
+	for i in range(_flux_page_capacity - 1, -1, -1):
+		if not used.has(i):
+			_flux_freelist.append(i)
+	print("[FluidSnapshot] restored: backlog=%d, active=%d, pages_used=%d" %
+		[_punch_backlog, _active_chunks.size(), _flux_chunk_table.size()])
 
 
 func get_active_chunk_positions() -> Array[Vector3i]:
@@ -397,7 +622,16 @@ func debug_dump_flux_stats() -> void:
 
 
 func step() -> void:
-	if _active_chunks.is_empty() or _flux_pipeline.is_empty():
+	if _flux_pipeline.is_empty():
+		return
+	if _active_chunks.is_empty():
+		# Idle-rescue (2026-07-17, bench-validated in momentum_demand.py's step()): the sim
+		# is asleep but demand mass is still queued. Run one rescue resolve cycle (walk with
+		# the orphaned-origin down-probe enabled — see momentum_resolve.comp); any deposit
+		# marks its chunk dirty, which re-activates it below, so a large backlog keeps the
+		# sim awake and drains a bit every tick until the queue empties.
+		if use_punch and _punch_backlog > 0 and _orchestrator.is_grid_valid():
+			_rescue_punch_backlog()
 		return
 	if not _orchestrator.is_grid_valid():
 		return
@@ -406,6 +640,9 @@ func step() -> void:
 	# grid was valid (e.g. very first tick), retry here before the dispatch needs them.
 	_ensure_flux_page_table()
 	_ensure_density_touch_capacity()
+	_ensure_momentum_claim_capacity()
+	_ensure_fill_history_capacity()
+	_ensure_punch_demand_accum_capacity()
 	for cp in _active_chunks:
 		if _flux_page_table_buf.is_valid() and not _flux_chunk_table.has(cp):
 			_allocate_flux_page(cp)
@@ -500,6 +737,12 @@ func step() -> void:
 	var reset_gain     := PackedByteArray(); reset_gain.resize(8)
 	reset_gain.encode_s32(0, -1); reset_gain.encode_s32(4, 0)
 
+	# Pre-grow the chunk-list buffer to the largest list dispatched this step (phi_list ⊇
+	# flux_list, so phi_count is the max) BEFORE building the uniform set — otherwise a
+	# mid-step realloc invalidates binding 5 and silently skips a dispatch. See
+	# _ensure_flux_chunk_list_capacity's comment for the full failure mode.
+	_ensure_flux_chunk_list_capacity(max(flux_count, phi_count))
+
 	var flux_uniforms := _build_flux_uniforms()
 
 	for _s in range(steps_per_tick):
@@ -526,6 +769,27 @@ func step() -> void:
 			# downloaded after Transport below, not get wiped by a reset that used to run
 			# only immediately before Transport's own dispatch.
 			_compute.buffer_update(_dirty_chunks_buf, 0, zero_dirty)
+
+			# Momentum punch (pass 6 claim-zero + pass 9 crater, 2026-07-15, see use_punch).
+			# Runs FIRST in the substep, before phi-flood/Accelerate/Transport — mirrors the
+			# bench's MomentumDemandFluidSim.step() ordering (punch+resolve, THEN the base
+			# substep, THEN buoyancy on whatever's settled). Own reset/apply changelog cycle
+			# (Transport hasn't run yet this substep, so nothing else holds the changelog).
+			if use_punch:
+				_upload_flux_chunk_list(flux_list)
+				_upload_flux_params(grid_min, grid_span, _frame, 6)  # (re)zero shared claim
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
+
+				_orchestrator.reset_changelog()
+				_upload_flux_params(grid_min, grid_span, _frame, 9)  # MomentumPunch
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
+				_orchestrator.apply_changelog()
+
+				_resolve_punch_demands(grid_min, grid_span)
 
 			# --- Phi-flood: re-derived from voxels_a every substep, no persisted field.
 			# See docs/PHI_FLOOD_PORT_PLAN.md's "ship the safe version first" note: one
@@ -575,6 +839,40 @@ func step() -> void:
 
 			flux_bitmask = _compute.download_range(_dirty_chunks_buf, 0, DIRTY_BUF_BYTES)
 			_orchestrator.apply_changelog()
+
+			# Fill-history update (pass 10, 2026-07-16, see stuck_rest_ticks) — runs after
+			# Transport's changelog is applied and before the buoyancy exchange consults the
+			# counters, mirroring momentum_demand.py's step() ordering (base substep, THEN
+			# _update_fill_history, THEN buoyancy). Writes only _fill_history_buf (each
+			# invocation its own cell — no changelog, no dirty bits, no sync hazards). Skipped
+			# entirely when buoyancy is off or the override is disabled: counters go stale,
+			# but the content-diff self-resets any stale entry on the first dispatch after
+			# re-enabling, so toggling at runtime is safe.
+			if use_buoyancy and stuck_rest_ticks >= 0:
+				_upload_flux_params(grid_min, grid_span, _frame, 10)  # FillHistoryUpdate
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
+
+			# Buoyancy exchange (pass 6 claim-zero + pass 8 exchange, 2026-07-14, see
+			# use_buoyancy). Runs AFTER Transport each substep. Zeroes the shared claim
+			# buffer (pass 6) fresh before its own dispatch; own reset/apply changelog
+			# cycle; re-download the dirty bitmask so exchanged chunks commit.
+			if use_buoyancy:
+				_upload_flux_params(grid_min, grid_span, _frame, 6)  # (re)zero shared claim
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
+
+				_orchestrator.reset_changelog()
+				_upload_flux_params(grid_min, grid_span, _frame, 8)  # BuoyancyExchange
+				_compute.run(_flux_pipeline, flux_uniforms, flux_count * 4, 4, 4)
+				_compute.submit()
+				_compute.sync()
+				_orchestrator.apply_changelog()
+
+				flux_bitmask = _compute.download_range(_dirty_chunks_buf, 0, DIRTY_BUF_BYTES)
+
 
 			# Density-trigger debug tint (pass 5, 2026-07-12) — see
 			# debug_density_trigger_tint's declaration. Same flux_list/flux_count
@@ -722,6 +1020,238 @@ func _ensure_density_touch_capacity() -> void:
 	_density_touch_capacity = max(needed, 1)
 	var buf := PackedByteArray(); buf.resize(_density_touch_capacity * 4); buf.fill(0)
 	_density_touch_buf = _compute.buffer_upload(buf)
+
+
+# Same sizing rule/growth pattern as _ensure_density_touch_capacity() above, for the
+# shared CAS claim scratch. Called unconditionally every step() (like density_touch) so
+# claim-based passes (buoyancy, and the punch once ported) can be toggled at runtime
+# without a binding shape change.
+func _ensure_momentum_claim_capacity() -> void:
+	var cs := _chunk_manager.chunk_size
+	var needed := _orchestrator.get_voxel_buf_capacity() * cs * cs * cs
+	if needed <= _momentum_claim_capacity and _momentum_claim_buf.is_valid():
+		return
+	if _momentum_claim_buf.is_valid():
+		_compute.free_rid(_momentum_claim_buf)
+	_momentum_claim_capacity = max(needed, 1)
+	var buf := PackedByteArray(); buf.resize(_momentum_claim_capacity * 4); buf.fill(0)
+	_momentum_claim_buf = _compute.buffer_upload(buf)
+
+
+# Same sizing rule/growth pattern, for the per-voxel fill history (see stuck_rest_ticks).
+# Growth REALLOCATES and zeroes — existing counters are lost on growth, which is benign:
+# a zeroed entry's prev-u16 (0 = air/fill-0) mismatches any real liquid, so every live
+# cell just restarts its count from 0 on the next pass-10 dispatch (a one-time extra
+# ~stuck_rest_ticks wait, only on the tick the world grew past the old capacity).
+func _ensure_fill_history_capacity() -> void:
+	var cs := _chunk_manager.chunk_size
+	var needed := _orchestrator.get_voxel_buf_capacity() * cs * cs * cs
+	if needed <= _fill_history_capacity and _fill_history_buf.is_valid():
+		return
+	if _fill_history_buf.is_valid():
+		_compute.free_rid(_fill_history_buf)
+	_fill_history_capacity = max(needed, 1)
+	var buf := PackedByteArray(); buf.resize(_fill_history_capacity * 4); buf.fill(0)
+	_fill_history_buf = _compute.buffer_upload(buf)
+
+
+# Same sizing rule/growth pattern, for the punch demand-resolve accumulate scratch
+# (momentum_resolve.comp pass 0's atomicAdd target) — indexed by full flat voxel index
+# exactly like _momentum_claim_buf above.
+func _ensure_punch_demand_accum_capacity() -> void:
+	var cs := _chunk_manager.chunk_size
+	var needed := _orchestrator.get_voxel_buf_capacity() * cs * cs * cs
+	if needed <= _punch_demand_accum_capacity and _punch_demand_accum_buf.is_valid():
+		return
+	if _punch_demand_accum_buf.is_valid():
+		_compute.free_rid(_punch_demand_accum_buf)
+	_punch_demand_accum_capacity = max(needed, 1)
+	var buf := PackedByteArray(); buf.resize(_punch_demand_accum_capacity * 4); buf.fill(0)
+	_punch_demand_accum_buf = _compute.buffer_upload(buf)
+
+
+# Debug readout (2026-07-17, the ~23% submerged-sphere oil "loss" investigation): prints
+# the punch demand queue's current count and the total fill it holds per material. F6's
+# fluid stats only count WORLD fill — mass sitting in unresolved/requeued demands is
+# invisible to it (the bench's conservation checks add pending_demands for exactly this
+# reason). A large standing queued_fill after the sim fully settles means the "missing"
+# mass is STRANDED backlog (walk failures / resolution starvation — demands requeueing
+# until the scheduler slept), not destroyed; an empty queue means a real destruction path.
+# On-demand only (F6): downloads up to count*16 bytes.
+func debug_dump_punch_queue() -> void:
+	if not _punch_demand_queue_buf.is_valid():
+		print("[PunchQueue] buffer not ready")
+		return
+	var cnt_bytes: PackedByteArray = _compute.download_range(_punch_demand_queue_buf, 0, 4)
+	var cnt := cnt_bytes.decode_u32(0)
+	var stored: int = min(cnt, MAX_PUNCH_DEMAND_ENTRIES)
+	var total_by_mat := {}
+	if stored > 0:
+		var data: PackedByteArray = _compute.download_range(_punch_demand_queue_buf, 4, stored * 16)
+		for i in range(stored):
+			var packed := data.decode_s32(i * 16 + 12)
+			var mat := packed & 0xFF
+			var amt := packed >> 8
+			total_by_mat[mat] = total_by_mat.get(mat, 0) + amt
+	if cnt == 0:
+		print("[PunchQueue] count=0 — queue empty, nothing in flight")
+		return
+	print("[PunchQueue] count=%d (stored=%d, dropped_over_capacity=%d)" % [cnt, stored, cnt - stored])
+	for mat in total_by_mat:
+		print("[PunchQueue]   mat=%d queued_fill=%d (%.1f voxels' worth)" % [mat, total_by_mat[mat], total_by_mat[mat] / 255.0])
+	# Print the first few entries' origins — a stranded demand is diagnosable by aiming
+	# F7 at its origin: an origin that is now AIR (orphaned by Transport draining the
+	# transient splash pile it sat on) explains a walk that finds zero seeds and requeues
+	# forever without progress (see docs/BUG_LOG.md 2026-07-17).
+	if stored > 0:
+		var data2: PackedByteArray = _compute.download_range(_punch_demand_queue_buf, 4, min(stored, 8) * 16)
+		for i in range(min(stored, 8)):
+			var ox := data2.decode_s32(i * 16)
+			var oy := data2.decode_s32(i * 16 + 4)
+			var oz := data2.decode_s32(i * 16 + 8)
+			var pk := data2.decode_s32(i * 16 + 12)
+			# Read the origin cell's CURRENT material/fill (2026-07-17): the decisive datum
+			# for WHY a demand is stuck. origin==AIR ⇒ orphaned (the idle-rescue down-probe
+			# case). origin==the demand's own material, buried (has same-material all around,
+			# no reachable dischargeable surface) ⇒ a WALK_CAP-reach problem, NOT an orphan —
+			# the down-probe finds material one step down and doesn't help. See docs/BUG_LOG.md.
+			var om := "?"
+			var of := "?"
+			var slot: int = _orchestrator._chunk_to_slot.get(_world_to_chunk_pos(Vector3i(ox, oy, oz)), -1)
+			if slot >= 0:
+				var cs := _chunk_manager.chunk_size
+				var vpc := cs * cs * cs
+				var lpx := ox - _world_to_chunk_pos(Vector3i(ox, oy, oz)).x * cs
+				var lpy := oy - _world_to_chunk_pos(Vector3i(ox, oy, oz)).y * cs
+				var lpz := oz - _world_to_chunk_pos(Vector3i(ox, oy, oz)).z * cs
+				var bidx := (slot * vpc + lpz * cs * cs + lpy * cs + lpx) * Chunk.VOXEL_STRIDE
+				var vd: PackedByteArray = _compute.download_range(_orchestrator.get_voxel_buf(), bidx, 4)
+				om = str(vd.decode_u8(0)); of = str(vd.decode_u8(1))
+			print("[PunchQueue]   entry %d: origin=(%d, %d, %d) mat=%d amt=%d | origin_cell now: mat=%s fill=%s" % [i, ox, oy, oz, pk & 0xFF, pk >> 8, om, of])
+
+
+# floor-div chunk position for a world voxel (matches fluid_flux.comp world_to_chunk).
+func _world_to_chunk_pos(gpos: Vector3i) -> Vector3i:
+	var cs := _chunk_manager.chunk_size
+	return Vector3i(floori(float(gpos.x) / cs), floori(float(gpos.y) / cs), floori(float(gpos.z) / cs))
+
+
+# Drains whatever is currently in _punch_demand_queue_buf (populated by fluid_flux.comp
+# pass 9's punch, dispatched immediately before this is called). Structural mirror of the
+# density-stacking mechanism's own (deleted) _resolve_density_demands(): zero-download-free
+# GPU-side buffer_copy for the carry-forward, fixed max-size dispatch guarded by each
+# pass's own `if (idx >= count) return;` so the CPU never needs to know the real count.
+const _PUNCH_MAX_DISPATCH_GROUPS := 4096  # ceil(MAX_PUNCH_DEMAND_ENTRIES / 64.0)
+
+func _resolve_punch_demands(grid_min: Vector3i, grid_span: Vector3i, rescue: int = 0) -> void:
+	var zero4 := PackedByteArray(); zero4.resize(4); zero4.fill(0)
+	_compute.buffer_update(_punch_touched_cells_buf, 0, zero4)
+	_compute.buffer_update(_punch_demand_requeue_buf, 0, zero4)
+
+	var uniforms := _build_momentum_resolve_uniforms()
+
+	# Pass 0: walk — bounded BFS, single best (min-y) candidate per demand entry, one
+	# invocation per queue entry (momentum_resolve.comp local_size_x=64). `rescue` enables
+	# the walk's orphaned-origin down-probe — only ever 1 from _rescue_punch_backlog().
+	_upload_momentum_resolve_params(grid_min, grid_span, 0, rescue)
+	_compute.run(_momentum_resolve_pipeline, uniforms, _PUNCH_MAX_DISPATCH_GROUPS, 1, 1)
+	_compute.submit()
+	_compute.sync()
+
+	# Pass 1: apply — clamp to real headroom, write changelog, requeue excess. Reset first
+	# so this substep's own already-applied punch writes (pass 9) aren't redundantly
+	# re-applied.
+	_orchestrator.reset_changelog()
+	_upload_momentum_resolve_params(grid_min, grid_span, 1)
+	_compute.run(_momentum_resolve_pipeline, uniforms, _PUNCH_MAX_DISPATCH_GROUPS, 1, 1)
+	_compute.submit()
+	_compute.sync()
+	_orchestrator.apply_changelog()
+
+	# Carry genuine excess into the NEXT substep's queue — pure GPU-side copy, matching
+	# the same established pattern. Next substep's punch (pass 9) atomicAdds fresh entries
+	# on top of whatever count this seeds.
+	_compute.buffer_copy(_punch_demand_requeue_buf, _punch_demand_queue_buf, 0, 0, 4)
+	_compute.buffer_copy(_punch_demand_requeue_buf, _punch_demand_queue_buf, 4, 4, MAX_PUNCH_DEMAND_ENTRIES * 16)
+
+	# Track the standing backlog (2026-07-17, one 4-byte readback per cycle) — see
+	# _punch_backlog's declaration for why this must be known CPU-side.
+	var qc: PackedByteArray = _compute.download_range(_punch_demand_queue_buf, 0, 4)
+	_punch_backlog = qc.decode_u32(0)
+
+
+# Idle-rescue for a stranded demand backlog (2026-07-17, see _punch_backlog and step()'s
+# idle path; bench twin: momentum_demand.py step()'s idle-rescue drain). Runs one resolve
+# cycle with the walk's orphaned-origin down-probe enabled, then re-activates every chunk
+# the deposits dirtied so normal simulation resumes and the backlog keeps draining. Safe by
+# scheduling construction: this only runs when the active set is empty — nothing dirty for
+# 4+ ticks, world settled. The bench rejected BOTH per-cell gates for this probe first
+# (unconditional and fill-history-gated each re-opened the waterfall chimney identically at
+# peak splash, climb_events=4) before validating this scheduler gate.
+func _rescue_punch_backlog() -> void:
+	var zero_dirty := PackedByteArray(); zero_dirty.resize(DIRTY_BUF_BYTES); zero_dirty.fill(0)
+	_compute.buffer_update(_dirty_chunks_buf, 0, zero_dirty)
+
+	var before := _punch_backlog
+	_resolve_punch_demands(_orchestrator.get_grid_min(), _orchestrator.get_grid_span(), 1)
+
+	var bitmask: PackedByteArray = _compute.download_range(_dirty_chunks_buf, 0, DIRTY_BUF_BYTES)
+	var reactivated := 0
+	for cp in _decode_dirty_bitmask(bitmask):
+		_active_chunks[cp] = 0
+		reactivated += 1
+		if _flux_page_table_buf.is_valid() and not _flux_chunk_table.has(cp):
+			_allocate_flux_page(cp)
+	# One-shot progress trace (2026-07-17) — a rescue that fires but re-activates 0 chunks
+	# and doesn't shrink the queue count is failing to place the demand (down-probe found
+	# material immediately but the underlying min-Y walk still can't reach a dischargeable
+	# surface within WALK_CAP — a BURIED origin, not the air-orphan the probe targets).
+	# Printed only when it makes no progress, so a healthy draining rescue stays quiet.
+	if reactivated == 0 and _punch_backlog >= before and _punch_backlog > 0:
+		print("[Rescue] fired but made NO progress: backlog=%d (queue count unchanged, 0 chunks re-activated) — origin likely buried, not air-orphaned" % _punch_backlog)
+
+
+# momentum_resolve.comp's own separate pipeline/uniform set (2026-07-15) — mirrors
+# GranularSimulation._build_demand_resolve_uniforms() / the deleted density_resolve.comp's
+# own exact binding layout (0=voxels_a, 1=chunk_table, 2=params, 3=queue, 4=accum,
+# 5=touched_cells, 6=changelog, 7=requeue, 8=dirty_chunks).
+func _build_momentum_resolve_uniforms() -> Array:
+	var u := func(binding: int, rid: RID) -> RDUniform:
+		var un := RDUniform.new()
+		un.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
+		un.binding = binding
+		un.add_id(rid)
+		return un
+	return [
+		u.call(0, _orchestrator.get_voxel_buf()),
+		u.call(1, _orchestrator.get_chunk_table()),
+		u.call(2, _momentum_resolve_params_buf),
+		u.call(3, _punch_demand_queue_buf),
+		u.call(4, _punch_demand_accum_buf),
+		u.call(5, _punch_touched_cells_buf),
+		u.call(6, _orchestrator.get_changelog_buf()),
+		u.call(7, _punch_demand_requeue_buf),
+		u.call(8, _dirty_chunks_buf),
+	]
+
+
+func _upload_momentum_resolve_params(grid_min: Vector3i, grid_span: Vector3i, pass_idx: int, rescue: int = 0) -> void:
+	var cs := _chunk_manager.chunk_size
+	var p := PackedByteArray(); p.resize(44)
+	p.encode_s32(0,  cs)
+	p.encode_s32(4,  grid_min.x)
+	p.encode_s32(8,  grid_min.y)
+	p.encode_s32(12, grid_min.z)
+	p.encode_s32(16, grid_span.x)
+	p.encode_s32(20, grid_span.y)
+	p.encode_s32(24, grid_span.z)
+	p.encode_s32(28, pass_idx)
+	p.encode_s32(32, settle_threshold)
+	# Orphaned-origin idle-rescue flag (offset 36, 2026-07-17) — read by the walk pass only.
+	p.encode_s32(36, rescue)
+	# Runtime walk cap (offset 40, 2026-07-17, see punch_walk_cap export) — read by the walk.
+	p.encode_s32(40, clampi(punch_walk_cap, 1, 128))
+	_compute.buffer_update(_momentum_resolve_params_buf, 0, p)
 
 
 # Allocates the GPU-side page-table mirror, sized to grid_span (chunk_pos → page index,
@@ -874,15 +1404,26 @@ func _build_flux_uniforms() -> Array:
 		u.call(14, _density_touch_buf),  # density-trigger debug tint (2026-07-12, see
 										  # debug_density_trigger_tint) — always bound,
 										  # only pass 5 ever writes it.
+		u.call(15, _momentum_claim_buf),  # shared CAS claim scratch (2026-07-14) — always
+										  # bound, used by claim-based resolution passes
+										  # (pass 6 zeroes it, pass 8 buoyancy claims it).
+		u.call(16, _punch_demand_queue_buf),  # write-only from pass 9 (MomentumPunch);
+											   # drained by momentum_resolve.comp's own
+											   # separate pipeline/uniform set. Always
+											   # bound so toggling use_punch never
+											   # changes this uniform set's shape.
 		u.call(21, _orchestrator.get_material_density_buf()),  # per-material density
 												  # (2026-07-12) — generalizes the
 												  # trigger away from hardcoded WATER/OIL.
+		u.call(22, _fill_history_buf),  # per-voxel fill history (2026-07-16, see
+										 # stuck_rest_ticks) — written by pass 10,
+										 # read by buoy_at_rest(). Always bound.
 	]
 
 
 func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pass_idx: int, phi_read_buf: int = 0) -> void:
 	var cs := _chunk_manager.chunk_size
-	var p := PackedByteArray(); p.resize(64)
+	var p := PackedByteArray(); p.resize(84)
 	p.encode_s32(0,  cs)
 	p.encode_s32(4,  grid_min.x)
 	p.encode_s32(8,  grid_min.y)
@@ -902,6 +1443,17 @@ func _upload_flux_params(grid_min: Vector3i, grid_span: Vector3i, frame: int, pa
 	p.encode_s32(52, phi_read_buf)
 	# Viscosity (2026-07-09) — global flow scalar, only read by Pass A. See the export.
 	p.encode_float(56, flow)
+	# Debug tint mode (offset 60) — only read by pass 5. See the tint_mode export.
+	p.encode_s32(60, tint_mode)
+	# Buoyancy rest tolerance (offset 64) — read by pass 8 + pass-5 buoyancy tint.
+	p.encode_s32(64, buoy_rest_flux)
+	# Momentum punch knobs (offsets 68/72/76) — read by pass 5 mode 2 + the punch pass.
+	p.encode_s32(68, punch_threshold)
+	p.encode_s32(72, punch_scale)
+	p.encode_s32(76, max_reach)
+	# Fill-history rest override (offset 80) — read by buoy_at_rest() (pass 8 + pass-5
+	# buoyancy tint); pass 10 maintains the backing buffer. See stuck_rest_ticks.
+	p.encode_s32(80, stuck_rest_ticks)
 	_compute.buffer_update(_flux_params_buf, 0, p)
 
 
@@ -986,14 +1538,29 @@ func _build_phi_chunk_list(flux_list: Array) -> Array:
 	return out
 
 
+# Grow _flux_chunk_list_buf to hold `count` chunks, reallocating (new RID) if needed.
+# MUST be called for the largest list this step BEFORE _build_flux_uniforms() (2026-07-17
+# bugfix): compute_helper.run() builds its uniform set from the RIDs in the uniforms array
+# at dispatch time, so a realloc between building flux_uniforms and a run() leaves binding 5
+# (this buffer) pointing at a freed RID — uniform_set_create then returns invalid and the
+# WHOLE dispatch is silently SKIPPED ("Storage buffer supplied (binding: 5) is invalid").
+# That skips Phi/Accelerate/Transport for that tick, diverging the sim run-to-run — the
+# source of the non-deterministic "walking origin" and unreliable DebugSnapshot. Pre-growing
+# up front (max of flux_count/phi_count) guarantees no realloc happens after the uniforms
+# are built, so the cached RIDs stay valid for every dispatch in the step.
+func _ensure_flux_chunk_list_capacity(count: int) -> void:
+	if count <= _flux_chunk_list_capacity and _flux_chunk_list_buf.is_valid():
+		return
+	if _flux_chunk_list_buf.is_valid():
+		_compute.free_rid(_flux_chunk_list_buf)
+	_flux_chunk_list_capacity = max(count, _flux_chunk_list_capacity * 2)
+	var blank := PackedByteArray(); blank.resize(_flux_chunk_list_capacity * 12); blank.fill(0)
+	_flux_chunk_list_buf = _compute.buffer_upload(blank)
+
+
 func _upload_flux_chunk_list(chunk_positions: Array) -> void:
 	var count := chunk_positions.size()
-	if count > _flux_chunk_list_capacity:
-		if _flux_chunk_list_buf.is_valid():
-			_compute.free_rid(_flux_chunk_list_buf)
-		_flux_chunk_list_capacity = max(count, _flux_chunk_list_capacity * 2)
-		var blank := PackedByteArray(); blank.resize(_flux_chunk_list_capacity * 12); blank.fill(0)
-		_flux_chunk_list_buf = _compute.buffer_upload(blank)
+	_ensure_flux_chunk_list_capacity(count)
 	var data := PackedByteArray(); data.resize(count * 12)
 	for i in count:
 		var cp: Vector3i = chunk_positions[i]
@@ -1007,4 +1574,11 @@ func _load_flux_shader() -> String:
 	var f := FileAccess.open("res://shaders/fluid_flux.comp", FileAccess.READ)
 	if f: return f.get_as_text()
 	push_error("FluidSimulation: failed to load fluid_flux.comp")
+	return ""
+
+
+func _load_momentum_resolve_shader() -> String:
+	var f := FileAccess.open("res://shaders/momentum_resolve.comp", FileAccess.READ)
+	if f: return f.get_as_text()
+	push_error("FluidSimulation: failed to load momentum_resolve.comp")
 	return ""

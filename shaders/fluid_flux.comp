@@ -104,6 +104,34 @@ layout(set = 0, binding = 2, std430) readonly buffer SimParams {
     // >= 1.0 takes the exact unscaled code path, so water (MaterialFlow=1.0) at this
     // default is bit-identical to the pre-viscosity shader.
     float flow;
+    // Debug tint mode (Phase 1/2 of the momentum/buoyancy port) — selects which trigger
+    // the tint-only pass 5 visualizes: 0 = buoyancy (lighter liquid at rest that could
+    // rise), 1 = momentum (liquid actively pushing into a different liquid). Only read by
+    // pass 5; no other pass touches it.
+    int tint_mode;
+    // Buoyancy rest tolerance (Phase 4, 2026-07-14) — max |flux| on a cell's own+behind
+    // lanes for it to still count as "at rest" for the buoyancy exchange (pass 8) and the
+    // pass-5 buoyancy tint. 0 = strict (exactly zero effective flux, the bench default);
+    // small positive values let a "basically settled" cell sort without waiting the ~150
+    // ticks the engine's damp=0.97 flux decay needs to reach exactly 0. See
+    // FluidSimulation.buoy_rest_flux.
+    int buoy_rest_flux;
+    // Momentum punch (Phase 5 port of momentum_demand.py, 2026-07-15). A liquid cell whose
+    // downward flux (into its own +Y face) reaches punch_threshold craters straight down
+    // through `reach = 1 + (F - punch_threshold)/punch_scale` (capped at max_reach)
+    // consecutive LIGHTER-different-liquid cells, displacing each as a demand. Read by the
+    // punch tint (pass 5 mode 2) and the punch pass. See FluidSimulation.punch_threshold.
+    int punch_threshold;
+    int punch_scale;
+    int max_reach;
+    // Fill-history rest override (2026-07-16 port of momentum_demand.py's
+    // stuck_rest_ticks — the §3.2 stuck-film fix, see LIQUID_INTERACTION_HANDOFF.md).
+    // A liquid cell whose (material|fill) bytes have been identical for this many
+    // consecutive simulation ticks counts as at rest in buoy_at_rest() no matter what
+    // the flux field claims — the content-change signal is the one thing Accelerate's
+    // permanently re-saturating free-surface lanes can't fake. -1 disables (pure
+    // flux-magnitude gate). See FluidSimulation.stuck_rest_ticks.
+    int stuck_rest_ticks;
 } params;
 layout(set = 0, binding = 3, std430) readonly buffer MaterialSim { uint data[256]; } material_sim;
 layout(set = 0, binding = 4, std430)          buffer Changelog {
@@ -154,6 +182,25 @@ layout(set = 0, binding = 13, std430) readonly buffer MaterialFlow { float data[
 // DISPATCH, not this binding) so toggling it never changes the uniform set's shape.
 layout(set = 0, binding = 14, std430) buffer DensityTouchBuffer { uint data[]; } density_touch;
 
+// Shared CAS claim scratch (2026-07-14) — one uint per full flat voxel index, 0 =
+// unclaimed this substep. ClaimZero (pass 6) zeroes it; any claim-based resolution pass
+// (currently BuoyancyExchange, pass 8) atomicCompSwap-claims every cell it writes so two
+// parallel resolutions never touch the same voxel — the GPU equivalent of the bench's
+// per-tick `touched` set (momentum_displace.py / momentum_demand.py). Always bound.
+layout(set = 0, binding = 15, std430) buffer MomentumClaim { uint data[]; } momentum_claim;
+
+// Punch demand queue (Phase 5 port step 2b, 2026-07-15) — written ONLY by MomentumPunch
+// (pass 9, see below); drained by momentum_resolve.comp's own separate pipeline (an
+// entirely different uniform set — this binding only needs to exist here for the WRITE
+// side). Each entry is the displaced lighter liquid's own former position (origin), its
+// material, and its fill amount — mirrors momentum_demand.py's pending_demands tuples.
+// Interleaved: origin_x, origin_y, origin_z, (material | amount<<8) — 4 ints/entry,
+// matching demand_resolve.comp's own established queue-entry shape.
+layout(set = 0, binding = 16, std430) buffer PunchDemandQueue {
+    uint count;
+    int entries[];
+} punch_demand_queue;
+
 // Per-material density lookup (2026-07-12) — 0.0 = not a density-sorted material (see
 // MaterialDef.density's own comment for why 0.0, not 1.0, is the safe default). Mirrors
 // MaterialFlow (binding 13) exactly: built by WorldOrchestrator._build_material_cache()
@@ -162,12 +209,30 @@ layout(set = 0, binding = 14, std430) buffer DensityTouchBuffer { uint data[]; }
 // 2026-07-14 (see ARCHITECTURE.md's momentum/buoyancy to-do item).
 layout(set = 0, binding = 21, std430) readonly buffer MaterialDensity { float data[256]; } material_density;
 
+// Per-voxel fill history (2026-07-16, the §3.2 stuck-film fix) — one uint per full flat
+// voxel index (same sizing rule as momentum_claim/density_touch): low 16 bits = the
+// (material | fill<<8) u16 last seen by the FillHistoryUpdate pass (pass 10), high 16
+// bits = how many consecutive ticks it has been byte-identical (saturating at 0xFFFF).
+// Written ONLY by pass 10 (dispatched once per substep after Transport's changelog is
+// applied, before BuoyancyExchange — mirroring momentum_demand.py's step() ordering);
+// read by buoy_at_rest(). Persistent across ticks; NOT zeroed on chunk (re)load — a
+// reused slot's stale entry almost always mismatches the new content and self-resets on
+// the next pass-10 dispatch, and the rare coincidental match only means an already-
+// motionless cell is considered at rest a little early (buoyancy still only ever
+// performs a legitimate density-ordered swap). Counters freeze while a chunk is outside
+// the dispatch range (pass 10 never sees it) — deliberately conservative: idle ticks
+// don't count toward "stuck", and a film that goes to sleep un-sorted sorts on the first
+// re-disturbance since its counter survives the nap.
+layout(set = 0, binding = 22, std430) buffer FillHistory { uint data[]; } fill_history;
+
 const uint SIM_LIQUID    = 2u;
-// Hardcoded material ids (material_db.gd defaults / Chunk.Mat enum). Used by the debug
-// tint (pass 5); the density-stacking passes that also used them were removed 2026-07-14.
-const uint MAT_WATER = 3u;
-const uint MAT_OIL   = 7u;
 const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGELOG_ENTRIES
+// Must match FluidSimulation.MAX_PUNCH_DEMAND_ENTRIES / momentum_resolve.comp's own literal.
+// Raised 65536 -> 262144 (2026-07-16, alongside the reserve-before-mutate fixes elsewhere in
+// this file and momentum_resolve.comp): confirmed in-editor that a single large (6000+
+// liquid voxel), heavily-punching scene can generate/backlog demand volume well past 65536 —
+// pragmatic headroom on top of the correctness fixes, not a substitute for them.
+const uint MAX_PUNCH_DEMAND_ENTRIES = 262144u;
 // Hoisted to file scope (was local to main()'s pass==0 block) so the phi-flood helpers
 // below (file-scope, defined before main()) can share it — one full voxel's worth of fill.
 const int FILL_CAP = 255;
@@ -250,6 +315,20 @@ int flux_lane(ivec3 gpos, int axis) {
 // is the neighbour's owned face, negated — one storage location per face in the world.
 const ivec3 AXIS_DIR[3] = ivec3[3](ivec3(1, 0, 0), ivec3(0, 1, 0), ivec3(0, 0, 1));
 
+// Buoyancy trigger candidate shape (port of tools/fluid_prototypes/python/buoyancy.py's
+// UPWARD_CANDIDATES / HORIZ4) — straight-UP always tried; the 4 diagonal-up candidates
+// ONLY for a cell with zero same-material neighbour among HORIZ4 (a lone droplet, not a
+// bulk-mass flank cell — firing diagonals unconditionally lets a bulk mass's outer shell
+// rise independently and fragment into fingers; see buoyancy.py's own comment). Mirror of
+// the density-stacking DOWNWARD_CANDIDATES shape, inverted for the rising direction.
+const ivec3 UPWARD_CANDIDATES[5] = ivec3[5](
+    ivec3(0, 1, 0),
+    ivec3(1, 1, 0), ivec3(-1, 1, 0), ivec3(0, 1, 1), ivec3(0, 1, -1)
+);
+const ivec3 HORIZ4[4] = ivec3[4](
+    ivec3(1, 0, 0), ivec3(-1, 0, 0), ivec3(0, 0, 1), ivec3(0, 0, -1)
+);
+
 void mark_dirty(int flat_idx, int vpc) {
     int chunk_slot = flat_idx / vpc;
     atomicOr(dirty_chunks.data[uint(chunk_slot) >> 5u], 1u << (uint(chunk_slot) & 31u));
@@ -276,6 +355,16 @@ void mark_dirty(int flat_idx, int vpc) {
 // much of its exposed surface). A losing material is now blocked at most every OTHER tick,
 // not permanently. Returns 0u (AIR, never a valid material id) as the sentinel for "no
 // liquid neighbour found" — callers already treat 0u as "no owner" by existing convention.
+//
+// TRIED 2026-07-16 and REVERTED: a 6-state scan-start rotation (by params.frame % 6 instead
+// of a 2-state parity flip), meant to close a provable permanent-starvation case where a
+// competing liquid occupies a higher-priority slot in BOTH of the 2 orderings
+// simultaneously. Bench-validated clean and DID fix the reported stuck-water symptom
+// in-editor — but a live in-editor test with buoyancy properly enabled surfaced a ~24.5%
+// total fill loss concentrated in the actively-churning region, not measured before.
+// Reverted to isolate whether the loss is caused by the rotation specifically or was
+// already present / only surfaced once buoyancy was actually turned on for a scene this
+// large (6000+ liquid voxels). See docs/BUG_LOG.md for whichever this turns out to be.
 uint designated_liquid(ivec3 gpos) {
     bool reverse = (params.frame & 1) == 1;
     for (int i = 0; i < 6; i++) {
@@ -361,6 +450,129 @@ const int MIN_FLOW = 1;
 
 int eff_flux(int raw) {
     return (abs(raw) >= MIN_FLOW) ? raw : 0;
+}
+
+// Buoyancy rest gate (port of buoyancy.py's _is_at_rest) — a cell counts as "at rest"
+// only if every one of its 3 owned faces AND the 3 incoming neighbour-owned faces
+// (the faces BEHIND it on each axis) carries no effective flux. Callable for ANY global
+// position, not just "my own": buoyancy checks both the riser and its denser target.
+// A position whose chunk has no flux page reads every lane as -1 here (flux_lane
+// returns -1) and is therefore treated as at rest — matching buoyancy.py's own
+// "no page means idle/evicted, i.e. definitionally zero flux" fix (a chunk only loses
+// its page once the engine's idle-eviction fires, i.e. nothing moved there recently).
+// A liquid resting directly on a LIGHTER, different liquid can never pass a plain
+// flux-magnitude rest check: Accelerate recomputes the same saturating downward pull every
+// tick (gravity keeps pressing it into an interface Transport structurally can't cross —
+// cross-material fill transfer only ever happens via buoyancy/punch, never ordinary
+// same-material Transport), so that face's flux never decays no matter how long the pair
+// has been sitting there motionless. Traced 2026-07-15/16 (in-editor FluidWatch): a water
+// film resting on a thin/non-bulk oil puddle showed fy pinned at the Y-axis clamp ceiling
+// for 100+ ticks, permanently failing buoy_rest_flux and therefore never becoming eligible
+// for the very swap that exists to resolve it — buoyancy structurally locked out of its
+// own use case. Ported from momentum_demand.py's _is_at_rest (bench-validated: full
+// waterfall/thin-pool/sealed-column suite passes unchanged with this exemption in place).
+// This is NOT the same as an actively falling stream: there, the cell below/above is the
+// SAME material or air, and Transport genuinely moves mass through every tick — so the
+// exemption below only ever fires for the exact cross-material standoff buoyancy targets,
+// never for a real stream (whose faces always border same-material liquid or air).
+bool buoy_at_rest(ivec3 p) {
+    // Fill-history override (2026-07-16, the §3.2 fix — port of momentum_demand.py's
+    // stuck_rest_ticks, bench-validated: waterfall suite climb_events=0 AND the
+    // test_stuck_film.py FILM repro sorts). Content byte-identical for N straight ticks
+    // means the cell is structurally stuck, however loudly Accelerate's formula
+    // saturates its lanes: phi-flood seeds P=fill at any free surface and air above
+    // reads P=0, so a non-full surface cell's own upward lane re-pins EVERY tick,
+    // moving or not — flux magnitude cannot distinguish the two, but actual content
+    // change can (a genuinely moving/splashing cell's mat|fill changes within a few
+    // ticks; two same-tick geometric exemptions were tried instead and both re-opened
+    // the chimney — see the rejection notes further down). A saturated steady-stream
+    // conduit (fill pinned at 255 while mass flows through) is the one shape that could
+    // fool this, but a buoyancy swap rewrites both cells (resetting both histories) and
+    // zeroes their fluxes, so even that worst case is rate-limited to one swap per N
+    // ticks and cannot ratchet a chimney.
+    if (params.stuck_rest_ticks >= 0) {
+        int hflat = world_to_flat(p);
+        if (hflat >= 0 && int(fill_history.data[hflat] >> 16u) >= params.stuck_rest_ticks) {
+            return true;
+        }
+    }
+    int tol = params.buoy_rest_flux;
+    uint mat_here = read_a(p) & 0xFFu;
+    bool have_here = mat_here != 0u;
+    float d_here = have_here ? material_density.data[mat_here] : 0.0;
+    for (int axis = 0; axis < 3; axis++) {
+        int lane = flux_lane(p, axis);
+        if (lane >= 0 && abs(eff_flux(flux_buf.data[lane])) > tol) {
+            // own lane (axis==1) is the face toward p+Y (above p) — exempt only if p is
+            // itself the LIGHTER liquid a denser one is pinned against from above.
+            //
+            // TRIED 2026-07-16 and REJECTED (twice, see momentum_demand.py::_is_at_rest
+            // for the full writeup): an additional exemption for "p has genuine AIR above
+            // it and negative own flux" (meant to catch a thin liquid film's own upward-
+            // facing lane permanently pinning per phi-flood's seed rule). First tried
+            // unconditionally: bench-caught reopening the chimney (climb_events=3).
+            // Narrowed to also require the below-neighbour be a lighter different liquid:
+            // made it WORSE (climb_events=17) — a chaotic nonlinear system, even a
+            // narrowly-scoped extra exemption cascades into more climbs, not fewer.
+            // Reverted both attempts; climb_events=0 is a hard invariant. The live "water
+            // permanently stuck via its own upward-facing lane" case remains unresolved.
+            bool exempt = false;
+            if (axis == 1 && have_here) {
+                uint am = read_a(p + AXIS_DIR[1]) & 0xFFu;
+                if (am != 0u && am != mat_here && material_sim.data[am] == SIM_LIQUID) {
+                    float d_above = material_density.data[am];
+                    if (d_above > d_here) exempt = true;
+                }
+            }
+            if (!exempt) return false;
+        }
+        ivec3 behind = p - AXIS_DIR[axis];
+        int blane = flux_lane(behind, axis);
+        if (blane >= 0 && abs(eff_flux(flux_buf.data[blane])) > tol) {
+            // behind lane (axis==1) is the face toward p-Y (below p) — exempt only if p
+            // is the DENSER liquid resting on a lighter one below it.
+            bool exempt = false;
+            if (axis == 1 && have_here) {
+                uint bm = read_a(behind) & 0xFFu;
+                if (bm != 0u && bm != mat_here && material_sim.data[bm] == SIM_LIQUID) {
+                    float d_below = material_density.data[bm];
+                    if (d_below < d_here) exempt = true;
+                }
+            }
+            if (!exempt) return false;
+        }
+    }
+    return true;
+}
+
+// Downward flow across gpos's +Y face (positive = water falling into/through gpos) —
+// momentum_demand.py's _downward_flux, same lane+sign as a direction=-1 momentum push.
+int downward_flux(ivec3 gpos) {
+    int lane = flux_lane(gpos, 1);   // axis 1 = +Y face of gpos
+    if (lane < 0) return 0;
+    return -eff_flux(flux_buf.data[lane]);
+}
+
+// Would this liquid cell PUNCH the cell below it this tick? (momentum_demand.py
+// _pass_momentum_punch's first-cell gate.) Requires: real downward arrival flux
+// (>= punch_threshold), and the cell directly below is a LIGHTER, DIFFERENT liquid that is
+// BULK — i.e. has its OWN material directly beneath it, so the displaced volume has a
+// connected column to escape down through. Isolated stream-debris oil (no same-material
+// below) is deliberately never punched (that was the last residual chimney). Density-
+// directional (denser-into-lighter only) and different-material only: material-agnostic
+// punch was bench-rejected 2026-07-15 (re-opens climb + leaks mass).
+bool punch_candidate(ivec3 gpos, uint mat_id) {
+    float d_here = material_density.data[mat_id];
+    if (d_here <= 0.0) return false;
+    if (downward_flux(gpos) < params.punch_threshold) return false;
+    ivec3 below = gpos + ivec3(0, -1, 0);
+    uint bm = read_a(below) & 0xFFu;
+    if (bm == 0u || bm == mat_id || material_sim.data[bm] != SIM_LIQUID) return false;
+    float d_below = material_density.data[bm];
+    if (d_below <= 0.0 || d_below >= d_here) return false;   // must be lighter
+    ivec3 under = below + ivec3(0, -1, 0);
+    if ((read_a(under) & 0xFFu) != bm) return false;         // bulk check
+    return true;
 }
 
 // Phase 7e Step 9 (2026-07-06) — pure, ephemeral conservation-scale helpers. Neither of
@@ -864,6 +1076,22 @@ void main() {
         float my_s_out = compute_s_out(gpos, cs, vpc);
         float my_s_in  = compute_s_in(gpos, cs, vpc);
 
+        // Sum all 6 faces as floats, round ONCE (RESTORED 2026-07-18 — see docs/BUG_LOG.md).
+        // A 2026-07-17 change rounded PER-FACE instead, on the reasoning that a single face's
+        // transfer X = v*s_out*s_in is computed identically by donor and receiver, so
+        // round(-X) == -round(X) makes that one face exactly conservative. The per-face
+        // symmetry argument is correct in isolation but is NOT what the engine's conservation
+        // rests on, and the change MEASURED FOUR REGRESSIONS (bench, 1:1 port of this shader):
+        //   * waterfall acceptance bar: climb_events 0 -> 4
+        //   * plunge mass loss: -0.35% -> -6.56% (19x WORSE — the very metric it targeted)
+        //   * a water/oil interface NEVER settles: conservation delta pinned near -150 EVERY
+        //     tick indefinitely, vs exactly 0 with this version
+        //   * chunks never go idle (active=8 forever vs 0) — the in-editor report of fluid
+        //     "twitching" for ~30s with chunks staying active long after the water lands
+        // Mechanism: rounding each face independently manufactures a +-1 quantum on every face
+        // whose true transfer is fractional. A cell with several small simultaneous flows then
+        // jitters forever instead of netting to zero, so it never settles and bleeds fill.
+        // Summing first lets those fractional flows cancel, and the cell goes quiet.
         float delta_f = 0.0;
         for (int axis = 0; axis < 3; axis++) {
             // My owned face (+axis direction).
@@ -1044,34 +1272,250 @@ void main() {
         return;
     }
 
-    // === DensityTouchDebug (params.pass == 5) ===
-    // Step 1 of the oil-water waterfall port (docs/BUG_LOG.md "SOLVED IN BENCH
-    // (2026-07-11)") — proves a GLSL change actually reaches live dispatch before any
-    // real displacement mechanism is written, per the still-open 2026-07-10 mystery
-    // (three bench-validated fixes each reported "looks exactly the same" in-editor).
-    // Deliberately the SIMPLEST possible trigger check: straight-down only, no diagonal
-    // reach, no displacement, no changelog write, no mass movement of any kind. Each
-    // invocation writes ONLY its own flat slot (self-write, no neighbour writes) so
-    // there is no CAS/race to reason about.
+    // === Buoyancy trigger tint (params.pass == 5) ===
+    // Phase 1 of the momentum/buoyancy port (2026-07-14): a TINT-ONLY visualization of
+    // buoyancy.py's _pass_buoyancy TRIGGER — no claim, no swap, no changelog, no mass
+    // movement of any kind. Marks a LIGHTER liquid, AT REST, that has a DENSER different
+    // liquid it could rise into: straight-up always, diagonal-up only if the cell is
+    // isolated (no same-material HORIZ4 neighbour). General density via MaterialDensity,
+    // not hardcoded ids. Writes ONLY this voxel's own tint slot (self-write, no neighbour
+    // writes, no CAS/race). Purpose: confirm the REAL trigger fires on exactly the right
+    // cells against REAL engine flux BEFORE the mutating exchange resolution (Phase 2) is
+    // written — the debug-tint-before-mutation discipline that the 2026-07-10
+    // "bench-valid but no visible in-editor effect" history taught (see docs/BUG_LOG.md).
     //
-    // FIX (2026-07-12, in-editor report: water voxels tinting magenta too): the flat
-    // slot index (my_flat) is reused across materials as voxels move — a slot that WAS
-    // a qualifying oil cell (touch=1) can have water flow into that exact same slot
-    // next tick once the oil moves on. The original version only ever wrote this slot
-    // when mat_id == MAT_OIL, silently skipping every non-oil voxel — so a slot's `1`
-    // survived untouched after its material changed out from under it, showing up as
-    // tint on whatever now occupies that position. Fix: unconditionally overwrite every
-    // DISPATCHED voxel's own slot each tick (0 unless it currently qualifies) so the
-    // buffer always reflects the CURRENT tick's material at that position, not
-    // whichever material last happened to qualify there.
+    // Every DISPATCHED voxel overwrites its own slot each tick (0 unless it currently
+    // qualifies), so a slot never keeps a stale `1` after its material moves on — the
+    // buffer always reflects the CURRENT tick's material at that position.
     if (params.pass == 5) {
         uint touch = 0u;
-        if (mat_id == MAT_OIL) {
-            ivec3 above = gpos + AXIS_DIR[1];
-            uint av = read_a(above);
-            touch = ((av & 0xFFu) == MAT_WATER) ? 1u : 0u;
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        if (my_is_liquid) {
+            if (params.tint_mode == 2) {
+                // --- Punch trigger (tint_mode 2): would crater straight down into bulk lighter liquid ---
+                touch = punch_candidate(gpos, mat_id) ? 1u : 0u;
+            } else {
+                // --- Buoyancy trigger (tint_mode 0): lighter liquid at rest that could rise ---
+                float d_here = material_density.data[mat_id];
+                if (d_here > 0.0 && buoy_at_rest(gpos)) {
+                    // Isolation: does this cell have same-material company on any of the 4
+                    // horizontal sides? A bulk mass's flank cells do; a lone droplet doesn't.
+                    bool isolated = true;
+                    for (int h = 0; h < 4; h++) {
+                        if ((read_a(gpos + HORIZ4[h]) & 0xFFu) == mat_id) { isolated = false; break; }
+                    }
+                    for (int c = 0; c < 5; c++) {
+                        if (c > 0 && !isolated) break;  // bulk-mass flank cell: straight-up only
+                        ivec3 npos = gpos + UPWARD_CANDIDATES[c];
+                        uint nm = read_a(npos) & 0xFFu;
+                        if (nm == 0u || nm == mat_id) continue;
+                        if (material_sim.data[nm] != SIM_LIQUID) continue;
+                        float d_n = material_density.data[nm];
+                        if (d_n <= 0.0 || d_n <= d_here) continue;  // neighbour not denser — not a target
+                        if (!buoy_at_rest(npos)) continue;
+                        touch = 1u;
+                        break;
+                    }
+                }
+            }
         }
         density_touch.data[my_flat] = touch;
+        return;
+    }
+
+    // === ClaimZero (params.pass == 6) ===
+    // Zeroes the shared CAS claim scratch for every voxel in this substep's dispatch range
+    // before any claim-based resolution pass runs (0u == unclaimed). Generic infrastructure
+    // — currently used by BuoyancyExchange (pass 8) and the momentum punch (pass 9); not
+    // tied to any single mechanism. Same role zero_slots.comp has for granular's CAS scratch.
+    if (params.pass == 6) {
+        momentum_claim.data[my_flat] = 0u;
+        return;
+    }
+
+    // Pass 7 (the original single-hop push-aside MomentumPush) was removed 2026-07-15,
+    // superseded by the momentum-graded punch (pass 9) + min-Y demand resolver — see
+    // ARCHITECTURE.md's momentum/buoyancy to-do item and
+    // tools/fluid_prototypes/python/momentum_demand.py for the validated replacement.
+
+    // === BuoyancyExchange (params.pass == 8) ===
+    // Phase 4 resolution: a LIGHTER liquid at rest with a DENSER different liquid directly
+    // above it (or diagonally above, if isolated) trades places with it — lighter rises,
+    // denser sinks into the exact vacated cell. Direct 2-cell exchange (port of
+    // buoyancy.py's _pass_buoyancy): exact conservation by construction, no air needed, no
+    // submerged air hole (the fix that made buoyancy converge in the bench — see
+    // MOMENTUM_FLUX_HANDOFF.md's RESOLVED section). Rest-gated (params.buoy_rest_flux
+    // tolerance) so it only sorts calm liquid and defers anything still in motion. Both
+    // cells CAS-claimed (shares momentum_claim, zeroed by pass 6) so parallel exchanges
+    // can't collide. Runs AFTER Transport in its own changelog cycle. This exchange is the
+    // primitive a future unified "momentum-as-force" will reuse, triggered by a directional
+    // force instead of by rest.
+    if (params.pass == 8) {
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        if (!my_is_liquid) return;
+        float d_here = material_density.data[mat_id];
+        if (d_here <= 0.0) return;              // not configured for density sorting
+        if (!buoy_at_rest(gpos)) return;
+
+        // Isolation: same-material company on any horizontal side? A bulk-mass flank cell
+        // only tries straight up; a lone droplet also tries the diagonals-up.
+        bool isolated = true;
+        for (int h = 0; h < 4; h++) {
+            if ((read_a(gpos + HORIZ4[h]) & 0xFFu) == mat_id) { isolated = false; break; }
+        }
+
+        for (int c = 0; c < 5; c++) {
+            if (c > 0 && !isolated) break;
+            ivec3 npos = gpos + UPWARD_CANDIDATES[c];
+            uint nv = read_a(npos);
+            uint nm = nv & 0xFFu;
+            if (nm == 0u || nm == mat_id || material_sim.data[nm] != SIM_LIQUID) continue;
+            float d_n = material_density.data[nm];
+            if (d_n <= 0.0 || d_n <= d_here) continue;  // neighbour not denser — not a target
+            if (!buoy_at_rest(npos)) continue;
+
+            int nflat = world_to_flat(npos);
+            if (nflat < 0) continue;
+            // Claim both cells; abort if either is already taken this substep.
+            if (atomicCompSwap(momentum_claim.data[nflat],   0u, 1u) != 0u) return;
+            if (atomicCompSwap(momentum_claim.data[my_flat], 0u, 1u) != 0u) return;
+
+            // Exchange: lighter (mover) rises into npos, denser sinks into gpos.
+            uint log_slot = atomicAdd(changelog.count, 2u);
+            if (log_slot + 1u < MAX_CHANGELOG) {
+                changelog.entries[log_slot * 2u]             = uint(nflat);
+                changelog.entries[log_slot * 2u + 1u]        = my_voxel;  // lighter rises
+                changelog.entries[(log_slot + 1u) * 2u]      = uint(my_flat);
+                changelog.entries[(log_slot + 1u) * 2u + 1u] = nv;        // denser sinks
+            }
+            mark_dirty(my_flat, vpc);
+            mark_dirty(nflat, vpc);
+            // Zero flux on both swapped cells (own + behind lanes on every axis) so stale
+            // momentum can't re-drive the freshly-swapped material — matches the bench
+            // (momentum_demand.py _pass_buoyancy). Safe to write flux_buf here: pass 8 is
+            // its own dispatch, no other pass reads flux concurrently, and both cells were
+            // at rest (|flux| <= tolerance) so this only trims the small residual.
+            for (int az = 0; az < 3; az++) {
+                int l1 = flux_lane(gpos, az); if (l1 >= 0) flux_buf.data[l1] = 0;
+                int l2 = flux_lane(npos, az); if (l2 >= 0) flux_buf.data[l2] = 0;
+                ivec3 ad = AXIS_DIR[az];
+                int b1 = flux_lane(gpos - ad, az); if (b1 >= 0) flux_buf.data[b1] = 0;
+                int b2 = flux_lane(npos - ad, az); if (b2 >= 0) flux_buf.data[b2] = 0;
+            }
+            return;  // one exchange per cell per substep
+        }
+        return;
+    }
+
+    // === MomentumPunch (params.pass == 9) ===
+    // Phase 5 port step 2b (2026-07-15) — momentum-graded plunge: a liquid cell arriving
+    // with real downward flux (>= punch_threshold) craters straight down through
+    // `reach = 1 + (F - punch_threshold)/punch_scale` (capped at max_reach) consecutive
+    // BULK lighter-liquid cells in ONE tick. Water advances into each punched cell,
+    // vacating its own previous cell to air; each displaced oil cell is queued as a
+    // demand (origin = its own former position), resolved by momentum_resolve.comp's
+    // separate min-Y walk. Faithful port of momentum_demand.py's _pass_momentum_punch —
+    // the VALIDATED policy (denser-into-lighter, different-material, bulk-only;
+    // material-agnostic punch was bench-rejected 2026-07-15 — re-opens climb and leaks
+    // mass, see punch_candidate()'s own comment). Every cell this invocation writes (its
+    // own cell, each punched target) is atomicCompSwap-claimed so two water columns can
+    // never punch through the same oil cell; a lost claim stops THIS invocation's walk
+    // early (conservative — the cells it already claimed/queued this hop stay valid,
+    // never corrupting) rather than aborting another invocation's progress. Runs BEFORE
+    // Accelerate/Transport each substep (see fluid_simulation.gd), mirroring the bench's
+    // step() ordering (punch+resolve, THEN the base flux substep, THEN buoyancy).
+    if (params.pass == 9) {
+        bool my_is_liquid = (mat_id != 0u && material_sim.data[mat_id] == SIM_LIQUID);
+        if (!my_is_liquid) return;
+        float d_here = material_density.data[mat_id];
+        if (d_here <= 0.0) return;
+        int F = downward_flux(gpos);
+        if (F < params.punch_threshold) return;
+
+        int reach = 1 + (F - params.punch_threshold) / max(1, params.punch_scale);
+        if (reach > params.max_reach) reach = params.max_reach;
+        if (reach < 1) reach = 1;
+
+        // Claim the mover's own cell first — if another invocation already claimed it
+        // (shouldn't happen for a liquid cell's own position, but costs nothing to guard).
+        if (atomicCompSwap(momentum_claim.data[my_flat], 0u, 1u) != 0u) return;
+
+        ivec3 cur = gpos;
+        int cur_flat = my_flat;
+        uint water_voxel = my_voxel;   // constant across every hop — the mover's own bytes
+
+        for (int i = 0; i < reach; i++) {
+            ivec3 below = cur + ivec3(0, -1, 0);
+            uint bv = read_a(below);
+            uint bm = bv & 0xFFu;
+            if (bm == 0u || bm == mat_id || material_sim.data[bm] != SIM_LIQUID) break;
+            float d_below = material_density.data[bm];
+            if (d_below <= 0.0 || d_below >= d_here) break;   // must be lighter
+            ivec3 under = below + ivec3(0, -1, 0);
+            if ((read_a(under) & 0xFFu) != bm) break;         // bulk check — see punch_candidate()
+
+            int below_flat = world_to_flat(below);
+            if (below_flat < 0) break;
+            if (atomicCompSwap(momentum_claim.data[below_flat], 0u, 1u) != 0u) break;
+
+            uint oil_fill = (bv >> 8u) & 0xFFu;
+
+            // Reserve the demand-queue slot FIRST (2026-07-16 fix — see docs/BUG_LOG.md,
+            // "punch's changelog mutation was unconditional but the demand-queue entry
+            // recording where the displaced oil goes was not"): the changelog is the ONLY
+            // thing that actually erases `bm`'s fill from `below` in voxels_a, and
+            // punch_demand_queue is the ONLY record of what that displaced oil was and
+            // where to route it. Writing the changelog unconditionally while the queue
+            // entry was gated on capacity meant a full queue silently erased real mass with
+            // zero record of it — confirmed as a real, measured ~20% total-fill loss on a
+            // large (6000+ liquid voxel) scene where sustained punch activity outpaced
+            // momentum_resolve.comp's own drain rate (punch_demand_queue.count is carried
+            // forward between ticks, never reset — see _resolve_punch_demands — so a
+            // resolution backlog compounds until it exceeds capacity). Reserving the queue
+            // slot before touching the changelog, and skipping the whole hop (no mutation
+            // at all) if the queue is full, means this cell simply doesn't punch again
+            // until the next tick — water and oil both stay exactly where they are,
+            // instead of oil vanishing. Bounds `reach` to what can actually be recorded,
+            // rather than truncating the queue's record of what was already done.
+            uint dq_slot = atomicAdd(punch_demand_queue.count, 1u);
+            if (dq_slot >= MAX_PUNCH_DEMAND_ENTRIES) break;
+            punch_demand_queue.entries[dq_slot * 4]     = below.x;
+            punch_demand_queue.entries[dq_slot * 4 + 1] = below.y;
+            punch_demand_queue.entries[dq_slot * 4 + 2] = below.z;
+            punch_demand_queue.entries[dq_slot * 4 + 3] = int(bm | (oil_fill << 8u));
+
+            uint log_slot = atomicAdd(changelog.count, 2u);
+            if (log_slot + 1u < MAX_CHANGELOG) {
+                changelog.entries[log_slot * 2u]             = uint(below_flat);
+                changelog.entries[log_slot * 2u + 1u]        = water_voxel;  // water advances
+                changelog.entries[(log_slot + 1u) * 2u]      = uint(cur_flat);
+                changelog.entries[(log_slot + 1u) * 2u + 1u] = 0u;           // vacate to air
+            }
+            mark_dirty(cur_flat, vpc);
+            mark_dirty(below_flat, vpc);
+
+            cur = below;
+            cur_flat = below_flat;
+        }
+        return;
+    }
+
+    // === FillHistoryUpdate (params.pass == 10) ===
+    // One linear pass per substep over the dispatch range, run after Transport's
+    // changelog is applied and before BuoyancyExchange (mirrors momentum_demand.py's
+    // _update_fill_history call site in step()): bump the unchanged-counter where this
+    // voxel's (material|fill) u16 is byte-identical to the stored snapshot, reset both
+    // where it isn't. Writes only fill_history (its own cell — no races), never
+    // voxels_a/changelog. See the FillHistory binding comment for the packing.
+    if (params.pass == 10) {
+        uint cur = my_voxel & 0xFFFFu;
+        uint h = fill_history.data[my_flat];
+        if ((h & 0xFFFFu) == cur) {
+            uint cnt = h >> 16u;
+            if (cnt < 0xFFFFu) fill_history.data[my_flat] = cur | ((cnt + 1u) << 16u);
+        } else {
+            fill_history.data[my_flat] = cur;  // new snapshot, count = 0
+        }
         return;
     }
 }

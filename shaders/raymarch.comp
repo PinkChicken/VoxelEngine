@@ -29,6 +29,16 @@ layout(set = 0, binding = 1, std430) buffer Params {
     int debug_pixel_y;
     int debug_chunk_flags; // bit 0 = chunk borders, bit 1 = active chunk tint, bit 2 =
                             // collision tint, bit 3 = density-trigger touch tint
+    // Debug material hide (2026-07-16, world.gd KEY_X): a BITMASK, one bit per material id
+    // (bit N = material N is hidden) — widened from a single material id (2026-07-16) so
+    // multiple materials can be hidden at once, e.g. rock AND oil together to see straight
+    // through a test rig's walls to whatever's submerged inside. Matched materials are
+    // treated as air by the ray, purely on the render side — voxels_a/the simulation are
+    // never touched, so cutting materials away to see what's stacked underneath a stuck-
+    // looking fluid interaction can't perturb the very physics being inspected (an earlier
+    // version of this tool destructively cleared matching voxels to real air, which was
+    // rejected for exactly that reason).
+    int debug_hide_mask;
 } params;
 layout(set = 0, binding = 2, std430) buffer OutputBuffer { uint pixels[]; } output_buf;
 layout(set = 0, binding = 3, std430) buffer CameraData {
@@ -225,6 +235,15 @@ void main() {
                 uint local_buffer_index = uint((local_voxel_pos.z * chunk_size + local_voxel_pos.y) * chunk_size + local_voxel_pos.x);
                 uint voxel_raw = voxels.data[cached_buffer_offset + local_buffer_index];
                 uint mat_id = voxel_raw & 0xFFu;
+
+                // Render-only hide (see debug_hide_mask above) — treat any material whose
+                // bit is set exactly like air for the rest of this iteration: no color, no
+                // opaque break, ray keeps marching. voxel_raw (used for the debug/cursor
+                // panel below) is left untouched, but that whole block is itself gated on
+                // mat_id != 0u, so a hidden voxel simply never sets cursor/debug info either.
+                if (mat_id != 0u && ((uint(params.debug_hide_mask) >> mat_id) & 1u) != 0u) {
+                    mat_id = 0u;
+                }
 
                 if (mat_id != 0u && !cursor_set) {
                     cursor_set = true;

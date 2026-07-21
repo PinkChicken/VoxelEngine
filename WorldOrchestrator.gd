@@ -219,6 +219,12 @@ func debug_dump_fluid_stats() -> void:
 	var grand_total_fill := 0
 	var grand_total_voxels := 0
 	var per_chunk: Array = []  # [{pos, fill, count}]
+	# Per-material breakdown (2026-07-16, added while chasing the punch conservation leak —
+	# the combined per-chunk total above can't distinguish "water settling into the pool"
+	# from "oil actually vanishing," which is exactly the question that mattered). Keyed by
+	# mat_id: total fill, voxel count, fill-weighted Y sum (for an average "surface" height
+	# that isn't skewed by counting empty/low-fill cells the same as full ones), min/max Y.
+	var per_mat: Dictionary = {}  # mat_id -> {fill, count, y_fill_sum, min_y, max_y}
 
 	for slot in range(_voxel_buf_capacity):
 		var chunk_pos: Variant = _slot_to_chunk.get(slot, null)
@@ -234,8 +240,20 @@ func debug_dump_fluid_stats() -> void:
 				continue
 			if _material_simulation[mat_id] != MaterialDef.SimulationClass.LIQUID:
 				continue
-			chunk_fill += data[off + 1]
+			var fill := data[off + 1]
+			chunk_fill += fill
 			chunk_count += 1
+
+			var local_y := (i / cs) % cs
+			var world_y: int = chunk_pos.y * cs + local_y
+			if not per_mat.has(mat_id):
+				per_mat[mat_id] = {"fill": 0, "count": 0, "y_fill_sum": 0, "min_y": world_y, "max_y": world_y}
+			var m: Dictionary = per_mat[mat_id]
+			m["fill"] += fill
+			m["count"] += 1
+			m["y_fill_sum"] += world_y * fill
+			if world_y < m["min_y"]: m["min_y"] = world_y
+			if world_y > m["max_y"]: m["max_y"] = world_y
 		if chunk_count > 0:
 			per_chunk.append({"pos": chunk_pos, "fill": chunk_fill, "count": chunk_count})
 			grand_total_fill += chunk_fill
@@ -247,6 +265,28 @@ func debug_dump_fluid_stats() -> void:
 		print("[FluidDebug]   chunk %s: total_fill=%d  liquid_voxels=%d  avg_fill=%.1f" % [entry["pos"], entry["fill"], entry["count"], avg])
 	var grand_avg: float = (float(grand_total_fill) / grand_total_voxels) if grand_total_voxels > 0 else 0.0
 	print("[FluidDebug] TOTAL fill=%d across %d liquid voxels (avg %.1f)" % [grand_total_fill, grand_total_voxels, grand_avg])
+
+	print("[FluidDebug] --- per-material breakdown ---")
+	var mat_ids: Array = per_mat.keys()
+	mat_ids.sort()
+	for mat_id in mat_ids:
+		var m: Dictionary = per_mat[mat_id]
+		# Chunk.Mat's own id->name mapping, kept local rather than depending on MaterialDB
+		# having an instance-bound lookup available from a static-style call here.
+		var mat_name: String
+		match mat_id:
+			Chunk.Mat.ROCK: mat_name = "ROCK"
+			Chunk.Mat.SAND: mat_name = "SAND"
+			Chunk.Mat.WATER: mat_name = "WATER"
+			Chunk.Mat.GLASS: mat_name = "GLASS"
+			Chunk.Mat.FIRE: mat_name = "FIRE"
+			Chunk.Mat.SMOKE: mat_name = "SMOKE"
+			Chunk.Mat.OIL: mat_name = "OIL"
+			_: mat_name = "mat%d" % mat_id
+		var avg_fill: float = float(m["fill"]) / m["count"]
+		var avg_y: float = (float(m["y_fill_sum"]) / m["fill"]) if m["fill"] > 0 else 0.0
+		print("[FluidDebug]   mat=%d (%s): total_fill=%d  voxels=%d  avg_fill=%.1f  min_y=%d  max_y=%d  fill-weighted avg_y=%.2f" \
+			% [mat_id, mat_name, m["fill"], m["count"], avg_fill, m["min_y"], m["max_y"], avg_y])
 
 # --- Debug rewind snapshot (2026-07-07) --- a CPU-side copy of the canonical voxel buffer
 # (_voxel_buf_a), so a hand-built or scripted test scenario can be captured ONCE and replayed

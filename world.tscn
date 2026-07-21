@@ -99,7 +99,12 @@ metadata/_custom_type_script = "uid://b3ee10d6jlmm0"
 script = ExtResource("12_fluid")
 phi_flood_iterations = 32
 watch_chunk = Vector3i(0, -1, 0)
-watch_local = Vector3i(0, 0, 0)
+watch_local = Vector3i(0, -2, 0)
+buoy_rest_flux = 64
+punch_threshold = 80
+punch_scale = 60
+max_reach = 1
+punch_walk_cap = 512
 steps_per_tick = 3
 gravity_bias = 1.6
 

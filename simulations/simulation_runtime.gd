@@ -1,5 +1,11 @@
 class_name SimulationRuntime extends Node
 
+# Fired once per real simulation tick, whether from run()'s accumulator (unpaused) or
+# step_once() (paused, manual single-step) — both funnel through _tick(). Added 2026-07-16
+# so world.gd's auto-F6 toggle can fire the dump after every tick without world.gd needing
+# its own tick-counter bookkeeping.
+signal tick_advanced
+
 const SIM_HZ := 60.0       # simulation ticks per second
 const MAX_CATCHUP := 1     # max ticks per render frame to prevent spiral-of-death
 
@@ -92,6 +98,7 @@ func run(delta: float) -> void:
 		_accumulator -= tick_dt
 		ticks += 1
 		_tick()
+		tick_advanced.emit()
 
 
 # Debug single-step: advances exactly one simulation tick regardless of the accumulator,
@@ -100,6 +107,7 @@ func run(delta: float) -> void:
 # accumulated time from before the pause.
 func step_once() -> void:
 	_tick()
+	tick_advanced.emit()
 
 
 func _tick() -> void:

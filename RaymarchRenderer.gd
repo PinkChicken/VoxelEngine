@@ -18,6 +18,14 @@ var _voxel_scale: float
 # reads it). Split so the buffer can stay allocated/bound (see get_density_touch_buf())
 # without forcing the tint to render, and vice versa.
 @export var debug_density_touch_tint: bool = false
+# Debug material hide (2026-07-16, world.gd KEY_X) — a BITMASK, one bit per material id
+# (bit N set = material N is hidden), so multiple materials can be hidden at once (e.g.
+# rock AND oil, to see straight through a test rig's walls to whatever's submerged inside).
+# Matched materials are treated as air by the raymarcher, purely on the render side;
+# voxels_a/the simulation are never touched, so cutting materials away to inspect what's
+# stacked underneath a stuck-looking fluid interaction can't perturb the physics being
+# inspected. 0 = nothing hidden.
+@export var debug_hide_mask: int = 0
 
 var _out_buf: RID
 var _debug_buf: RID
@@ -118,7 +126,7 @@ func _init_labels() -> void:
 
 
 func _alloc_frame_buffers() -> void:
-	var p := PackedByteArray(); p.resize(80); p.fill(0)
+	var p := PackedByteArray(); p.resize(84); p.fill(0)
 	_params_buf = _compute.buffer_upload(p)
 	var c := PackedByteArray(); c.resize(48); c.fill(0)
 	_cam_buf = _compute.buffer_upload(c)
@@ -313,7 +321,7 @@ func _render() -> void:
 
 	var mouse_pos = get_viewport().get_mouse_position()
 
-	var params_data := PackedByteArray(); params_data.resize(80)
+	var params_data := PackedByteArray(); params_data.resize(84)
 	params_data.encode_s32(0, chunk_size)
 	params_data.encode_s32(4, _output_res.x)
 	params_data.encode_s32(8, _output_res.y)
@@ -336,6 +344,7 @@ func _render() -> void:
 	var chunk_flags := (1 if debug_chunk_borders else 0) | (2 if debug_active_chunks else 0) \
 		| (8 if debug_density_touch_tint else 0)
 	params_data.encode_s32(76, chunk_flags)
+	params_data.encode_s32(80, debug_hide_mask)
 	_compute.buffer_update(_params_buf, 0, params_data)
 	_upload_active_chunks()
 	_upload_collision_chunks()
@@ -444,7 +453,23 @@ func _upload_active_chunks() -> void:
 			_granular_sim = get_node_or_null(
 				"/root/world/WorldOrchestrator/SimulationRuntime/GranularSimulation")
 		if _granular_sim:
-			positions = _granular_sim.get_active_chunk_positions()
+			positions.append_array(_granular_sim.get_active_chunk_positions())
+		# FluidSimulation's own active set (2026-07-16) — this overlay previously only
+		# reflected GranularSimulation (sand), silently useless for answering "is the fluid
+		# sim still dispatching to this chunk at all" while diagnosing a stuck submerged
+		# water body. Merged in, deduplicated below, so one overlay covers both sims.
+		if not _fluid_sim:
+			_fluid_sim = get_node_or_null(
+				"/root/world/WorldOrchestrator/SimulationRuntime/FluidSimulation")
+		if _fluid_sim:
+			positions.append_array(_fluid_sim.get_active_chunk_positions())
+	var seen := {}
+	var deduped: Array[Vector3i] = []
+	for p in positions:
+		if not seen.has(p):
+			seen[p] = true
+			deduped.append(p)
+	positions = deduped
 	var count := mini(positions.size(), 256)
 	var buf := PackedByteArray(); buf.resize(4 + count * 12); buf.fill(0)
 	buf.encode_s32(0, count)

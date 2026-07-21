@@ -1,0 +1,533 @@
+#version 450
+// momentum_resolve.comp — drains MomentumPunch's (fluid_flux.comp pass 9) demand queue.
+//
+// Phase 5 port step 2b/3 (2026-07-15) of the validated bench mechanism
+// (tools/fluid_prototypes/python/momentum_demand.py's MomentumDemandFluidSim, inheriting
+// DensityLowestSurfaceFluidSim._resolve_demand). Own separate pipeline/uniform set,
+// structurally mirroring GranularSimulation's demand_resolve.comp: a bounded-BFS WALK
+// pass (per queue entry) that finds where displaced oil should land, then an APPLY pass
+// (per touched cell) that clamps to real headroom, writes the changelog, and requeues
+// any genuine excess — the same accumulate-then-apply split GPU demand resolvers in this
+// codebase already use to make same-tick contention (two demands landing on the same
+// cell) safe, rather than writing directly from the walk pass.
+//
+// Deliberately SIMPLER than the walk this file's now-deleted predecessor
+// (density_resolve.comp, torn out 2026-07-14) implemented, because the mechanism it
+// serves is simpler: the validated config has bubble_mode="off" (never tunnel through a
+// sealing liquid) and fallback_air_rise=False (the one-step fallback only rises into
+// same-material headroom, never bare air) — see momentum_demand.py's own KNOBS/docstring
+// for why those were the winning choices (climb=0 requires displaced oil to only ever go
+// down/laterally; the removed paths were exactly the chimney seeds). So this walk tracks
+// a single running-best (lowest-y, then nearest) candidate instead of collecting and
+// sorting many, and never searches for a bubble landing.
+//
+// KNOWN DIFFERENCE FROM THE BENCH (flag for in-editor verification): the bench's BFS is
+// unbounded aside from WALK_CAP=512 (a wide search so min-Y selection can find the TRUE
+// lowest surface, not just the nearest). A 512-entry local array of visited positions per
+// invocation is real GPU register pressure; this port starts at WALK_CAP=64 (matching the
+// precedent set by the deleted density_resolve.comp for the same structural role). If
+// in-editor testing shows demands requeuing/falling back more than the bench predicts
+// (a narrower search reaches fewer candidates), raise WALK_CAP first before suspecting
+// anything else — this is the single most likely source of a behavioural gap.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer VoxelBufA { uint data[]; } voxels_a;
+layout(set = 0, binding = 1, std430) readonly buffer ChunkTable { int data[]; } chunk_table;
+
+layout(set = 0, binding = 2, std430) readonly buffer Params {
+    int chunk_size;
+    int grid_min_x; int grid_min_y; int grid_min_z;
+    int grid_span_x; int grid_span_y; int grid_span_z;
+    int pass;               // 0 = walk (populate accum/touched/requeue), 1 = apply
+    int settle_threshold;   // same rest_tol role as fluid_flux.comp's dischargeable test
+    // Orphaned-origin idle-rescue flag (2026-07-17, see the walk pass's probe block and
+    // FluidSimulation._rescue_punch_backlog): 1 ONLY when the fluid sim is otherwise
+    // asleep with a non-empty demand backlog — never during normal, churning substeps.
+    int rescue;
+    // Runtime walk cap (2026-07-17, FluidSimulation.punch_walk_cap export) — how far the
+    // min-Y BFS searches for a dischargeable surface per demand. Clamped to [1, WALK_CAP_MAX]
+    // in-shader (the visited[] array is fixed-size at compile time; only the LOOP BOUND is
+    // dynamic). Raised from the old hard-coded 64 so a deep origin in a large pool can reach
+    // a distant rising surface — see momentum_resolve.comp's file header + docs/BUG_LOG.md.
+    int walk_cap;
+} params;
+
+// Drained queue (fluid_flux.comp binding 16 is the SAME buffer, write side only there).
+layout(set = 0, binding = 3, std430) readonly buffer PunchDemandQueue {
+    uint count;
+    int entries[];   // interleaved: origin_x, origin_y, origin_z, (material | amount<<8)
+} punch_demand_queue;
+
+// Per FULL FLAT VOXEL INDEX atomicAdd accumulator — how much of `mat` wants to land here
+// this substep, summed across every demand that picked this cell as its target.
+layout(set = 0, binding = 4, std430) buffer DemandAccum { uint data[]; } demand_accum;
+
+// Cells that received at least one accumulation this substep (the walk pass registers a
+// cell here the first time it wins an atomicAdd's "prev==0" race) — the apply pass's own
+// dispatch range, so it never has to scan the whole accum buffer.
+layout(set = 0, binding = 5, std430) buffer TouchedCells {
+    uint count;
+    int entries[];   // interleaved: x, y, z, material
+} touched_cells;
+
+layout(set = 0, binding = 6, std430) buffer Changelog {
+    uint count;
+    uint entries[];   // interleaved: flat_idx, packed_value
+} changelog;
+
+// Genuinely-unresolved demands (no candidate found at all, or excess after a partial
+// deposit) — carried into NEXT substep's queue via a GPU-side buffer_copy in
+// FluidSimulation._resolve_punch_demands(), same pattern the deleted density_resolve.comp
+// established. Same interleaved shape as PunchDemandQueue.
+layout(set = 0, binding = 7, std430) buffer DemandRequeue {
+    uint count;
+    int entries[];
+} demand_requeue;
+
+layout(set = 0, binding = 8, std430) buffer DirtyChunks { uint data[]; } dirty_chunks;
+
+const uint SIM_LIQUID = 2u;
+const int FILL_CAP = 255;
+const uint MAX_CHANGELOG = 524288u;              // must match WorldOrchestrator.MAX_CHANGELOG_ENTRIES
+const uint MAX_PUNCH_DEMAND_ENTRIES = 262144u;   // must match fluid_flux.comp's own literal
+// visited[] is a fixed-size local array — GLSL cannot size it from a uniform, so the array
+// is compile-time WALK_CAP_MAX and params.walk_cap (runtime, from the editor export) is the
+// dynamic LOOP BOUND, clamped to this max.
+// Dropped 512 → 128 (2026-07-17): the in-editor walk_cap sweep proved raising reach does NOT
+// drain the buried-origin strand (64/256/512 gave ~269k/283k/286k queued — no improvement,
+// slightly worse), because the min-Y resolver buries its OWN requeue origins as the pool
+// fills bottom-up and the rising surface ends up thousands of BFS cells away, not hundreds.
+// 512 also allocated 6 KB private memory per invocation (× 262144 invocations) → wrecked
+// occupancy → visibly laggy. 128 (1.5 KB) keeps a modest experiment ceiling without the lag;
+// the real fix is the up-column rescue probe (see the walk pass), not more reach.
+const int WALK_CAP_MAX = 128;
+
+const ivec3 NEIGH6[6] = ivec3[6](
+    ivec3(1, 0, 0), ivec3(-1, 0, 0), ivec3(0, 1, 0), ivec3(0, -1, 0), ivec3(0, 0, 1), ivec3(0, 0, -1)
+);
+
+ivec3 world_to_chunk(ivec3 gpos) {
+    int cs = params.chunk_size;
+    return ivec3(
+        int(floor(float(gpos.x) / float(cs))),
+        int(floor(float(gpos.y) / float(cs))),
+        int(floor(float(gpos.z) / float(cs)))
+    );
+}
+
+int chunk_table_idx(ivec3 cp) {
+    ivec3 lcp = cp - ivec3(params.grid_min_x, params.grid_min_y, params.grid_min_z);
+    if (lcp.x < 0 || lcp.x >= params.grid_span_x ||
+        lcp.y < 0 || lcp.y >= params.grid_span_y ||
+        lcp.z < 0 || lcp.z >= params.grid_span_z) return -1;
+    return lcp.z * params.grid_span_x * params.grid_span_y + lcp.y * params.grid_span_x + lcp.x;
+}
+
+int world_to_flat(ivec3 gpos) {
+    int cs = params.chunk_size;
+    int vpc = cs * cs * cs;
+    ivec3 cp = world_to_chunk(gpos);
+    int tbl = chunk_table_idx(cp);
+    if (tbl < 0) return -1;
+    int slot = chunk_table.data[tbl];
+    if (slot < 0) return -1;
+    ivec3 lp = gpos - cp * cs;
+    return slot * vpc + lp.z * cs * cs + lp.y * cs + lp.x;
+}
+
+uint read_a(ivec3 gpos) {
+    // NOTE: "flat" is a reserved GLSL interpolation qualifier and cannot be used as a
+    // variable name (see CLAUDE.md's own GLSL gotchas) — flat_idx everywhere in this file.
+    int flat_idx = world_to_flat(gpos);
+    if (flat_idx < 0) return 0u;
+    return voxels_a.data[flat_idx];
+}
+
+void mark_dirty(int flat_idx, int vpc) {
+    int chunk_slot = flat_idx / vpc;
+    atomicOr(dirty_chunks.data[uint(chunk_slot) >> 5u], 1u << (uint(chunk_slot) & 31u));
+}
+
+// Identical role to fluid_flux.comp's own dischargeable test (density_demand.py's
+// _is_dischargeable_liquid): pos must currently BE `mat`, and is dischargeable unless it's
+// sealed under a different, non-air material AND basically full (within rest_tol of cap).
+bool is_dischargeable_liquid(ivec3 pos, uint mat) {
+    uint v = read_a(pos);
+    if ((v & 0xFFu) != mat) return false;
+    int f = int((v >> 8u) & 0xFFu);
+    ivec3 above = pos + ivec3(0, 1, 0);
+    uint am = read_a(above) & 0xFFu;
+    int rest_tol = max(1, params.settle_threshold - 1);
+    if (am != 0u && f >= FILL_CAP - rest_tol) return false;
+    return true;
+}
+
+void accumulate_at(ivec3 pos, uint mat, uint amt) {
+    if (amt == 0u) return;
+    int flat_idx = world_to_flat(pos);
+    if (flat_idx < 0) {
+        // Nowhere real to put it — requeue from the target itself rather than drop it.
+        // (2026-07-17: was `int(mat)` with NO amount packed — the entry re-read as amt=0
+        // and was discarded by the walk's early-out, i.e. this "requeue" silently dropped
+        // the whole demand. Same audit as the full-width decode fix above.)
+        uint slot = atomicAdd(demand_requeue.count, 1u);
+        if (slot < MAX_PUNCH_DEMAND_ENTRIES) {
+            demand_requeue.entries[slot * 4]     = pos.x;
+            demand_requeue.entries[slot * 4 + 1] = pos.y;
+            demand_requeue.entries[slot * 4 + 2] = pos.z;
+            demand_requeue.entries[slot * 4 + 3] = int(mat | (amt << 8u));
+        }
+        return;
+    }
+    // Reserve the touched_cells slot FIRST (2026-07-16 fix — second instance of the exact
+    // bug class fixed in fluid_flux.comp's punch pass, see its own comment there and
+    // docs/BUG_LOG.md). The OLD order added `amt` to demand_accum unconditionally, then
+    // only registered the cell in touched_cells if there was room (gated on a prev==0 race
+    // to dedupe). If touched_cells was full, the registration silently failed while the
+    // accumulation had already happened — the apply pass ONLY ever iterates cells listed in
+    // touched_cells, so that accumulated amount became permanently unreachable: real mass,
+    // sitting in demand_accum, never read again. Fixed by reserving a touched_cells slot
+    // unconditionally per call (no more prev==0 dedup) and only adding to demand_accum if
+    // that succeeds; if the queue is full, requeue the demand instead of silently losing it.
+    // Dropping the dedup means a cell CAN get multiple touched_cells entries now (one per
+    // accumulate_at call that lands there, not one per distinct cell) — harmless: the apply
+    // pass's atomicExchange-and-reset means the first entry for a cell reads the true total
+    // and zeroes it, so any duplicate entries for the same cell read 0 and no-op immediately
+    // (see the `if (total == 0u) return;` in the apply pass below). Trades a little GPU work
+    // for a hard conservation guarantee.
+    uint slot = atomicAdd(touched_cells.count, 1u);
+    if (slot >= MAX_PUNCH_DEMAND_ENTRIES) {
+        uint rslot = atomicAdd(demand_requeue.count, 1u);
+        if (rslot < MAX_PUNCH_DEMAND_ENTRIES) {
+            demand_requeue.entries[rslot * 4]     = pos.x;
+            demand_requeue.entries[rslot * 4 + 1] = pos.y;
+            demand_requeue.entries[rslot * 4 + 2] = pos.z;
+            demand_requeue.entries[rslot * 4 + 3] = int(mat | (amt << 8u));
+        }
+        return;
+    }
+    touched_cells.entries[slot * 4]     = pos.x;
+    touched_cells.entries[slot * 4 + 1] = pos.y;
+    touched_cells.entries[slot * 4 + 2] = pos.z;
+    touched_cells.entries[slot * 4 + 3] = int(mat);
+    atomicAdd(demand_accum.data[flat_idx], amt);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+
+    // === Walk (params.pass == 0) ===
+    if (params.pass == 0) {
+        if (idx >= punch_demand_queue.count) return;
+
+        ivec3 origin = ivec3(
+            punch_demand_queue.entries[idx * 4],
+            punch_demand_queue.entries[idx * 4 + 1],
+            punch_demand_queue.entries[idx * 4 + 2]
+        );
+        int packed = punch_demand_queue.entries[idx * 4 + 3];
+        uint mat = uint(packed) & 0xFFu;
+        // FULL-WIDTH amount decode (2026-07-17 fix — the THIRD punch-pipeline conservation
+        // leak, a new shape of the same GPU-port bug family; see docs/BUG_LOG.md). Fresh
+        // punch entries carry oil_fill <= 255, but the apply pass below MERGES every demand
+        // landing on one cell into a single accumulated total and requeues the overflow as
+        // `mat | (excess << 8)` at full width — in a packed pool, where many displaced-oil
+        // demands all route to the same few lowest surface cells, excess routinely exceeds
+        // 255. The old `& 0xFFu` mask here silently truncated every such requeued entry on
+        // its next walk (e.g. 700 read back as 188 — 512 fill destroyed per entry per
+        // substep, all churn-proportional and fully deterministic; measured ~23% of a 17x17
+        // x20 pool's oil across one submerged-sphere plunge). The bench cannot express this
+        // bug: it never merges demands, so no amount ever exceeds 255 there.
+        uint amt = uint(packed) >> 8u;
+        if (mat == 0u || amt == 0u) return;
+
+        // Bounded local-array BFS (see file header for the WALK_CAP tradeoff). visited[]
+        // doubles as the frontier queue: [0, head) already dequeued/processed, [head, tail)
+        // still pending. A cell is pushed at most once (checked via linear scan before
+        // adding), so no cycles and no double-processing within one invocation's walk.
+        ivec3 visited[WALK_CAP_MAX];
+        int wc = clamp(params.walk_cap, 1, WALK_CAP_MAX);  // runtime bound (editor export)
+        int tail = 0;
+        visited[tail++] = origin;   // origin itself is never a candidate, but blocks re-adding it
+        int head = 1;               // seed frontier starts at index 1 (origin occupies slot 0)
+
+        for (int d = 0; d < 6 && tail < wc; d++) {
+            ivec3 p = origin + NEIGH6[d];
+            if ((read_a(p) & 0xFFu) == mat) visited[tail++] = p;
+        }
+
+        // Orphaned-origin rescue (2026-07-17, bench-validated in momentum_demand.py — see
+        // docs/BUG_LOG.md): a requeued demand's origin can be a cell Transport has since
+        // drained to AIR (top of a collapsed transient splash pile). All 6 neighbours air
+        // means zero seeds: the demand requeues forever without progress, nothing marks
+        // dirty, and the scheduler sleeps with the mass frozen in the queue (the in-editor
+        // 269,404-fill single stranded entry). Rescue: probe straight DOWN through air to
+        // the liquid body below and seed the walk there. SCHEDULER-GATED — params.rescue
+        // is 1 only during FluidSimulation's idle-rescue drain (active set empty = nothing
+        // dirty for 4+ ticks = settled by the scheduler's own definition). Two per-cell
+        // gates were bench-rejected first (unconditional and fill-history-gated both
+        // reopened the chimney identically, climb_events=4 at peak splash — a saturated
+        // splash conduit's bytes are stable, the history signal's documented blind spot).
+        if (tail == 1 && params.rescue == 1) {
+            ivec3 p = origin;
+            for (int i = 0; i < 64; i++) {   // matches the bench's MAX_TUNNEL_HEIGHT bound
+                p.y -= 1;
+                uint pm = read_a(p) & 0xFFu;
+                if (pm == mat) { visited[tail++] = p; break; }
+                if (pm != 0u) break;   // solid or a different liquid seals the drop
+            }
+        }
+
+        int best_y = 2147483647;
+        int best_order = 2147483647;
+        ivec3 best_pos = ivec3(0);
+        ivec3 best_cell = ivec3(0);
+        bool best_valid = false;
+
+        int walked = 0;
+        while (head < tail && walked < wc) {
+            ivec3 pos = visited[head++];
+            walked++;
+
+            if (is_dischargeable_liquid(pos, mat)) {
+                uint v = read_a(pos);
+                int f = int((v >> 8u) & 0xFFu);
+                ivec3 land = (f < FILL_CAP) ? pos : (pos + ivec3(0, 1, 0));
+                if (land.y < best_y || (land.y == best_y && walked < best_order)) {
+                    best_y = land.y;
+                    best_order = walked;
+                    best_pos = land;
+                    best_cell = pos;     // the OIL cell (BFS-walkable seed for the spread below)
+                    best_valid = true;
+                }
+            }
+
+            for (int d = 0; d < 6 && tail < wc; d++) {
+                ivec3 p = pos + NEIGH6[d];
+                if ((read_a(p) & 0xFFu) != mat) continue;   // only same-material cells are ever
+                                                              // real frontier entries — a non-
+                                                              // matching neighbour is cheap to
+                                                              // re-read_a() from another path, but
+                                                              // must NEVER occupy a WALK_CAP slot
+                                                              // (it isn't part of the walkable body
+                                                              // and would burn the tiny budget on
+                                                              // dead ends if it did — bug found and
+                                                              // fixed while writing this pass).
+                bool seen = false;
+                for (int k = 0; k < tail; k++) {
+                    if (visited[k] == p) { seen = true; break; }
+                }
+                if (!seen) visited[tail++] = p;
+            }
+        }
+
+        // Seed for the deposit spread below: normally the min-Y surface cell the walk found;
+        // if the walk found nothing (deeply buried origin) the up-column probe supplies one.
+        ivec3 seed = best_cell;
+        bool have_seed = best_valid;
+
+        // Up-column rescue (2026-07-17, port of momentum_demand.py's buried-origin fix —
+        // bench-validated: drains the strand, climb_events=0 on the waterfall; see
+        // docs/BUG_LOG.md). A BURIED origin (packed same-material oil above it) whose BFS
+        // can't reach a dischargeable surface within walk_cap — the min-Y resolver fills the
+        // pool bottom-up and buries its own requeue origins, so the rising surface is
+        // thousands of BFS cells away, unreachable at any practical walk_cap (proven
+        // in-editor: 64/256/512 all strand the same ~1056 voxels). Physically the displaced
+        // oil rises up its OWN column to the local surface, then SPREADS across it (it does
+        // not tunnel sideways through the packed body, nor up through water).
+        //
+        // UN-GATED (unlike the down-probe): fires only when the BFS found NO surface — a
+        // DEEPLY buried origin, which only happens in a large/deep pool. The waterfall pool
+        // is shallow so displaced oil is always within walk_cap of its surface and this never
+        // fires there (bench-confirmed climb_events=0 UN-gated). Running un-gated lets it
+        // drain during normal active resolve — essential in-editor, where the pool may never
+        // reach the full-idle state an idle gate needed, so an idle-gated probe never fired
+        // and the strand never drained (and the has_work backlog kept the sim oscillating =
+        // "never settles" flashing).
+        //
+        // LATERAL SPREAD (not single-cell): climb origin's column to the local surface, then
+        // run a bounded BFS across the surface accumulating ~one cell's worth at EACH surface
+        // landing (air above full oil, or a partial-fill surface cell) until `amt` is spent.
+        // Depositing into many cells per pass drains a ~1000-voxel strand in a handful of
+        // passes instead of 255/tick over ~1000 ticks — the single-best version drained so
+        // slowly the pool never visibly settled.
+        if (!have_seed) {
+            // Climb to the LOCAL SURFACE. A cell is the surface ONLY if the cell above it is
+            // AIR — being partial-fill is NOT enough (2026-07-18 bugfix, caught in-editor): a
+            // BURIED cell sitting at fill 254 from ordinary churn was treated as "the surface",
+            // so the climb stopped at the origin itself, the lateral spread ran from a buried
+            // cell where nothing is dischargeable, and the demand requeued forever with zero
+            // progress (`[Rescue] fired but made NO progress`, oil max_y FELL instead of rising).
+            // The bench missed it because its pool is pristine 255-fill so origins were always
+            // full; in-editor, churn leaves cells at 254 constantly.
+            ivec3 p = origin;
+            for (int i = 0; i < 64; i++) {   // MAX_TUNNEL_HEIGHT bound
+                uint pm = read_a(p) & 0xFFu;
+                if (pm != mat) break;                       // not our material — bail
+                ivec3 up = p + ivec3(0, 1, 0);
+                uint um = read_a(up) & 0xFFu;
+                if (um == 0u) { seed = p; have_seed = true; break; }  // air above => p is the surface
+                if (um != mat) break;                       // water/solid seal — can't rise through
+                p = up;                                     // same material above — keep climbing
+            }
+        }
+
+        // UNIFIED DEPOSIT SPREAD (2026-07-18). Runs for BOTH paths — the ordinary min-Y result
+        // and the up-column rescue — because the old code dumped the WHOLE demand at a single
+        // cell (`accumulate_at(best_pos, mat, amt)`) and let the apply pass requeue whatever
+        // didn't fit. With min-Y deliberately choosing the LOWEST landing, that target is
+        // typically a partial-fill surface cell whose headroom is 1-2 (churn leaves cells at
+        // 253-254), NOT the air above a full cell (headroom 255). So a large demand moved ~2
+        // fill per pass, re-dirtied its chunk every tick, and effectively never drained: the
+        // in-editor "oil keeps twitching / never settles / queue stuck at ~580 voxels".
+        // Spreading across many surface cells with headroom-exact placement is what the Python
+        // bench always did (`_write_at` places min(amt, headroom) and carries the remainder to
+        // the NEXT candidate) — this brings the GPU port in line.
+        if (have_seed) {
+            {
+                // Fresh lateral BFS from the seed (reset visited — the min-Y walk filled it with
+                // body cells; the surface spread needs the full budget).
+                uint left = amt;
+                tail = 0;
+                visited[tail++] = seed;
+                int lhead = 0;
+                int lwalked = 0;
+                while (lhead < tail && lwalked < wc && left > 0u) {
+                    ivec3 c = visited[lhead++];
+                    lwalked++;
+                    if (is_dischargeable_liquid(c, mat)) {
+                        uint cv = read_a(c);
+                        uint cf = (cv >> 8u) & 0xFFu;
+                        ivec3 land = (cf < uint(FILL_CAP)) ? c : (c + ivec3(0, 1, 0));
+                        // Place only what this cell can ACTUALLY take (2026-07-18 fix — the
+                        // throughput bug that made the in-editor queue drain glacially and the
+                        // sim never settle). Previously this handed every landing a flat 255;
+                        // but real surface cells sit at fill 253-254 from churn, so headroom is
+                        // 1-2 — the cell absorbed 2 and the apply pass requeued the other 253,
+                        // EVERY pass. Net effect: ~2 fill moved per cell per tick, chunks
+                        // re-dirtied forever, queue never drained. The bench never had this
+                        // because its _write_at places min(amt, headroom) and carries the
+                        // remainder to the NEXT candidate; this now matches that behaviour, so
+                        // one pass fills many cells to the brim instead of thrashing one.
+                        uint lv = read_a(land);
+                        uint lm = lv & 0xFFu;
+                        uint lf = (lv >> 8u) & 0xFFu;
+                        uint headroom = 0u;
+                        if (lm == 0u)        headroom = uint(FILL_CAP);            // air: full cell
+                        else if (lm == mat)  headroom = uint(FILL_CAP) - lf;       // partial: what's left
+                        if (headroom > 0u) {
+                            uint place = min(left, headroom);
+                            accumulate_at(land, mat, place);
+                            left -= place;
+                        }
+                    }
+                    for (int d = 0; d < 6 && tail < wc; d++) {
+                        ivec3 q = c + NEIGH6[d];
+                        if ((read_a(q) & 0xFFu) != mat) continue;
+                        bool seen = false;
+                        for (int k = 0; k < tail; k++) { if (visited[k] == q) { seen = true; break; } }
+                        if (!seen) visited[tail++] = q;
+                    }
+                }
+                if (left > 0u) {
+                    // Budget/amt not fully placed this pass — requeue the remainder from the
+                    // SEED (a surface cell), so the next pass continues the spread from the
+                    // surface rather than from a buried origin.
+                    uint rq = atomicAdd(demand_requeue.count, 1u);
+                    if (rq < MAX_PUNCH_DEMAND_ENTRIES) {
+                        demand_requeue.entries[rq * 4]     = seed.x;
+                        demand_requeue.entries[rq * 4 + 1] = seed.y;
+                        demand_requeue.entries[rq * 4 + 2] = seed.z;
+                        demand_requeue.entries[rq * 4 + 3] = int(mat | (left << 8u));
+                    }
+                }
+                return;
+            }
+        }
+
+        // Fallback: ONE-step rise, same-material headroom only (fallback_air_rise=False —
+        // the validated policy; rising into bare air was the last chimney seed, see
+        // momentum_demand.py's own comment on this exact knob).
+        ivec3 above = origin + ivec3(0, 1, 0);
+        uint av = read_a(above);
+        uint amat = av & 0xFFu;
+        uint afill = (av >> 8u) & 0xFFu;
+        if (amat == mat && afill < uint(FILL_CAP)) {
+            accumulate_at(above, mat, amt);
+            return;
+        }
+
+        // Nowhere to go at all this substep — requeue from the original origin.
+        uint slot = atomicAdd(demand_requeue.count, 1u);
+        if (slot < MAX_PUNCH_DEMAND_ENTRIES) {
+            demand_requeue.entries[slot * 4]     = origin.x;
+            demand_requeue.entries[slot * 4 + 1] = origin.y;
+            demand_requeue.entries[slot * 4 + 2] = origin.z;
+            demand_requeue.entries[slot * 4 + 3] = int(mat | (amt << 8u));
+        }
+        return;
+    }
+
+    // === Apply (params.pass == 1) ===
+    if (params.pass == 1) {
+        if (idx >= touched_cells.count) return;
+
+        ivec3 pos = ivec3(
+            touched_cells.entries[idx * 4],
+            touched_cells.entries[idx * 4 + 1],
+            touched_cells.entries[idx * 4 + 2]
+        );
+        uint mat = uint(touched_cells.entries[idx * 4 + 3]);
+
+        int flat_idx = world_to_flat(pos);
+        if (flat_idx < 0) return;
+
+        uint total = atomicExchange(demand_accum.data[flat_idx], 0u);
+        if (total == 0u) return;
+
+        uint cv = voxels_a.data[flat_idx];
+        uint cmat = cv & 0xFFu;
+        uint cfill = (cv >> 8u) & 0xFFu;
+
+        uint headroom;
+        uint base_fill;
+        if (cmat == 0u) {
+            headroom = uint(FILL_CAP);
+            base_fill = 0u;
+        } else if (cmat == mat) {
+            headroom = uint(FILL_CAP) - cfill;
+            base_fill = cfill;
+        } else {
+            // Occupied by something else this tick (shouldn't happen for a candidate the
+            // walk pass validated against pre-dispatch state, but the world can only have
+            // changed via THIS SAME dispatch's own punch writes, already committed before
+            // this pipeline ran — defensive, not expected in practice).
+            headroom = 0u;
+            base_fill = cfill;
+        }
+
+        uint placed = min(total, headroom);
+        uint excess = total - placed;
+
+        if (placed > 0u) {
+            uint log_slot = atomicAdd(changelog.count, 1u);
+            if (log_slot < MAX_CHANGELOG) {
+                changelog.entries[log_slot * 2u]      = uint(flat_idx);
+                changelog.entries[log_slot * 2u + 1u] = mat | ((base_fill + placed) << 8u);
+            }
+            int cs = params.chunk_size;
+            mark_dirty(flat_idx, cs * cs * cs);
+        }
+
+        if (excess > 0u) {
+            uint slot = atomicAdd(demand_requeue.count, 1u);
+            if (slot < MAX_PUNCH_DEMAND_ENTRIES) {
+                demand_requeue.entries[slot * 4]     = pos.x;
+                demand_requeue.entries[slot * 4 + 1] = pos.y;
+                demand_requeue.entries[slot * 4 + 2] = pos.z;
+                demand_requeue.entries[slot * 4 + 3] = int(mat | (excess << 8u));
+            }
+        }
+    }
+}
