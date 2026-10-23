@@ -48,14 +48,30 @@ class_name MPMSimulation extends Node
 # Chunk edge length in cells. Must equal ChunkManager.chunk_size — every chunk→cell conversion
 # below uses this, and activation/readout assume chunks tile the grid exactly.
 @export var n_grid: int = 32
-@export var sim_dt: float = 1.0e-4
 @export var gravity: float = 9.8
-# Particle capacity for the whole region. Was per-chunk; a region spanning N chunks now shares
-# one budget, so a lake spread over 3 chunks has 4000 particles total, not 12000. Raise this as
-# part of S3 once a real lake is the test case (see docs/MIGRATION_MPM.md §7.2).
-@export var max_particles: int = 4000
-# Cap on how many chunks may be active at once (bounds the region's grid).
-@export var max_active_chunks: int = 8
+
+# SIMULATED SECONDS ADVANCED PER REAL TICK. Substep dt is derived from this and the substep
+# count, so there is ONE pacing knob instead of two that must agree.
+#
+# This replaces a hardcoded `sim_dt = 1.0e-4` with 24 substeps: that advanced only 2.4e-3 s per
+# tick, i.e. 0.144 s of simulation per real second — water fell at roughly a SEVENTH of real
+# speed, which is the "falls really slowly" report. At 1/60 with 24 substeps the substep dt is
+# 6.94e-4, still far under the MPM CFL limit for this port (sound speed ≈ sqrt(E/ρ) ≈ 89, so
+# dt_max ≈ 1.1e-2), so real time is comfortably stable. Raise it for slow-motion, lower it if a
+# violent impact starts blowing up.
+@export var sim_seconds_per_tick: float = 1.0 / 60.0
+
+# Particle capacity for the WHOLE region (not per chunk). One full 32³ chunk of water is 32768
+# voxels, so the old 4000 could not represent even an eighth of a single chunk — and the
+# promotion scan fills in ascending y, so overflow truncated the TOP of a poured sphere. 64K
+# holds two full chunks; raising it costs ~7 MB of particle buffers per region.
+@export var max_particles: int = 65536
+# Cap on how many chunks may be active at once (bounds the region's grid). 8 was too tight for
+# anything but an isolated puddle: water reaching the edge of an un-simulated chunk sees a hard
+# wall and piles up it, which is the "climbs up that wall" report. 16 doubles the reach without
+# letting the bounding box get big enough to tank the per-substep dispatch cost — the real
+# driver of cost is the BOX, not the chunk count, so this is a balance point, not a free win.
+@export var max_active_chunks: int = 16
 # Hard ceiling on region grid nodes. 1M nodes ≈ 60 MB of grid buffers (60 B/node) and ≈ 15.6k
 # workgroups per pass. Exceeded → the chunk that would cross it is refused, not allocated.
 const MAX_REGION_NODES := 1048576
@@ -101,6 +117,10 @@ var _region: ChunkRegion = null
 var _active_chunks: Dictionary = {}  # Vector3i -> true
 var _warned_budget := false
 var _warned_region_cap := false
+var _warned_capacity := false
+# Substep dt actually uploaded to the shaders; recomputed from sim_seconds_per_tick.
+var sim_dt: float = 1.0e-4
+var _applied_sim_dt: float = -1.0
 
 # Shared across the region (one grid resolution).
 var dx: float
@@ -480,22 +500,105 @@ func add_particle(w: ChunkRegion, local_pos: Vector3, mat_id: int, mass: float) 
 func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> void:
 	if not is_setup:
 		return
-	var reactivated: Dictionary = {}  # chunk_pos -> true, chunks added by THIS call
+
+	# PASS 1 — resolve every chunk this edit touches BEFORE any geometry work. A sphere across
+	# a chunk boundary used to add one chunk at a time, and each addition rebuilt the region and
+	# re-ran the full promotion scan (a whole-chunk GPU readback + 32k voxel lookups). One edit
+	# spanning N chunks therefore cost N rebuilds — the stutter reported on every sphere drop.
+	var new_chunks: Array[Vector3i] = []
 	for idx in positions.size():
-		var wp: Vector3i = positions[idx]
+		if not _is_mpm_material(material_ids[idx]):
+			continue
+		var cp := _chunk_of(positions[idx])
+		if _active_chunks.has(cp) or new_chunks.has(cp):
+			continue
+		new_chunks.append(cp)
+
+	var grew := false
+	for cp in new_chunks:
+		if _active_chunks.size() >= max_active_chunks:
+			if not _warned_budget:
+				push_warning("MPMSimulation: max_active_chunks=%d exhausted — %d chunk(s) from this edit left unsimulated (they will act as walls until a slot frees)." % [max_active_chunks, new_chunks.size()])
+				_warned_budget = true
+			break
+		if not _would_fit(cp):
+			if not _warned_region_cap:
+				push_warning("MPMSimulation: region grid would exceed MAX_REGION_NODES=%d including %s — refusing to grow." % [MAX_REGION_NODES, cp])
+				_warned_region_cap = true
+			break
+		_active_chunks[cp] = true
+		grew = true
+	if grew:
+		_ensure_region()  # exactly ONE rebuild + reseed for the whole edit
+
+	# PASS 2 — append only voxels in chunks that were ALREADY active. A voxel in a chunk that
+	# just activated is already covered by promote_existing_voxels() (edit_apply.comp writes
+	# _voxel_buf_a before this signal fires), so appending it again would duplicate it.
+	if _region == null:
+		return
+	var add_pos: Array[Vector3] = []
+	var add_mat: Array[int] = []
+	var add_mass: Array[float] = []
+	for idx in positions.size():
 		var mat_id: int = material_ids[idx]
 		if not _is_mpm_material(mat_id):
 			continue
+		var wp: Vector3i = positions[idx]
 		var cp := _chunk_of(wp)
-		if not _active_chunks.has(cp):
-			if not _try_add_chunk(cp):
-				continue  # budget/cap refused, already warned
-			reactivated[cp] = true
-			continue
-		if _region == null or reactivated.has(cp):
+		if new_chunks.has(cp) or not _region.chunks.has(cp):
 			continue
 		var def := _material_db.get_def(mat_id)
-		add_particle(_region, _region_local(wp), mat_id, def.mpm_density * p_vol)
+		add_pos.append(_region_local(wp))
+		add_mat.append(mat_id)
+		add_mass.append(def.mpm_density * p_vol)
+	_append_particles(_region, add_pos, add_mat, add_mass)
+
+
+# Bulk append — one buffer_update per ATTRIBUTE for the whole batch, instead of the 8 per
+# particle that add_particle() costs (a 500-voxel sphere was 4000 individual GPU uploads, the
+# other half of the placement stutter). add_particle() stays for single-voxel placement.
+func _append_particles(w: ChunkRegion, local_pos: Array[Vector3], mats: Array[int], masses: Array[float]) -> int:
+	var count := local_pos.size()
+	if count == 0:
+		return 0
+	var room := max_particles - w.n_particles
+	if count > room:
+		push_warning("MPMSimulation: appending %d particle(s) but only %d slot(s) free — dropping the excess." % [count, maxi(room, 0)])
+		count = room
+		if count <= 0:
+			return 0
+
+	var base := w.n_particles
+	var pos := PackedFloat32Array(); pos.resize(count * 3)
+	var vel := PackedFloat32Array(); vel.resize(count * 3)
+	var cc  := PackedFloat32Array(); cc.resize(count * 9)
+	var jj  := PackedFloat32Array(); jj.resize(count)
+	var mt  := PackedInt32Array();   mt.resize(count)
+	var ms  := PackedFloat32Array(); ms.resize(count)
+	var al  := PackedInt32Array();   al.resize(count)
+	var ff  := PackedFloat32Array(); ff.resize(count * 9)
+	for i in count:
+		var p: Vector3 = local_pos[i]
+		pos[i*3] = p.x; pos[i*3+1] = p.y; pos[i*3+2] = p.z
+		jj[i] = 1.0
+		mt[i] = mats[i]
+		ms[i] = masses[i]
+		al[i] = 1
+		ff[i*9] = 1.0; ff[i*9+4] = 1.0; ff[i*9+8] = 1.0  # F = identity
+
+	_compute.buffer_update(w.pos, base * 3 * 4, pos.to_byte_array())
+	_compute.buffer_update(w.vel, base * 3 * 4, vel.to_byte_array())
+	_compute.buffer_update(w.C, base * 9 * 4, cc.to_byte_array())
+	_compute.buffer_update(w.J, base * 4, jj.to_byte_array())
+	_compute.buffer_update(w.mat, base * 4, mt.to_byte_array())
+	_compute.buffer_update(w.mass, base * 4, ms.to_byte_array())
+	_compute.buffer_update(w.alive, base * 4, al.to_byte_array())
+	_compute.buffer_update(w.F, base * 9 * 4, ff.to_byte_array())
+
+	w.n_particles += count
+	w.groups_particles = int(ceil(float(w.n_particles) / 64.0))
+	_upload_region_params(w)
+	return count
 
 
 func _upload_region_params(w: ChunkRegion) -> void:
@@ -572,22 +675,42 @@ func tick_all(substeps_per_tick: int) -> void:
 	if w == null or w.n_particles == 0:
 		return
 
-	_run_region_substeps(w, substeps_per_tick)
-	_readout_region(w)  # writes voxel state every tick; return value drives nothing here
+	# Derive the substep dt from the single pacing knob (see sim_seconds_per_tick).
+	var want_dt := sim_seconds_per_tick / maxf(float(substeps_per_tick), 1.0)
+	if not is_equal_approx(want_dt, _applied_sim_dt):
+		_applied_sim_dt = want_dt
+		sim_dt = want_dt
+		_upload_region_params(w)
 
-	var vel := read_velocities(w)
+	_run_region_substeps(w, substeps_per_tick)
+	var changed := _readout_region(w)
+
+	# IDLE DETECTION — cheap signal first. An empty readout dirty-set means the grid wrote
+	# nothing back this tick, which needs no extra GPU→CPU round trip because the bitmask was
+	# already downloaded. The previous version called read_velocities() EVERY tick, which
+	# downloads the whole particle position buffer (a per-tick stall) and requires max speed to
+	# fall under REST_SPEED — a threshold MPM particles jitter above indefinitely, so the region
+	# never slept. That is the "chunks stay active and I can't modify them" report. Velocity is
+	# now only consulted once the voxel world has already gone quiet, as confirmation.
+	if not changed.is_empty():
+		w.idle_ticks = 0
+		return
+
+	w.idle_ticks += 1
+	if w.idle_ticks < IDLE_THRESHOLD:
+		return
+
 	var max_speed := 0.0
+	var vel := read_velocities(w)
 	for i in w.n_particles:
 		var spd := Vector3(vel[i*3], vel[i*3+1], vel[i*3+2]).length()
 		max_speed = max(max_speed, spd)
 
 	if max_speed < REST_SPEED:
-		w.idle_ticks += 1
-		if w.idle_ticks >= IDLE_THRESHOLD:
-			# Everything is at rest and already written back to voxels. Sleep the region and
-			# clear the intent set; a later edit or a streamed chunk re-activates from voxels.
-			_active_chunks.clear()
-			_destroy_region()
+		# Everything is at rest and already written back to voxels. Sleep the region and clear
+		# the intent set; a later edit or a streamed chunk re-activates from voxels.
+		_active_chunks.clear()
+		_destroy_region()
 	else:
 		w.idle_ticks = 0
 
@@ -609,6 +732,19 @@ func _run_region_substeps(w: ChunkRegion, substeps: int) -> void:
 # Does NOT emit WorldOrchestrator.chunks_committed (see the note in _on_voxels_placed's
 # counterpart discussion in MIGRATION_MPM.md §2 — CA is off, nothing else consumes it yet).
 func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
+	# CAPACITY INTERLOCK — the cause of "I can no longer add or modify those chunks".
+	# readout writes AIR into any node whose grid mass is below threshold. A water voxel the
+	# player just placed, in a region whose particle set is already full, has NO particle — so
+	# readout would erase it on the very next tick, and every subsequent edit vanishes the same
+	# way. When the particle set cannot represent the region, stop writing back instead of
+	# corrupting the world.
+	if w.n_particles >= max_particles:
+		if not _warned_capacity:
+			push_warning("MPMSimulation: max_particles=%d reached — readout SUSPENDED so it cannot erase voxels that have no particle. Raise max_particles or reduce active chunks." % max_particles)
+			_warned_capacity = true
+		var none: Array[Vector3i] = []
+		return none
+
 	var zero_dirty := PackedByteArray(); zero_dirty.resize(DIRTY_BUF_BYTES); zero_dirty.fill(0)
 	_compute.buffer_update(w.dirty_chunks_buf, 0, zero_dirty)
 	_orchestrator.reset_changelog()
