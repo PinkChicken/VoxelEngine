@@ -349,8 +349,16 @@ func _mpm_status_dump() -> void:
 		float(simulation_runtime.last_mpm_tick_usec) / 1000.0))
 	print("  faces holding material: %s  (bit0=-X bit1=+X bit2=-Y bit3=+Y bit4=-Z bit5=+Z)" % (
 		_mpm_face_names(int(info["faces"]))))
+	print("  water physics: density %.2f  stiffness %.0f  viscosity %.1f   (O cycles presets; sliders in the remote Inspector)" % [
+		mpm_simulation.water_density, mpm_simulation.water_stiffness, mpm_simulation.water_viscosity])
 	print("  timescale: %.4f s/tick  (T cycles the ladder: 1/60 1/120 1/240 1/480 1/30)" % (
 		mpm_simulation.sim_seconds_per_tick))
+	# Cost warning: grid buffers are ~60 bytes/node and are REALLOCATED on every window move, so
+	# an oversized window shows up as multi-frame hitches, not just a higher average.
+	var nodes := int(info["nodes"])
+	if nodes > 600000:
+		print("  WARNING: %d nodes (~%d MB of grid buffers) — every window move reallocates all of it, which is where the 90ms hitches come from. Prefer 2x2x2 = 262,144." % [
+			nodes, int(float(nodes) * 60.0 / 1048576.0)])
 
 
 # THE TEST (2026-08-12, brief §37) — proves MPM's activity is genuinely player-independent:
