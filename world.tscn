@@ -113,7 +113,7 @@ enabled = false
 
 [node name="MPMSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=918273645]
 script = ExtResource("13_mpm")
-max_active_chunks = 32
+max_active_chunks = 64
 
 [node name="MaterialDB" type="Node" parent="." unique_id=1815152731]
 script = ExtResource("8_udhof")

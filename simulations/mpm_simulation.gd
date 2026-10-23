@@ -292,6 +292,14 @@ func is_simulating() -> bool:
 	return _region != null and _region.n_particles > 0
 
 
+# Throw the region away and rebuild it from voxels on the next tick, keeping the requested set.
+# Used when something OUTSIDE the simulation state changes what the shaders must bind — e.g. a
+# material parameter edit rebuilds MaterialDB's mpm buffer, which would leave the region's uniform
+# sets pointing at a freed handle.
+func hard_rebuild() -> void:
+	_destroy_region()
+
+
 # Step the timescale ladder. Returns a human-readable summary for the console.
 func cycle_timescale(substeps: int) -> String:
 	_timescale_index = (_timescale_index + 1) % TIMESCALE_LADDER.size()
@@ -986,6 +994,10 @@ const REST_SPEED := 0.02
 func tick_all(substeps_per_tick: int) -> void:
 	if not is_bound():
 		return
+	# Rebuild on demand (hard_rebuild / material change): the region is created lazily, so a tick
+	# that arrives with no region but a non-empty requested set must reconstruct it.
+	if _region == null and not _active_chunks.is_empty():
+		_ensure_region()
 	var w := _region
 	if w == null or w.n_particles == 0:
 		return
@@ -1350,6 +1362,12 @@ func region_grid_info() -> Dictionary:
 		# The single most useful field for "why isn't the region following the water".
 		"faces": _region.face_mask,
 		"occupied": _region.occupied.size(),
+		# Window extent in CHUNK coords, so the dump shows where the box actually is relative to
+		# wherever material was dropped.
+		"window_min": Vector3i(_region.origin.x / n_grid, _region.origin.y / n_grid, _region.origin.z / n_grid),
+		"window_max": Vector3i(_region.origin.x / n_grid, _region.origin.y / n_grid, _region.origin.z / n_grid) + region_chunks - Vector3i.ONE,
+		"region_chunks": region_chunks,
+		"occupied_list": _region.occupied.keys(),
 	}
 
 

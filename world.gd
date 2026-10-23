@@ -7,6 +7,7 @@ extends Node3D
 @onready var fluid_simulation: FluidSimulation = $WorldOrchestrator/SimulationRuntime/FluidSimulation
 @onready var mpm_simulation: MPMSimulation = $WorldOrchestrator/SimulationRuntime/MPMSimulation
 @onready var raymarch_renderer = $RaymarchRenderer
+@onready var material_db = $MaterialDB
 
 # Watch-voxel indicator (2026-07-04) — a red wireframe box always rendered at
 # FluidSimulation.watch_chunk/watch_local so it's visible while testing (e.g.
@@ -88,7 +89,8 @@ void fragment() {
 func _mpm_stress() -> void:
 	var vs: float = chunk_manager.voxel_scale
 	var center := Vector3i(player.global_position / vs) + Vector3i(0, 20, 0)
-	print("[MPMStress] spawning a radius-11 WATER body at voxel %s (~5.6k voxels, ~5.6k particles)" % center)
+	print("[MPMStress] spawning a radius-11 WATER body at voxel %s -> chunk %s (~5.6k voxels, ~5.6k particles)" % [
+		center, chunk_manager.voxel_to_chunk_position(center)])
 	world_orchestrator.edit_add_sphere(center, 11.0, 3)  # 3 = WATER
 	if not simulation_runtime.log_mpm_perf:
 		print("[MPMStress] perf logging is OFF — press G to start reporting 60-tick averages, Y for region state")
@@ -103,6 +105,31 @@ func _mpm_toggle_perf() -> void:
 	simulation_runtime.reset_perf_window()
 	print("[MPMPerf] %s" % (
 		"ON — a 60-tick average prints after each window" if simulation_runtime.log_mpm_perf else "off"))
+
+
+# Material parameter sweep — MPM physics only, applied to WATER (id 3). Ordered so pressing O walks
+# one axis of behaviour at a time: stiffness first, then viscosity, then density.
+const MPM_PARAM_PRESETS := [
+	{"name": "baseline",             "density": 1.0,  "stiffness": 8000.0,  "viscosity": 0.0},
+	{"name": "very soft (E/16)",     "density": 1.0,  "stiffness": 500.0,   "viscosity": 0.0},
+	{"name": "soft (E/4)",           "density": 1.0,  "stiffness": 2000.0,  "viscosity": 0.0},
+	{"name": "stiff (Ex4)",          "density": 1.0,  "stiffness": 32000.0, "viscosity": 0.0},
+	{"name": "very stiff (Ex16)",    "density": 1.0,  "stiffness": 128000.0,"viscosity": 0.0},
+	{"name": "viscous",              "density": 1.0,  "stiffness": 8000.0,  "viscosity": 10.0},
+	{"name": "heavy (density 4)",    "density": 4.0,  "stiffness": 8000.0,  "viscosity": 0.0},
+	{"name": "light (density 0.25)", "density": 0.25, "stiffness": 8000.0,  "viscosity": 0.0},
+]
+var _mpm_preset_index: int = 0
+
+
+func _mpm_cycle_material() -> void:
+	_mpm_preset_index = (_mpm_preset_index + 1) % MPM_PARAM_PRESETS.size()
+	var p: Dictionary = MPM_PARAM_PRESETS[_mpm_preset_index]
+	material_db.override_mpm(3, p["density"], p["stiffness"], p["viscosity"])
+	# The region's uniform sets hold the old MaterialDB RID, so it must be rebuilt, not reused.
+	mpm_simulation.hard_rebuild()
+	print("[MPM params] %s — density %.2f, stiffness %.0f, viscosity %.1f (region rebuilt from voxels)" % [
+		p["name"], p["density"], p["stiffness"], p["viscosity"]])
 
 
 # KEY_Z — drop the MPM region without touching the world. Distinct from R (full terrain regen):
@@ -196,6 +223,11 @@ func _unhandled_input(event: InputEvent) -> void:
 			# that actually matters: is the fluid meta-stable because the substep is too coarse?
 			# Watch whether the body still expands to fill its container as dt gets finer.
 			print("[MPM] %s" % mpm_simulation.cycle_timescale(simulation_runtime.mpm_substeps_per_tick))
+		elif event.keycode == KEY_O:
+			# Material parameter sweep (2026-08-13). Cycles WATER's MPM physics through a ladder of
+			# presets and rebuilds the region, so "is the boundary a solver/parameter problem or a
+			# container problem" is one keypress per hypothesis instead of one build.
+			_mpm_cycle_material()
 		elif event.keycode == KEY_H:
 			# Punch trigger tint (mode 2, Phase 5 port step 2a) — marks every cell the
 			# momentum PUNCH would fire on: a liquid arriving with real downward flux
@@ -304,6 +336,12 @@ func _mpm_status_dump() -> void:
 	var requested := mpm_simulation.requested_chunk_positions()
 	if not requested.is_empty():
 		print("  requested (drives budget + growth): %s" % [requested])
+	# Window extent and the material's own chunk extents, so the dump answers "where is the box
+	# relative to my water" directly. NOTE: the window is sized by region_chunks (default 2x2x2 =
+	# 8 chunks), NOT by max_active_chunks — that export is the old growth budget and does nothing
+	# for a fixed window.
+	print("  window chunks %s .. %s  (region_chunks %s)" % [info["window_min"], info["window_max"], info["region_chunks"]])
+	print("  occupied chunks: %s" % [info["occupied_list"]])
 	# On-demand timing — no averaging window needed, and no CLI flag.
 	print("  last tick: %.2f ms  (G to log 60-tick averages, B to spawn a stress water body)" % (
 		float(simulation_runtime.last_mpm_tick_usec) / 1000.0))

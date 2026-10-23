@@ -140,6 +140,20 @@ func _default_materials() -> Array[MaterialDef]:
 	return [air, rock, sand, water, glass, fire, smoke, oil]
 
 
+# Live override of an MPM material's physics, for the parameter-sweep diagnostic (KEY_O in
+# world.gd). Rebuilds both GPU mirrors. The CALLER must also force MPMSimulation to rebuild its
+# region, because the region's uniform sets hold the old mpm_buffer_rid.
+func override_mpm(mat_id: int, mpm_density: float, mpm_stiffness: float, mpm_viscosity: float) -> void:
+	var def := get_def(mat_id)
+	if not def:
+		return
+	def.mpm_density = mpm_density
+	def.mpm_stiffness = mpm_stiffness
+	def.mpm_viscosity = mpm_viscosity
+	build_buffer()
+	build_mpm_buffer()
+
+
 func build_buffer() -> void:
 	if buffer_rid.is_valid():
 		_compute.free_rid(buffer_rid)
