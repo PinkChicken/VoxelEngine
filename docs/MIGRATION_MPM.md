@@ -83,7 +83,38 @@ Both are unbuilt today (Phase 8/9 are empty design slots), so nothing is lost.
 - Passes: `clear_grid`, `p2g`, `grid_op`, `g2p`, `readout`; `readout.comp` writes simulated
   mass back into the canonical `_voxel_buf_a`, guarded against overwriting STATIC voxels.
 
-**Not done:** cross-chunk particle handoff; water parity vs CA; the CA deletion.
+**Not done:** water parity vs CA; the CA deletion.
+
+### 2.1 Cross-chunk continuity — shared region grid (2026-08-13)
+
+The per-chunk-window model is gone. It had **four** walls, not the one the old header admitted,
+and all four lived in the shaders:
+
+| # | wall | where |
+|---|---|---|
+| 1 | out-of-grid P2G nodes dropped → kernel mass lost, phantom free surface | `p2g.comp` bounds check |
+| 2 | out-of-grid G2P nodes dropped → velocity/affine under-weighted | `g2p.comp` bounds check |
+| 3 | **position clamped to `[0, n_grid)`** → particles physically could not cross | `g2p.comp` clamp |
+| 4 | 3-cell velocity damping band at every edge → a soft wall | `grid_op.comp` (`P.bound`) |
+
+**Replacement:** one `ChunkRegion` covers the **bounding box of all active chunks**, and the grid
+is rectangular (`dims: Vector3i`) instead of a cube. Chunk boundaries inside the region are now
+ordinary interior nodes — no special handling anywhere. The four walls above survive only at the
+true edge of the simulated domain, where they are correct.
+
+Consequences worth knowing:
+
+- **Particle capacity is now region-wide**, not per-chunk (`max_particles` = 4000 total, not
+  4000 × chunks). This is the next thing to raise.
+- **Idle is a region property.** A chunk going quiet next to a flowing neighbour is not a reason
+  to drop anything — that would tear a shared grid mid-simulation.
+- **Rebuilds re-seed from voxels.** Region geometry only changes when the active chunk set
+  changes (a rare, structural event), and a rebuild re-seeds particles from the voxel world, so
+  in-flight velocities are lost across one. Acceptable, documented, not per-tick.
+- **Far-apart active chunks waste grid** between them, because the region is one bounding box.
+  `MAX_REGION_NODES` (1M ≈ 60 MB) bounds this by refusing to grow and warning, rather than
+  allocating gigabytes. The refinement — one region per *connected component* — is deliberately
+  deferred; it adds merge/split bookkeeping without changing anything a contiguous lake sees.
 
 ---
 
@@ -98,10 +129,11 @@ Both are unbuilt today (Phase 8/9 are empty design slots), so nothing is lost.
 
 Override without editing scenes: `-- mpm` or `-- ca` on the command line.
 
-**Why CA is still the default:** MPM is pilot-scale (4000 particles/chunk, 8 active chunks) and
-would visibly degrade the game if it were the only solver today. CA remains the working baseline
-*and* the reference oracle MPM water is validated against. Flipping the default is the cutover
-step (§5, S4) — one export in `world.tscn`.
+**Why MPM is now the default (2026-08-13):** the CA solvers are already `enabled = false` in
+`world.tscn` — the scene had been switched to MPM by hand before the gate existed, so a CA
+default made the world sit completely still (nothing to step, and MPM gated off). MPM is what
+actually runs. CA remains selectable with `-- ca`, **but both CA nodes must also be re-enabled in
+`world.tscn`** before CA produces motion, because their own `enabled` export is authoritative.
 
 ---
 
@@ -122,7 +154,7 @@ append `-- mpm` after the scene path.
 
 ## 5. Cutover order
 
-**S1 — Done.** Gate the solvers; stop paying for both engines.
+**S1 — Done (2026-08-13).** Gate the solvers; stop paying for both engines.
 Acceptance: boot log shows exactly one solver mode; only that solver's passes appear in the
 frame.
 
@@ -131,12 +163,16 @@ a waterfall, the two shapes that broke the CA mechanisms).
 Acceptance: visually indistinguishable at the same voxel scale; no settling deadlock; no volume
 drift.
 
-**S3 — Cross-chunk continuity.** Solve the seam flagged in `mpm_simulation.gd`'s header: a particle
-on a chunk boundary must hand off to the neighbouring chunk's grid.
-Acceptance: a lake spanning ≥3 chunks behaves as one body; a waterfall crossing chunks does not
-shed particles at the boundary. **This is the real gate — without it MPM cannot replace CA.**
+**S3 — Implemented 2026-08-13, NOT yet verified in-engine.** The shared region grid replaces the
+four per-chunk walls (§2.1).
+Acceptance (still to be observed, not assumed): a lake spanning ≥3 chunks behaves as one body; a
+waterfall crossing chunks does not shed or pile particles at a boundary; a body of water poured
+across a chunk seam settles flat with no ridge at the seam. **This is the real gate — without it
+MPM cannot replace CA.**
 
-**S4 — Flip the default to MPM** and validate sand (repose angle) alongside water.
+**S4 — Partially done (2026-08-13):** the default is now MPM (the CA nodes were already disabled
+in the scene). Still open: raising `max_particles` above its region-wide 4000, and validating
+sand's repose angle alongside water.
 
 **S5 — Delete the CA solvers** (§6 manifest). Re-validate collision, rendering, and edits after.
 
@@ -179,13 +215,21 @@ sentinel) once nothing reads them.
 
 ## 7. Open risks
 
-1. **Cross-chunk seam (S3)** is the load-bearing unknown. Each active chunk simulates on its own
-   grid today. A wide lake is the failure case and it is *not* hypothetical for this project's
-   terrain.
-2. **Particle budget.** 4000/chunk × 8 chunks. A real lake will exceed this; decide the policy
-   (raise the budget, coarsen, or two-tier) before S3 closes.
-3. **Static terrain is read per substep.** `grid_op.comp` reads `_voxel_buf_a` for no-slip, adding
+1. **Region footprint (replaces the old cross-chunk seam risk).** One bounding box over all active
+   chunks means far-apart material buys a large mostly-empty grid. `MAX_REGION_NODES` refuses
+   rather than over-allocates, so the failure mode is "a distant chunk silently doesn't simulate",
+   which is a correctness trade, not a crash. Per-connected-component regions are the fix if it
+   ever bites.
+2. **Particle budget is now shared.** 4000 total across the whole region. A lake spanning 3
+   chunks has a third of what it had under per-chunk budgets. Raise this before judging water
+   quality — and re-check the fixed-point `fp_scale` derivation (§36.3) when you do.
+3. **Rebuilds discard in-flight velocity** by re-seeding from voxels. Only on chunk-set changes,
+   but a waterfall spawning new active chunks mid-fall could visibly hiccup.
+4. **Static terrain is read per substep.** `grid_op.comp` reads `_voxel_buf_a` for no-slip, adding
    a read dependency between MPM and the canonical buffer that CA didn't have. Measure it.
-4. **Parity is a human judgement**, not a test. Use the U-tube and waterfall scenes, and the same
-   in-editor-first discipline §5 prescribes: confirm a change is live with an unmistakable visual
-   marker before trusting a bench result.
+5. **None of the 2026-08-13 work is verified in-engine.** The agent's sandbox cannot load a Godot
+   project at all (§4), so the shader/driver signature change and the region logic are static
+   review only. Treat the first run as the real test.
+6. **Parity is a human judgement**, not a test. Use the U-tube and waterfall scenes, and the same
+   in-editor-first discipline §5 of `ARCHITECTURE.md` prescribes: confirm a change is live with an
+   unmistakable visual marker before trusting a bench result.

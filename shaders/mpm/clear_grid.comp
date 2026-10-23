@@ -5,9 +5,12 @@ layout(local_size_x = 64) in;
 // scatters into them this substep.
 
 layout(set = 0, binding = 0, std430) readonly buffer Params {
-	int n_grid; int n_particles; int bound; int pad0;
+	// Rectangular region grid (2026-08-13) — was a single cube edge `n_grid`. One region now
+	// spans the bounding box of several chunks, so the grid is a box, not a cube. Must match
+	// MPMSimulation._upload_region_params() byte for byte.
+	int dim_x; int dim_y; int dim_z; int n_particles;
 	float dt; float dx; float inv_dx; float gravity;
-	float p_vol; float fp_scale; float pad1; float pad2;
+	float p_vol; float fp_scale; int bound; int pad0;
 } P;
 layout(set = 0, binding = 8, std430)  buffer GMom     { int data[]; } g_mom;
 layout(set = 0, binding = 9, std430)  buffer GMass    { int data[]; } g_mass;
@@ -20,8 +23,7 @@ const uint NMAT = 8u;
 
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
-	int ng = P.n_grid;
-	uint G = uint(ng) * uint(ng) * uint(ng);
+	uint G = uint(P.dim_x) * uint(P.dim_y) * uint(P.dim_z);
 	if (idx >= G) return;
 
 	g_mass.data[idx] = 0;

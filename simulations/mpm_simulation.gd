@@ -10,24 +10,29 @@ class_name MPMSimulation extends Node
 # not via register_simulation()/get_simulation_class() — that path assumes one sim instance per
 # SimulationClass bit, and MPM owns several materials across GRANULAR+LIQUID at once.
 #
-# ACTIVE-CHUNK MODEL (2026-08-12, revised after user pushback on an earlier per-player-window
-# design — "the simulation shouldn't be player-dependent; a waterfall behind the player
-# shouldn't stop"): reuses the EXACT pattern GranularSimulation/FluidSimulation already use —
-# _active_chunks: Dictionary[Vector3i, idle_ticks], a chunk goes active when disturbed, sleeps
-# after 4 consecutive idle ticks (GranularSimulation's own threshold, matched here) — rather
-# than inventing a separate "window near the player" concept. Each active chunk gets its OWN
-# MPM grid+particle buffers (a ChunkRegion), sized exactly to that chunk (n_grid = chunk_size,
-# origin = chunk_pos * chunk_size) — chunk-aligned, not centered on anything. Activation is
-# driven by real world state: EditDispatcher.voxels_placed (a player/spell/explosion placed
-# MPM-eligible material) and chunk.active_simulation_mask() at boot + as chunks stream in
-# (chunk_loaded) — never by player/camera position. A continuously flowing waterfall never
-# goes idle, so it never sleeps, regardless of where the player is looking.
+# CROSS-CHUNK CONTINUITY (2026-08-13 — this replaces the per-chunk-window model).
+# The original design gave EVERY active chunk its own independent 32³ grid, and its own header
+# flagged the consequence as an unsolved seam: "a particle exactly on a chunk boundary doesn't
+# hand off cleanly to the neighboring chunk's grid... Fine for now (isolated ponds/piles)."
+# It was not fine — it was three separate walls, all in the shaders:
+#   1. p2g.comp  bounds-checked nodes out of the cube (`node >= ng → continue`), so a particle
+#      within one cell of the boundary lost part of its quadratic B-spline kernel: mass vanished
+#      into the void and the particle saw a phantom free surface.
+#   2. g2p.comp  did the same on the gather, so velocity/affine were only partially weighted.
+#   3. g2p.comp  clamped position to [0, ng) — particles literally could not cross at all.
+#   4. grid_op.comp damped a 3-cell band (P.bound) at every edge, i.e. a soft wall.
 #
-# KNOWN TRADEOFF, flagged not hidden: each active chunk simulates on its OWN grid, independent
-# of its neighbors. A particle exactly on a chunk boundary doesn't hand off cleanly to the
-# neighboring chunk's grid the way granular/fluid's shared sparse-buffer dispatch does — this
-# is a real seam, not solved here. Fine for now (isolated ponds/piles); revisit if cross-chunk
-# continuity (a wide lake spanning many chunks) turns out to matter in practice.
+# The fix is a SHARED GRID: one region covers the bounding box of all active chunks, so chunk
+# boundaries that fall inside it are now interior nodes with no special handling at all, and the
+# four walls above only exist at the true edge of the simulated domain — where they're correct.
+# Grids are no longer cubes (`dims: Vector3i`), which is the whole shader-side change.
+#
+# TRADEOFF, stated rather than hidden: a single region is the bounding box of ALL active chunks,
+# so two far-apart puddles waste grid between them. With max_active_chunks small and contiguous
+# material (a lake, a waterfall) this is nothing; MAX_REGION_NODES bounds the pathological case
+# by refusing to grow rather than allocating gigabytes. The refinement — one region per
+# CONNECTED component (union-find over face-adjacency) — is deliberately deferred: it multiplies
+# the bookkeeping (merge/split on activation) without changing anything a contiguous lake sees.
 #
 # Uses Utils/compute_helper.gd like every other GPU system in this project — its
 # ComputeHelper.new() shares the single static RenderingDevice all of them run on, so this
@@ -40,31 +45,45 @@ class_name MPMSimulation extends Node
 # Grid is LOCKED to real voxel resolution: dx is always 1.0 (one MPM cell = one voxel) — the
 # "no snap" design (brief §15-18, Part III): the MPM background grid IS the voxel grid.
 
-@export var n_grid: int = 32  # kept equal to ChunkManager.chunk_size — see class header
+# Chunk edge length in cells. Must equal ChunkManager.chunk_size — every chunk→cell conversion
+# below uses this, and activation/readout assume chunks tile the grid exactly.
+@export var n_grid: int = 32
 @export var sim_dt: float = 1.0e-4
 @export var gravity: float = 9.8
-# Per-CHUNK particle capacity. Smaller than the old single-window default (20000) since each
-# active chunk now gets its own buffers and there can be several simultaneously — see
-# max_active_chunks below for the real resource cap.
+# Particle capacity for the whole region. Was per-chunk; a region spanning N chunks now shares
+# one budget, so a lake spread over 3 chunks has 4000 particles total, not 12000. Raise this as
+# part of S3 once a real lake is the test case (see docs/MIGRATION_MPM.md §7.2).
 @export var max_particles: int = 4000
-# Hard cap on simultaneously active chunks (each with its own full grid+particle buffer set).
-# A real resource budget, matching the project's "active tier" philosophy (brief §19.1) —
-# activation requests beyond this are dropped (logged once, not spammed), not queued.
+# Cap on how many chunks may be active at once (bounds the region's grid).
 @export var max_active_chunks: int = 8
+# Hard ceiling on region grid nodes. 1M nodes ≈ 60 MB of grid buffers (60 B/node) and ≈ 15.6k
+# workgroups per pass. Exceeded → the chunk that would cross it is refused, not allocated.
+const MAX_REGION_NODES := 1048576
 const BOUND := 3
 const NMAT := 8  # must match clear_grid.comp/p2g.comp's NMAT — the render mass-breakdown slot count
 const DIRTY_BUF_BYTES := 64  # matches GranularSimulation's own constant/convention
-const IDLE_THRESHOLD := 4    # ticks with no readout change before a chunk sleeps — matches
-							  # GranularSimulation's own threshold (granular_simulation.gd)
+const IDLE_THRESHOLD := 4    # ticks with no motion before the whole region sleeps — matches
+							 # GranularSimulation's own threshold (granular_simulation.gd)
 # Target magnitude for a busy grid node's fixed-point accumulator (fp_scale is derived from
 # this, not hardcoded — §36.3 found a fixed magic constant silently rounds low-density
 # materials to zero at one dx and silently overflows int32 at another).
 const NODE_BUDGET := 1.0e7
 
-# --- Per-chunk simulation state ---
 class ChunkRegion:
+	# Grid extent in CELLS and its world-cell origin. dims is a multiple of n_grid per axis and
+	# covers the bounding box of `chunks`, so more than one chunk can live in one grid.
+	var dims: Vector3i = Vector3i.ZERO
+	var origin: Vector3i = Vector3i.ZERO
+	# The chunks this region was built for (snapshot of the active set at build time).
+	var chunks: Array[Vector3i] = []
+	# Cheap fingerprint of `chunks`, so _ensure_region() can tell "same chunk set" from "same
+	# count but different members" without comparing arrays (Vector3i has no natural order to
+	# sort by). Mismatch on either dims/origin or signature forces a rebuild.
+	var signature: int = 0
+
 	var n_particles: int = 0
 	var groups_particles: int = 0
+	var groups_grid: int = 0
 	var idle_ticks: int = 0
 
 	var params_buf: RID
@@ -75,15 +94,19 @@ class ChunkRegion:
 
 	var set_clear: RID; var set_p2g: RID; var set_grid_op: RID; var set_g2p: RID; var set_readout: RID
 
-var _windows: Dictionary = {}  # Vector3i chunk_pos -> ChunkRegion
+# The one live region, or null when nothing is being simulated.
+var _region: ChunkRegion = null
+# Chunks that currently WANT to be simulated. Region geometry is always derived from this set,
+# never edited directly — _ensure_region() is the only thing that builds grids.
+var _active_chunks: Dictionary = {}  # Vector3i -> true
 var _warned_budget := false
+var _warned_region_cap := false
 
-# Shared across all windows (same n_grid for every chunk).
+# Shared across the region (one grid resolution).
 var dx: float
 var inv_dx: float
 var p_vol: float
 var fp_scale: float
-var _groups_grid: int = 0
 
 var _material_db: MaterialDB
 var _compute
@@ -119,14 +142,13 @@ func _verify_material_table() -> void:
 
 
 # Compiles shared shader pipelines, resolves the real WorldOrchestrator/ChunkManager, and
-# connects to the signals that drive chunk activation. Call once. Allocates NO per-chunk
-# buffers here — those come from _activate_chunk() as chunks actually need them.
+# connects to the signals that drive chunk activation. Call once. Allocates NO grid buffers
+# here — those come from _ensure_region() as chunks actually need them.
 func setup() -> bool:
 	dx = 1.0
 	inv_dx = 1.0
 	p_vol = pow(dx * 0.5, 3.0)
 	fp_scale = NODE_BUDGET / p_vol
-	_groups_grid = int(ceil(float(n_grid * n_grid * n_grid) / 64.0))
 
 	_clear   = _compute.compile_shader(_load_shader("res://shaders/mpm/clear_grid.comp"))
 	_p2g     = _compute.compile_shader(_load_shader("res://shaders/mpm/p2g.comp"))
@@ -159,55 +181,151 @@ func is_bound() -> bool:
 	return is_instance_valid(_orchestrator)
 
 
+# --- chunk → cell helpers -------------------------------------------------------------
+
+func _chunk_of(world_voxel: Vector3i) -> Vector3i:
+	var s := n_grid
+	return Vector3i(floori(float(world_voxel.x) / s), floori(float(world_voxel.y) / s), floori(float(world_voxel.z) / s))
+
+
+func _region_local(world_voxel: Vector3i) -> Vector3:
+	return Vector3(world_voxel - _region.origin) + Vector3(0.5, 0.5, 0.5)
+
+
+func _is_mpm_material(mat_id: int) -> bool:
+	if mat_id == 0:
+		return false
+	var def := _material_db.get_def(mat_id)
+	return def != null and (def.mpm_model == MaterialDef.MPMModel.FLUID
+		or def.mpm_model == MaterialDef.MPMModel.GRANULAR)
+
+
+# --- activation (intent only; geometry follows) ---------------------------------------
+
 # Player-independent discovery: checks EVERY currently loaded chunk's cheap, already-maintained
 # active_simulation_mask() (Chunk.rebuild_counts_and_mask(), zero per-voxel scanning) for
-# GRANULAR/LIQUID material and activates a window for any that qualify, up to budget. Called
-# once from setup() and again from _on_chunk_loaded() as new chunks stream in — so a persistent
-# lake somewhere the player has never looked still gets discovered and simulated, matching
-# "not player-dependent."
+# GRANULAR/LIQUID material and requests those chunks. Called once from setup() and again from
+# _on_chunk_loaded() as new chunks stream in — so a persistent lake somewhere the player has
+# never looked still gets discovered and simulated, matching "not player-dependent."
 func scan_loaded_chunks_for_existing_material() -> void:
 	const CANDIDATE_MASK := 1 | 2  # SIM_BITS[GRANULAR] | SIM_BITS[LIQUID]
-	for cp in _chunk_manager.chunks.keys():
-		if _windows.has(cp):
+	for key in _chunk_manager.chunks.keys():
+		var cp: Vector3i = key
+		if _active_chunks.has(cp):
 			continue
 		var chunk: Chunk = _chunk_manager.chunks[cp]
 		if chunk.active_simulation_mask() & CANDIDATE_MASK != 0:
-			_activate_chunk(cp)
+			_try_add_chunk(cp)
 
 
 func _on_chunk_loaded(chunk_pos: Vector3i) -> void:
-	if not is_setup or _windows.has(chunk_pos):
+	if not is_setup or _active_chunks.has(chunk_pos):
 		return
 	var chunk: Chunk = _chunk_manager.chunks.get(chunk_pos)
 	if not chunk:
 		return
 	const CANDIDATE_MASK := 1 | 2
 	if chunk.active_simulation_mask() & CANDIDATE_MASK != 0:
-		_activate_chunk(chunk_pos)
+		_try_add_chunk(chunk_pos)
 
 
-# Allocates a full grid+particle buffer set for one chunk and binds its STATIC no-slip read to
-# the real voxel world at origin = chunk_pos * n_grid. Immediately scans that chunk for
-# existing MPM-eligible material (promote_existing_voxels) so a chunk discovered via a single
-# placed grain also picks up any pre-existing water/sand already there, not just the one voxel
-# that triggered activation. Returns the new ChunkRegion, or null if the budget is exhausted.
-func _activate_chunk(chunk_pos: Vector3i) -> ChunkRegion:
-	if _windows.size() >= max_active_chunks:
+# Would adding `cp` keep the region grid within MAX_REGION_NODES? Computed on the prospective
+# bounding box, so a refusal leaves the existing region untouched.
+func _would_fit(cp: Vector3i) -> bool:
+	var bmin := cp
+	var bmax := cp
+	for key in _active_chunks:
+		var c: Vector3i = key
+		bmin = Vector3i(mini(bmin.x, c.x), mini(bmin.y, c.y), mini(bmin.z, c.z))
+		bmax = Vector3i(maxi(bmax.x, c.x), maxi(bmax.y, c.y), maxi(bmax.z, c.z))
+	var d := (bmax - bmin + Vector3i.ONE) * n_grid
+	return int(d.x) * int(d.y) * int(d.z) <= MAX_REGION_NODES
+
+
+# Request a chunk be simulated. Returns true if it is now part of the active set. Adding a
+# chunk changes the region bounding box, so this rebuilds the region (and re-seeds particles
+# from the voxel world) whenever the geometry actually changes.
+func _try_add_chunk(cp: Vector3i) -> bool:
+	if _active_chunks.has(cp):
+		return true
+	if _active_chunks.size() >= max_active_chunks:
 		if not _warned_budget:
-			push_warning("MPMSimulation: max_active_chunks=%d exhausted, dropping activation at %s" % [max_active_chunks, chunk_pos])
+			push_warning("MPMSimulation: max_active_chunks=%d exhausted, dropping request at %s" % [max_active_chunks, cp])
 			_warned_budget = true
-		return null
+		return false
+	if not _would_fit(cp):
+		if not _warned_region_cap:
+			push_warning("MPMSimulation: region grid would exceed MAX_REGION_NODES=%d including %s — refusing to grow (far-apart active chunks are the cause; see class header's TRADEOFF)" % [MAX_REGION_NODES, cp])
+			_warned_region_cap = true
+		return false
+	_active_chunks[cp] = true
+	_ensure_region()
+	return true
 
+
+# (Re)builds the region if its geometry no longer matches the active set. This is the ONLY
+# place grid buffers are created. Rebuilding re-seeds particles from the voxel world (which is
+# the authoritative, readout-written state), so in-flight velocities are lost across a rebuild
+# — acceptable because rebuilds only happen when the region's chunk set changes, which is a
+# rare, structural event, not a per-tick one.
+func _ensure_region() -> bool:
+	if _active_chunks.is_empty():
+		_destroy_region()
+		return false
+
+	var bmin := Vector3i(2147483647, 2147483647, 2147483647)
+	var bmax := Vector3i(-2147483648, -2147483648, -2147483648)
+	var chunks: Array[Vector3i] = []
+	for key in _active_chunks:
+		var c: Vector3i = key
+		chunks.append(c)
+		bmin = Vector3i(mini(bmin.x, c.x), mini(bmin.y, c.y), mini(bmin.z, c.z))
+		bmax = Vector3i(maxi(bmax.x, c.x), maxi(bmax.y, c.y), maxi(bmax.z, c.z))
+
+	var dims := (bmax - bmin + Vector3i.ONE) * n_grid
+	var origin := bmin * n_grid
+	var sig := _active_signature()
+
+	if _region != null and _region.dims == dims and _region.origin == origin:
+		if _region.signature == sig:
+			return false
+		# Same bbox, different membership — keep the grid, re-seed particles from the voxel
+		# world so the new chunk's material is picked up.
+		_region.chunks = chunks
+		_region.signature = sig
+		promote_existing_voxels(_region, chunks)
+		return false
+
+	_destroy_region()
+	_region = _build_region(origin, dims, chunks)
+	_region.signature = sig
+	return true
+
+
+# Order-independent fingerprint of the active chunk set (positional hash combine).
+func _active_signature() -> int:
+	var h := 0
+	for key in _active_chunks:
+		var c: Vector3i = key
+		h = (h * 73856093) ^ (int(c.x) * 19349663) ^ (int(c.y) * 83492791) ^ (int(c.z) * 2654435761)
+	return h
+
+
+func _build_region(origin: Vector3i, dims: Vector3i, chunks: Array[Vector3i]) -> ChunkRegion:
 	var w := ChunkRegion.new()
-	var gnodes := n_grid * n_grid * n_grid
-	w.g_mom      = _new_zero_buf(gnodes * 3 * 4)
-	w.g_mass     = _new_zero_buf(gnodes * 4)
-	w.g_vel      = _new_zero_buf(gnodes * 3 * 4)
-	w.g_mass_mat = _new_zero_buf(gnodes * NMAT * 4)
+	w.origin = origin
+	w.dims = dims
+	w.chunks = chunks
+
+	var nodes := int(dims.x) * int(dims.y) * int(dims.z)
+	w.groups_grid = int(ceil(float(nodes) / 64.0))
+	w.g_mom      = _new_zero_buf(nodes * 3 * 4)
+	w.g_mass     = _new_zero_buf(nodes * 4)
+	w.g_vel      = _new_zero_buf(nodes * 3 * 4)
+	w.g_mass_mat = _new_zero_buf(nodes * NMAT * 4)
 	w.params_buf = _new_zero_buf(48)
 	w.dirty_chunks_buf = _new_zero_buf(DIRTY_BUF_BYTES)
 
-	var origin := chunk_pos * n_grid
 	w.voxel_params_buf = _new_zero_buf(48)
 	var b := PackedByteArray(); b.resize(48)
 	b.encode_s32(0, _chunk_manager.chunk_size)
@@ -220,7 +338,6 @@ func _activate_chunk(chunk_pos: Vector3i) -> ChunkRegion:
 	w.voxel_buf_a = _orchestrator.get_voxel_buf()
 	w.chunk_table = _orchestrator.get_chunk_table()
 
-	# Empty particle buffers (max_particles capacity) — seed_particles()/add_particle() below fill them.
 	var cap := max_particles
 	w.pos   = _new_zero_buf(cap * 3 * 4)
 	w.vel   = _new_zero_buf(cap * 3 * 4)
@@ -231,47 +348,42 @@ func _activate_chunk(chunk_pos: Vector3i) -> ChunkRegion:
 	w.alive = _new_zero_buf(cap * 4)
 	w.F     = _new_zero_buf(cap * 9 * 4)
 
-	_upload_window_params(w)
-	_build_window_sets(w)
-	_windows[chunk_pos] = w
-
-	promote_existing_voxels(chunk_pos, w)
+	_upload_region_params(w)
+	_build_region_sets(w)
+	promote_existing_voxels(w, chunks)
 	return w
 
 
-func _deactivate_chunk(chunk_pos: Vector3i) -> void:
-	var w: ChunkRegion = _windows.get(chunk_pos)
+func _destroy_region() -> void:
+	var w := _region
+	_region = null
 	if not w:
 		return
 	for rid in [w.params_buf, w.pos, w.vel, w.C, w.J, w.mat, w.mass, w.alive, w.F,
-			w.g_mom, w.g_mass, w.g_vel, w.g_mass_mat,
-			w.voxel_params_buf, w.dirty_chunks_buf]:
+		w.g_mom, w.g_mass, w.g_vel, w.g_mass_mat,
+		w.voxel_params_buf, w.dirty_chunks_buf]:
 		if rid.is_valid():
 			_compute.free_rid(rid)
-	_windows.erase(chunk_pos)
 
 
-# ONE-SHOT: seeds particles from whatever FLUID/GRANULAR-modeled voxels currently exist in
-# this chunk, so a newly-activated window doesn't just represent the one voxel that triggered
-# it — a whole pre-existing pond in that chunk gets picked up too.
-func promote_existing_voxels(chunk_pos: Vector3i, w: ChunkRegion) -> int:
-	var origin := chunk_pos * n_grid
-	_orchestrator.sync_chunk_to_cpu(chunk_pos)  # block_data is stale-by-design (CLAUDE.md)
-
+# Seeds particles from whatever FLUID/GRANULAR-modeled voxels currently exist in the given
+# chunks, so a newly-activated region isn't just the one voxel that triggered it — a whole
+# pre-existing pond is picked up too, including ponds in the NEIGHBOURING chunks that share
+# this grid (which is the point: they're one body of water now).
+func promote_existing_voxels(w: ChunkRegion, chunks: Array[Vector3i]) -> int:
 	var found_pos: Array[Vector3i] = []
 	var found_mat: Array[int] = []
-	for ly in range(n_grid):
-		for lz in range(n_grid):
-			for lx in range(n_grid):
-				var wp := origin + Vector3i(lx, ly, lz)
-				var mat := _orchestrator.query_voxel_material(wp)
-				if mat == 0:
-					continue
-				var def := _material_db.get_def(mat)
-				if def and (def.mpm_model == MaterialDef.MPMModel.FLUID
-						or def.mpm_model == MaterialDef.MPMModel.GRANULAR):
-					found_pos.append(wp)
-					found_mat.append(mat)
+	for cp in chunks:
+		var origin := cp * n_grid
+		_orchestrator.sync_chunk_to_cpu(cp)  # block_data is stale-by-design (CLAUDE.md)
+		for ly in range(n_grid):
+			for lz in range(n_grid):
+				for lx in range(n_grid):
+					var wp := origin + Vector3i(lx, ly, lz)
+					var mat := _orchestrator.query_voxel_material(wp)
+					if _is_mpm_material(mat):
+						found_pos.append(wp)
+						found_mat.append(mat)
 
 	var n := found_pos.size()
 	if n == 0:
@@ -280,7 +392,7 @@ func promote_existing_voxels(chunk_pos: Vector3i, w: ChunkRegion) -> int:
 		var wp := found_pos[i]
 		var mat_id := found_mat[i]
 		var def := _material_db.get_def(mat_id)
-		var local := Vector3(wp - origin) + Vector3(0.5, 0.5, 0.5)  # voxel center
+		var local := Vector3(wp - w.origin) + Vector3(0.5, 0.5, 0.5)  # voxel center, region-local
 		return {"pos": local, "mat": mat_id, "mass": def.mpm_density * p_vol}
 	)
 	return n
@@ -298,7 +410,7 @@ func _new_zero_buf(size: int) -> RID:
 	return _compute.buffer_upload(b)
 
 
-# seed_fn(i) -> Dictionary { pos: Vector3 (LOCAL to the window's chunk origin, voxel units),
+# seed_fn(i) -> Dictionary { pos: Vector3 (LOCAL to the REGION origin, voxel units),
 # mat: int, mass: float }
 func seed_particles(w: ChunkRegion, n: int, seed_fn: Callable) -> void:
 	if n > max_particles:
@@ -333,15 +445,15 @@ func seed_particles(w: ChunkRegion, n: int, seed_fn: Callable) -> void:
 	_compute.buffer_update(w.mass, 0, ms.to_byte_array())
 	_compute.buffer_update(w.alive, 0, al.to_byte_array())
 	_compute.buffer_update(w.F, 0, ff.to_byte_array())
-	_upload_window_params(w)
+	_upload_region_params(w)
 
 
-# Continuous promotion: appends ONE particle into a window's unused tail capacity — a
+# Continuous promotion: appends ONE particle into the region's unused tail capacity — a
 # buffer_update() write at index n_particles plus incrementing it, NOT a reseed. No pipeline/
-# uniform-set rebuild needed. Returns false if this window's max_particles is exhausted.
+# uniform-set rebuild needed. Returns false if max_particles is exhausted.
 func add_particle(w: ChunkRegion, local_pos: Vector3, mat_id: int, mass: float) -> bool:
 	if w.n_particles >= max_particles:
-		push_warning("MPMSimulation.add_particle(): window max_particles=%d exhausted" % max_particles)
+		push_warning("MPMSimulation.add_particle(): max_particles=%d exhausted" % max_particles)
 		return false
 	var i: int = w.n_particles
 
@@ -356,50 +468,50 @@ func add_particle(w: ChunkRegion, local_pos: Vector3, mat_id: int, mass: float) 
 
 	w.n_particles += 1
 	w.groups_particles = int(ceil(float(w.n_particles) / 64.0))
-	_upload_window_params(w)
+	_upload_region_params(w)
 	return true
 
 
-# EditDispatcher/WorldOrchestrator.voxels_placed handler — activates a window for the placed
-# voxel's chunk if one doesn't already exist (budget permitting), then promotes the voxel into
-# a particle. Chunk-keyed, not window/player-position-keyed — placing sand/water anywhere in
-# any loaded chunk works identically, near the player or not.
+# EditDispatcher/WorldOrchestrator.voxels_placed handler. edit_apply.comp writes straight into
+# _voxel_buf_a, so by the time this fires the placed voxels ARE in the voxel world — meaning a
+# chunk that has to (re)activate already gets them via promote_existing_voxels(), and calling
+# add_particle() on top of that would insert a duplicate. Only voxels landing in a chunk that
+# was ALREADY part of the region need the incremental append.
 func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> void:
 	if not is_setup:
 		return
+	var reactivated: Dictionary = {}  # chunk_pos -> true, chunks added by THIS call
 	for idx in positions.size():
 		var wp: Vector3i = positions[idx]
 		var mat_id: int = material_ids[idx]
-		var def := _material_db.get_def(mat_id)
-		if not def or (def.mpm_model != MaterialDef.MPMModel.FLUID and def.mpm_model != MaterialDef.MPMModel.GRANULAR):
+		if not _is_mpm_material(mat_id):
 			continue
+		var cp := _chunk_of(wp)
+		if not _active_chunks.has(cp):
+			if not _try_add_chunk(cp):
+				continue  # budget/cap refused, already warned
+			reactivated[cp] = true
+			continue
+		if _region == null or reactivated.has(cp):
+			continue
+		var def := _material_db.get_def(mat_id)
+		add_particle(_region, _region_local(wp), mat_id, def.mpm_density * p_vol)
 
-		var chunk_pos := Vector3i(floori(float(wp.x) / n_grid), floori(float(wp.y) / n_grid), floori(float(wp.z) / n_grid))
-		var w: ChunkRegion = _windows.get(chunk_pos)
-		if not w:
-			w = _activate_chunk(chunk_pos)
-			if not w:
-				continue  # budget exhausted, already warned
-		w.idle_ticks = 0
-		var origin := chunk_pos * n_grid
-		var local_pos := Vector3(wp - origin) + Vector3(0.5, 0.5, 0.5)
-		add_particle(w, local_pos, mat_id, def.mpm_density * p_vol)
 
-
-func _upload_window_params(w: ChunkRegion) -> void:
+func _upload_region_params(w: ChunkRegion) -> void:
 	var b := PackedByteArray(); b.resize(48)
-	b.encode_s32(0, n_grid)
-	b.encode_s32(4, w.n_particles)
-	b.encode_s32(8, BOUND)
-	b.encode_s32(12, 0)
+	b.encode_s32(0, w.dims.x)
+	b.encode_s32(4, w.dims.y)
+	b.encode_s32(8, w.dims.z)
+	b.encode_s32(12, w.n_particles)
 	b.encode_float(16, sim_dt)
 	b.encode_float(20, dx)
 	b.encode_float(24, inv_dx)
 	b.encode_float(28, gravity)
 	b.encode_float(32, p_vol)
 	b.encode_float(36, fp_scale)
-	b.encode_float(40, 0.0)
-	b.encode_float(44, 0.0)
+	b.encode_s32(40, BOUND)
+	b.encode_s32(44, 0)
 	_compute.buffer_update(w.params_buf, 0, b)
 
 
@@ -411,7 +523,7 @@ func _u(binding: int, rid: RID) -> RDUniform:
 	return un
 
 
-func _build_window_sets(w: ChunkRegion) -> void:
+func _build_region_sets(w: ChunkRegion) -> void:
 	w.set_clear = _compute.create_uniform_set([
 		_u(0, w.params_buf), _u(8, w.g_mom), _u(9, w.g_mass), _u(12, w.g_mass_mat)
 	], _clear.shader)
@@ -444,66 +556,64 @@ func _build_window_sets(w: ChunkRegion) -> void:
 # grid cell for several consecutive ticks without crossing a voxel boundary, producing
 # identical readout output while genuinely still accelerating — which hit IDLE_THRESHOLD and
 # deactivated chunks that were still actively falling, exactly the "waterfall stops" failure
-# this whole redesign exists to prevent, just one layer deeper than player-position coupling.
+# this whole design exists to prevent, just one layer deeper than player-position coupling.
 # Velocity is the actual physical quantity that means "at rest," not a proxy for it.
 const REST_SPEED := 0.02
 
-# Public entry point — call ONCE per real simulation tick (SimulationRuntime._tick()). Runs
-# every active chunk's physics substeps + readout, then updates idle counters and drops any
-# chunk that's been idle IDLE_THRESHOLD ticks in a row (matches GranularSimulation's own
-# threshold) — a chunk with continuous activity (a waterfall) never idles out, independent of
-# player position.
+# Public entry point — call ONCE per real simulation tick (SimulationRuntime._tick()). Runs the
+# region's physics substeps + readout, then sleeps the whole region once it has been motionless
+# for IDLE_THRESHOLD ticks. Idle is a REGION property now, not a per-chunk one: chunks share a
+# grid, so one chunk going quiet while its neighbour still flows is not a reason to drop
+# anything — that would tear the shared grid apart mid-simulation.
 func tick_all(substeps_per_tick: int) -> void:
 	if not is_bound():
 		return
-	var to_drop: Array[Vector3i] = []
-	for chunk_pos in _windows.keys():
-		var w: ChunkRegion = _windows[chunk_pos]
-		if w.n_particles == 0:
-			continue
-		_run_window_substeps(w, substeps_per_tick)
-		_readout_window(w)  # still writes voxel state every tick; return value no longer
-		# drives idle-detection (see REST_SPEED above) — kept for the STATIC-guard write path.
+	var w := _region
+	if w == null or w.n_particles == 0:
+		return
 
-		var vel := read_velocities(w)
-		var max_speed := 0.0
-		for i in w.n_particles:
-			var spd := Vector3(vel[i*3], vel[i*3+1], vel[i*3+2]).length()
-			max_speed = max(max_speed, spd)
+	_run_region_substeps(w, substeps_per_tick)
+	_readout_region(w)  # writes voxel state every tick; return value drives nothing here
 
-		if max_speed < REST_SPEED:
-			w.idle_ticks += 1
-			if w.idle_ticks >= IDLE_THRESHOLD:
-				to_drop.append(chunk_pos)
-		else:
-			w.idle_ticks = 0
-	for chunk_pos in to_drop:
-		_deactivate_chunk(chunk_pos)
+	var vel := read_velocities(w)
+	var max_speed := 0.0
+	for i in w.n_particles:
+		var spd := Vector3(vel[i*3], vel[i*3+1], vel[i*3+2]).length()
+		max_speed = max(max_speed, spd)
+
+	if max_speed < REST_SPEED:
+		w.idle_ticks += 1
+		if w.idle_ticks >= IDLE_THRESHOLD:
+			# Everything is at rest and already written back to voxels. Sleep the region and
+			# clear the intent set; a later edit or a streamed chunk re-activates from voxels.
+			_active_chunks.clear()
+			_destroy_region()
+	else:
+		w.idle_ticks = 0
 
 
-func _run_window_substeps(w: ChunkRegion, substeps: int) -> void:
+func _run_region_substeps(w: ChunkRegion, substeps: int) -> void:
 	for i in substeps:
-		_compute.run_with_set(_clear,   w.set_clear,   _groups_grid)
+		_compute.run_with_set(_clear,   w.set_clear,   w.groups_grid)
 		_compute.run_with_set(_p2g,     w.set_p2g,     w.groups_particles)
-		_compute.run_with_set(_grid_op, w.set_grid_op, _groups_grid)
+		_compute.run_with_set(_grid_op, w.set_grid_op, w.groups_grid)
 		_compute.run_with_set(_g2p,     w.set_g2p,     w.groups_particles)
 	_compute.submit()
 	_compute.sync()
 
 
-# Writes the window's current grid mass/material state into the REAL voxel world (shared
+# Writes the region's current grid mass/material state into the REAL voxel world (shared
 # changelog + WorldOrchestrator.apply_changelog() — same safe path GranularSimulation/
-# FluidSimulation use). Does NOT emit WorldOrchestrator.chunks_committed — CA
-# (GranularSimulation/FluidSimulation) is currently disabled (enabled=false in world.tscn), so
-# the original conflict concern (CA picking up voxels MPM just wrote) doesn't apply right now;
-# left unwired rather than wired-but-untested, since re-enabling CA alongside MPM on the same
-# materials is still an open question this migration hasn't answered.
-func _readout_window(w: ChunkRegion) -> Array[Vector3i]:
+# FluidSimulation use). readout.comp maps each grid node through origin + local index and then
+# through world_to_flat(), so nodes in any chunk of the region land in the right chunk slot.
+# Does NOT emit WorldOrchestrator.chunks_committed (see the note in _on_voxels_placed's
+# counterpart discussion in MIGRATION_MPM.md §2 — CA is off, nothing else consumes it yet).
+func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
 	var zero_dirty := PackedByteArray(); zero_dirty.resize(DIRTY_BUF_BYTES); zero_dirty.fill(0)
 	_compute.buffer_update(w.dirty_chunks_buf, 0, zero_dirty)
 	_orchestrator.reset_changelog()
 
-	_compute.run_with_set(_readout, w.set_readout, _groups_grid)
+	_compute.run_with_set(_readout, w.set_readout, w.groups_grid)
 	_compute.submit()
 	_compute.sync()
 
@@ -533,14 +643,25 @@ func _decode_dirty_bitmask(bitmask: PackedByteArray) -> Array[Vector3i]:
 	return out
 
 
-# --- Diagnostics / test accessors — operate on a specific chunk's window ---
+# --- Diagnostics / test accessors ---
 
+# The region now spans multiple chunks, so this returns the region if `chunk_pos` is covered by
+# it, else null. Kept under the old name so existing callers keep working; n_particles on the
+# returned object is REGION-wide, not that chunk's share.
 func get_chunk_region(chunk_pos: Vector3i) -> ChunkRegion:
-	return _windows.get(chunk_pos)
+	if _region == null:
+		return null
+	return _region if _region.chunks.has(chunk_pos) else null
 
 
 func active_chunk_positions() -> Array:
-	return _windows.keys()
+	return _active_chunks.keys()
+
+
+func region_grid_info() -> Dictionary:
+	if _region == null:
+		return {}
+	return {"origin": _region.origin, "dims": _region.dims, "nodes": _region.dims.x * _region.dims.y * _region.dims.z, "chunks": _region.chunks.size(), "particles": _region.n_particles}
 
 
 func read_positions(w: ChunkRegion) -> PackedFloat32Array:

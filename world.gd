@@ -233,13 +233,19 @@ func _unhandled_input(event: InputEvent) -> void:
 func _mpm_status_dump() -> void:
 	if not mpm_simulation.is_bound():
 		var mode_name := "MPM" if simulation_runtime.is_mpm_mode() else "CA"
-		print("[MPM] not bound — solver mode is %s, so MPM has no active chunks" % mode_name)
+		print("[MPM] not bound — solver mode is %s, so MPM is not running" % mode_name)
 		return
+	# Regions are shared across chunks now (2026-08-13), so there is one grid, not one per
+	# chunk. Report the region, then the chunks it covers.
+	var info := mpm_simulation.region_grid_info()
 	var chunks := mpm_simulation.active_chunk_positions()
-	print("[MPM] %d active chunk(s):" % chunks.size())
-	for cp in chunks:
-		var w = mpm_simulation.get_chunk_region(cp)
-		print("  chunk %s — %d particles, idle_ticks=%d" % [cp, w.n_particles, w.idle_ticks])
+	if info.is_empty():
+		print("[MPM] no live region — %d chunk(s) requested, none simulated (asleep or refused)" % chunks.size())
+		return
+	print("[MPM] region origin=%s dims=%s nodes=%d | %d/8 chunk(s), %d particles" % [
+		info["origin"], info["dims"], info["nodes"], info["chunks"], info["particles"]])
+	if not chunks.is_empty():
+		print("  chunks: %s" % [chunks])
 
 
 # THE TEST (2026-08-12, brief §37) — proves MPM's activity is genuinely player-independent:
@@ -291,12 +297,19 @@ func _mpm_multi_chunk_test() -> void:
 	await get_tree().process_frame
 	await get_tree().process_frame
 
+	# 2026-08-13: regions are shared across chunks, so two chunks 2 apart resolve to ONE region
+	# whose grid spans both. This test therefore no longer proves "independent windows" — it
+	# proves both placements keep simulating while far from the camera, which is the
+	# player-independence property it was originally written for.
+	var info := mpm_simulation.region_grid_info()
+	print("[MPMMultiChunk] region: %s | active chunks: %s" % [info, mpm_simulation.active_chunk_positions()])
+	if info.is_empty() or int(info["chunks"]) < 2:
+		print("[MPMMultiChunk] RESULT: FAIL (expected one region covering both chunks)")
+		return
 	var w_water = mpm_simulation.get_chunk_region(water_chunk)
 	var w_sand  = mpm_simulation.get_chunk_region(sand_chunk)
-	print("[MPMMultiChunk] both chunks activated: water=%s sand=%s" \
-		% [w_water != null, w_sand != null])
-	if not w_water or not w_sand:
-		print("[MPMMultiChunk] RESULT: FAIL (one or both chunks did not activate)")
+	if w_water == null or w_sand == null:
+		print("[MPMMultiChunk] RESULT: FAIL (one or both chunks not covered by the region)")
 		return
 
 	# Let real time pass with the camera pointed at NEITHER region — SimulationRuntime._tick()

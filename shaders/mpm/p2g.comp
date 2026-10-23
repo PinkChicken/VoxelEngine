@@ -9,9 +9,11 @@ layout(local_size_x = 64) in;
 // needed — see tools/mpm_prototype/GODOT_PORT_PLAN.md §1).
 
 layout(set = 0, binding = 0, std430) readonly buffer Params {
-	int n_grid; int n_particles; int bound; int pad0;
+	// Rectangular region grid (2026-08-13) — was a single cube edge `n_grid`. Must match
+	// MPMSimulation._upload_region_params() byte for byte.
+	int dim_x; int dim_y; int dim_z; int n_particles;
 	float dt; float dx; float inv_dx; float gravity;
-	float p_vol; float fp_scale; float pad1; float pad2;
+	float p_vol; float fp_scale; int bound; int pad0;
 } P;
 layout(set = 0, binding = 1, std430) readonly buffer Pos   { float data[]; } p_pos;
 layout(set = 0, binding = 2, std430) readonly buffer Vel   { float data[]; } p_vel;
@@ -111,7 +113,6 @@ void main() {
 	if (model == MODEL_NOT_SIMULATED || model == MODEL_STATIC) return;  // STATIC: brief §37 — real
 	// terrain-voxel wall particles are a later, dedicated step, not this one.
 
-	int ng = P.n_grid;
 	vec3 pos  = vec3(p_pos.data[3u*p], p_pos.data[3u*p+1u], p_pos.data[3u*p+2u]);
 	vec3 vel  = vec3(p_vel.data[3u*p], p_vel.data[3u*p+1u], p_vel.data[3u*p+2u]);
 	float mass = p_mass.data[p];
@@ -208,8 +209,11 @@ void main() {
 	for (int j = 0; j < 3; j++)
 	for (int k = 0; k < 3; k++) {
 		ivec3 node = base + ivec3(i, j, k);
+		// Bounds are the REGION grid, not a chunk. Chunk boundaries inside a region are now
+		// ordinary interior nodes — this check only clips the true edge of the simulated
+		// domain (2026-08-13).
 		if (node.x < 0 || node.y < 0 || node.z < 0 ||
-			node.x >= ng || node.y >= ng || node.z >= ng) continue;
+			node.x >= P.dim_x || node.y >= P.dim_y || node.z >= P.dim_z) continue;
 		vec3 dpos = (vec3(i, j, k) - fx) * P.dx;
 		float weight = w[i].x * w[j].y * w[k].z;
 		// affine = stress(3x3) + mass*C ; contribution = weight*(mass*vel + affine*dpos)
@@ -219,7 +223,7 @@ void main() {
 		ad.z = (st6*dpos.x + st7*dpos.y + st8*dpos.z) + mass*(C6*dpos.x + C7*dpos.y + C8*dpos.z);
 		vec3 mom = weight * (mass * vel + ad);
 		float mc = weight * mass;
-		uint ni = (uint(node.z) * uint(ng) + uint(node.y)) * uint(ng) + uint(node.x);
+		uint ni = (uint(node.z) * uint(P.dim_y) + uint(node.y)) * uint(P.dim_x) + uint(node.x);
 		atomicAdd(g_mass.data[ni],        int(round(mc * scale)));
 		atomicAdd(g_mom.data[3u*ni],      int(round(mom.x * scale)));
 		atomicAdd(g_mom.data[3u*ni + 1u], int(round(mom.y * scale)));

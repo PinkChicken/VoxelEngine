@@ -10,9 +10,11 @@ layout(local_size_x = 64) in;
 // order matters and is deliberate (see p2g.comp's header comment).
 
 layout(set = 0, binding = 0, std430) readonly buffer Params {
-	int n_grid; int n_particles; int bound; int pad0;
+	// Rectangular region grid (2026-08-13) — was a single cube edge `n_grid`. Must match
+	// MPMSimulation._upload_region_params() byte for byte.
+	int dim_x; int dim_y; int dim_z; int n_particles;
 	float dt; float dx; float inv_dx; float gravity;
-	float p_vol; float fp_scale; float pad1; float pad2;
+	float p_vol; float fp_scale; int bound; int pad0;
 } P;
 layout(set = 0, binding = 1, std430)          buffer Pos   { float data[]; } p_pos;
 layout(set = 0, binding = 2, std430)          buffer Vel   { float data[]; } p_vel;
@@ -42,7 +44,6 @@ void main() {
 	uint model = mat_model(mat_id);
 	if (model == MODEL_NOT_SIMULATED || model == MODEL_STATIC) return;  // never moves / no particle yet
 
-	int ng = P.n_grid;
 	vec3 pos = vec3(p_pos.data[3u*p], p_pos.data[3u*p+1u], p_pos.data[3u*p+2u]);
 	vec3 Xp = pos * P.inv_dx;
 	ivec3 base = ivec3(Xp - 0.5);
@@ -60,11 +61,12 @@ void main() {
 	for (int j = 0; j < 3; j++)
 	for (int k = 0; k < 3; k++) {
 		ivec3 node = base + ivec3(i, j, k);
+		// Region grid bounds (2026-08-13) — chunk boundaries inside a region are interior now.
 		if (node.x < 0 || node.y < 0 || node.z < 0 ||
-			node.x >= ng || node.y >= ng || node.z >= ng) continue;
+			node.x >= P.dim_x || node.y >= P.dim_y || node.z >= P.dim_z) continue;
 		vec3 dpos = (vec3(i, j, k) - fx) * P.dx;
 		float weight = w[i].x * w[j].y * w[k].z;
-		uint ni = (uint(node.z) * uint(ng) + uint(node.y)) * uint(ng) + uint(node.x);
+		uint ni = (uint(node.z) * uint(P.dim_y) + uint(node.y)) * uint(P.dim_x) + uint(node.x);
 		vec3 gv = vec3(g_vel.data[3u*ni], g_vel.data[3u*ni+1u], g_vel.data[3u*ni+2u]);
 		new_vel += weight * gv;
 		// new_C += 4 * weight * outer(gv, dpos) / dx^2
@@ -78,12 +80,14 @@ void main() {
 	p_vel.data[3u*p + 1u] = new_vel.y;
 	p_vel.data[3u*p + 2u] = new_vel.z;
 
-	// Domain is [0, n_grid) in real voxel units, NOT a normalized [0,1] cube — this clamp
+	// Domain is [0, dims) in real voxel units, NOT a normalized [0,1] cube — this clamp
 	// used to read `vec3(1.0)` (main.py's original unit-cube convention) before the grid was
 	// locked to real voxel resolution (brief §37); left unported once, it silently trapped
 	// every particle at y=1.0 the first time this ran against real static-voxel boundaries.
+	// NOTE (2026-08-13): this clamp is now the REGION edge, so it no longer walls particles
+	// off at a chunk boundary — that was one of the four cross-chunk walls this change removes.
 	vec3 new_pos = pos + P.dt * new_vel;
-	new_pos = clamp(new_pos, vec3(0.0), vec3(float(P.n_grid) - 1e-4));
+	new_pos = clamp(new_pos, vec3(0.0), vec3(float(P.dim_x), float(P.dim_y), float(P.dim_z)) - 1e-4);
 	p_pos.data[3u*p]      = new_pos.x;
 	p_pos.data[3u*p + 1u] = new_pos.y;
 	p_pos.data[3u*p + 2u] = new_pos.z;

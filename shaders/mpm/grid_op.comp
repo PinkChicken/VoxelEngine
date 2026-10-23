@@ -16,9 +16,11 @@ layout(local_size_x = 64) in;
 // is pointed at WorldOrchestrator's real RIDs instead of a synthetic test buffer.
 
 layout(set = 0, binding = 0, std430) readonly buffer Params {
-	int n_grid; int n_particles; int bound; int pad0;
+	// Rectangular region grid (2026-08-13) — was a single cube edge `n_grid`. Must match
+	// MPMSimulation._upload_region_params() byte for byte.
+	int dim_x; int dim_y; int dim_z; int n_particles;
 	float dt; float dx; float inv_dx; float gravity;
-	float p_vol; float fp_scale; float pad1; float pad2;
+	float p_vol; float fp_scale; int bound; int pad0;
 } P;
 layout(set = 0, binding = 8, std430) readonly buffer GMom  { int data[]; } g_mom;
 layout(set = 0, binding = 9, std430) readonly buffer GMass { int data[]; } g_mass;
@@ -68,13 +70,12 @@ bool is_static_node(ivec3 local_node) {
 
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
-	int ng = P.n_grid;
-	uint G = uint(ng) * uint(ng) * uint(ng);
+	uint G = uint(P.dim_x) * uint(P.dim_y) * uint(P.dim_z);
 	if (idx >= G) return;
 
-	int ix = int(idx % uint(ng));
-	int iy = int((idx / uint(ng)) % uint(ng));
-	int iz = int(idx / (uint(ng) * uint(ng)));
+	int ix = int(idx % uint(P.dim_x));
+	int iy = int((idx / uint(P.dim_x)) % uint(P.dim_y));
+	int iz = int(idx / (uint(P.dim_x) * uint(P.dim_y)));
 
 	if (is_static_node(ivec3(ix, iy, iz))) {
 		// No-slip: this node belongs to a real STATIC-material voxel — zero velocity
@@ -109,13 +110,16 @@ void main() {
 		vel *= max_speed / spd;
 	}
 
+	// Edge damping band. This is the REGION edge (2026-08-13), not a chunk edge — a chunk
+	// boundary in the middle of a shared region gets no special treatment, which is exactly
+	// what makes a lake spanning chunks behave as one body.
 	int b = P.bound;
-	if (ix < b       && vel.x < 0.0) vel.x = 0.0;
-	if (ix > ng - b  && vel.x > 0.0) vel.x = 0.0;
-	if (iy < b       && vel.y < 0.0) vel.y = 0.0;
-	if (iy > ng - b  && vel.y > 0.0) vel.y = 0.0;
-	if (iz < b       && vel.z < 0.0) vel.z = 0.0;
-	if (iz > ng - b  && vel.z > 0.0) vel.z = 0.0;
+	if (ix < b           && vel.x < 0.0) vel.x = 0.0;
+	if (ix > P.dim_x - b && vel.x > 0.0) vel.x = 0.0;
+	if (iy < b           && vel.y < 0.0) vel.y = 0.0;
+	if (iy > P.dim_y - b && vel.y > 0.0) vel.y = 0.0;
+	if (iz < b           && vel.z < 0.0) vel.z = 0.0;
+	if (iz > P.dim_z - b && vel.z > 0.0) vel.z = 0.0;
 
 	g_vel.data[3u*idx]      = vel.x;
 	g_vel.data[3u*idx + 1u] = vel.y;
