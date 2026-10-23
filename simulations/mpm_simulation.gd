@@ -193,6 +193,14 @@ func setup() -> bool:
 		orch.voxels_placed.connect(_on_voxels_placed)
 	if not orch.chunk_loaded.is_connected(_on_chunk_loaded):
 		orch.chunk_loaded.connect(_on_chunk_loaded)
+	# R-key regenerate (player_controller) calls ChunkManager.regenerate_chunks(), which emits
+	# slab_invalidated -> WorldOrchestrator._init_grid(). That FREES AND RECREATES
+	# _voxel_buf_a, _chunk_table and _changelog_buf with new RIDs, and a live region binds all
+	# three directly (w.voxel_buf_a / w.chunk_table and the readout uniform set). Without this
+	# the region keeps pointing at freed handles and readout writes stale particles into a dead
+	# buffer. Tear the region down whenever the grid is rebuilt.
+	if not cm.slab_invalidated.is_connected(Callable(self, "reset")):
+		cm.slab_invalidated.connect(Callable(self, "reset"))
 
 	is_setup = true
 	scan_loaded_chunks_for_existing_material()
@@ -201,6 +209,20 @@ func setup() -> bool:
 
 func is_bound() -> bool:
 	return is_instance_valid(_orchestrator)
+
+
+# Drop ALL simulation state: the region (and with it every particle), the active-chunk set, and
+# every one-shot warning flag. Called when the world itself is rebuilt (R key -> slab_invalidated
+# -> WorldOrchestrator._init_grid), because the region's buffers are bound to RIDs that get
+# freed and recreated underneath it. Also usable as a manual hard reset.
+func reset() -> void:
+	_active_chunks.clear()
+	_destroy_region()
+	_warned_budget = false
+	_warned_region_cap = false
+	_warned_capacity = false
+	_grow_cooldown = 0
+	_applied_sim_dt = -1.0
 
 
 # --- chunk → cell helpers -------------------------------------------------------------
