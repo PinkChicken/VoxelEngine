@@ -88,6 +88,7 @@ script = ExtResource("10_orch")
 
 [node name="SimulationRuntime" type="Node" parent="WorldOrchestrator" unique_id=1047747846]
 script = ExtResource("9_wse8f")
+solver_mode = 1
 metadata/_custom_type_script = "uid://d2v6l0q3qshsc"
 
 [node name="GranularSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=603403044]

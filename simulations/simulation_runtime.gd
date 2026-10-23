@@ -30,12 +30,13 @@ var paused: bool = false
 #       MPM water is validated against while it is still at pilot scale).
 # MPM = MPMSimulation only; the CA sims are never woken, so they can't compete for the buffer.
 #
-# Default is CA deliberately: MPM is currently pilot-scale (4000 particles/chunk, 8 active
-# chunks) and would visibly degrade the game if made the only solver today. Flipping the
-# cutover is a one-line change — set this export to MPM in world.tscn, or change the default
-# below — and should happen only once MPM reaches parity (see docs/MIGRATION_MPM.md).
+# Default is MPM as of 2026-08-13: the CA solvers are already `enabled = false` in world.tscn
+# (the scene switched to MPM by hand before this gate existed), so MPM is what actually runs in
+# practice and gating it behind a CA default is what made the world sit still. CA remains
+# selectable with `-- ca` — but note that BOTH CA nodes must also be re-enabled in world.tscn
+# before CA produces any motion, since their own `enabled` export is authoritative.
 enum SolverMode { CA = 0, MPM = 1 }
-@export_enum("CA", "MPM") var solver_mode: int = SolverMode.CA
+@export_enum("CA", "MPM") var solver_mode: int = SolverMode.MPM
 
 # MLS-MPM migration (2026-08-12, brief §37) — NOT a VoxelSimulation (see mpm_simulation.gd's
 # header for why), so it doesn't go through register_simulation()/_active; ticked directly
