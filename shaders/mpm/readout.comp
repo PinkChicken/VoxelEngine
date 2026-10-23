@@ -135,12 +135,19 @@ void main() {
 	// Presence is self-limiting: after growing, that material is interior, the new plane is empty,
 	// and the bit clears.
 	if (mass >= MASS_THRESHOLD) {
-		if (ix == 0)            atomicOr(face_mask.data[0], 1u);
-		if (ix == P.dim_x - 1)  atomicOr(face_mask.data[0], 2u);
-		if (iy == 0)            atomicOr(face_mask.data[0], 4u);
-		if (iy == P.dim_y - 1)  atomicOr(face_mask.data[0], 8u);
-		if (iz == 0)            atomicOr(face_mask.data[0], 16u);
-		if (iz == P.dim_z - 1)  atomicOr(face_mask.data[0], 32u);
+		// Test the BOUNDARY BAND, not the outermost plane. grid_op zeroes inward velocity for
+		// nodes within `bound` cells of a face, so material piles up AT THE BAND — a particle
+		// resting at local y=3.0 has base 2 and scatters to nodes 2,3,4, so node 0 NEVER gets
+		// mass. Testing `iy == 0` therefore tested a plane the material physically cannot
+		// occupy, and -Y growth could not fire no matter how much water sat on the floor. That is
+		// why the region stayed 1 chunk tall in Y through every run so far.
+		int b = max(P.bound, 1);
+		if (ix < b)                atomicOr(face_mask.data[0], 1u);
+		if (ix >= P.dim_x - b)     atomicOr(face_mask.data[0], 2u);
+		if (iy < b)                atomicOr(face_mask.data[0], 4u);
+		if (iy >= P.dim_y - b)     atomicOr(face_mask.data[0], 8u);
+		if (iz < b)                atomicOr(face_mask.data[0], 16u);
+		if (iz >= P.dim_z - b)     atomicOr(face_mask.data[0], 32u);
 		// Which CHUNK of the region grid this material sits in — see the Occupancy declaration.
 		int cs = VP.chunk_size;
 		int dcx = P.dim_x / cs;

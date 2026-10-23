@@ -87,7 +87,12 @@ class_name MPMSimulation extends Node
 # Hard ceiling on region grid nodes. 1M nodes ≈ 60 MB of grid buffers (60 B/node) and ≈ 15.6k
 # workgroups per pass. Exceeded → the chunk that would cross it is refused, not allocated.
 const MAX_REGION_NODES := 1048576
-const BOUND := 3
+# Width of the velocity-damping band grid_op applies inside each region face, in cells. This is
+# an artificial wall: material stops `BOUND` cells short of the true edge, which both looks wrong
+# (water hovering above an invisible floor) and used to hide the edge from face-presence detection
+# (readout.comp now tests the band rather than the plane). 1 keeps the wall as thin as it can be
+# while still stopping material from leaving.
+const BOUND := 1
 const NMAT := 8  # must match clear_grid.comp/p2g.comp's NMAT — the render mass-breakdown slot count
 const DIRTY_BUF_BYTES := 64  # matches GranularSimulation's own constant/convention
 # Region-grid chunk occupancy bitmask: 512 chunks' worth, far more than a bounding box under
@@ -1018,13 +1023,18 @@ func _grow_region_if_needed(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
 
 	var proposals: Array[Vector3i] = []
 	var proposed: Dictionary = {}
+	# GRAVITY FIRST. When the chunk budget is tight, growing DOWNWARD is the direction that
+	# matters, and lateral spread can otherwise consume every slot before gravity is even
+	# considered — which is exactly what happened in the run where 16/16 chunks were taken by a
+	# 5x5 pancake while Y never grew at all.
+	for cp in changed:
+		if grow_ym and cp.y == bmin.y: _propose(proposals, proposed, cp + Vector3i(0, -1, 0))
 	for cp in changed:
 		if grow_xm and cp.x == bmin.x: _propose(proposals, proposed, cp + Vector3i(-1, 0, 0))
 		if grow_xp and cp.x == bmax.x: _propose(proposals, proposed, cp + Vector3i( 1, 0, 0))
-		if grow_ym and cp.y == bmin.y: _propose(proposals, proposed, cp + Vector3i(0, -1, 0))
-		if grow_yp and cp.y == bmax.y: _propose(proposals, proposed, cp + Vector3i(0,  1, 0))
 		if grow_zm and cp.z == bmin.z: _propose(proposals, proposed, cp + Vector3i(0, 0, -1))
 		if grow_zp and cp.z == bmax.z: _propose(proposals, proposed, cp + Vector3i(0, 0,  1))
+		if grow_yp and cp.y == bmax.y: _propose(proposals, proposed, cp + Vector3i(0,  1, 0))
 	if proposals.is_empty():
 		return false
 
