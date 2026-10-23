@@ -1,0 +1,32 @@
+#version 450
+layout(local_size_x = 64) in;
+
+// MPM production pass 1/4 — zero the background grid's scratch accumulators before P2G
+// scatters into them this substep.
+
+layout(set = 0, binding = 0, std430) readonly buffer Params {
+	int n_grid; int n_particles; int bound; int pad0;
+	float dt; float dx; float inv_dx; float gravity;
+	float p_vol; float fp_scale; float pad1; float pad2;
+} P;
+layout(set = 0, binding = 8, std430)  buffer GMom     { int data[]; } g_mom;
+layout(set = 0, binding = 9, std430)  buffer GMass    { int data[]; } g_mass;
+layout(set = 0, binding = 12, std430) buffer GMassMat { int data[]; } g_mass_mat;
+
+// Must match NMAT in p2g.comp / mpm_material_table's material count (§35.2's aliasing bug —
+// the retired prototype hardcoded 4 and silently aliased ids 4-7 onto one render slot; this
+// project has 8 materials today, sized to that, not to an arbitrary round number).
+const uint NMAT = 8u;
+
+void main() {
+	uint idx = gl_GlobalInvocationID.x;
+	int ng = P.n_grid;
+	uint G = uint(ng) * uint(ng) * uint(ng);
+	if (idx >= G) return;
+
+	g_mass.data[idx] = 0;
+	g_mom.data[3u*idx] = 0;
+	g_mom.data[3u*idx + 1u] = 0;
+	g_mom.data[3u*idx + 2u] = 0;
+	for (uint m = 0u; m < NMAT; m++) g_mass_mat.data[idx * NMAT + m] = 0;
+}

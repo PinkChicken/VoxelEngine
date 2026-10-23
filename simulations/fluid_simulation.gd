@@ -404,6 +404,10 @@ func _debug_print_watch() -> void:
 # already bench-validated) is the planned follow-up once a second liquid (oil) exists.
 @export_range(0.05, 1.0, 0.01) var flow: float = 1.0
 
+# MLS-MPM migration (2026-08-12, brief §37) — same disable mechanism as
+# GranularSimulation.enabled; see that file's comment for the full reasoning.
+@export var enabled: bool = true
+
 const DIRTY_BUF_BYTES := 64
 
 
@@ -453,7 +457,7 @@ func _ready() -> void:
 		# capacity is known (mirrors _density_touch_buf's own growth pattern above).
 
 	var runtime := get_parent()
-	if runtime.has_method("register_simulation"):
+	if enabled and runtime.has_method("register_simulation"):
 		runtime.register_simulation(self)
 
 	Performance.add_custom_monitor("Voxel/fluid_active_chunks", func(): return _active_chunks.size())

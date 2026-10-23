@@ -27,6 +27,13 @@ var _frame: int = 0
 # slow motion for a voxel size this small. Mirrors FluidSimulation.steps_per_tick.
 @export var steps_per_tick: int = 1
 
+# MLS-MPM migration (2026-08-12, brief §37) — false skips register_simulation() below, so
+# SimulationRuntime never ticks this system, while the node itself stays alive in the scene
+# tree (world.gd's many debug tools — U-tube/density/sphere test-rig builders, F6/F7/T/H/N/J
+# — all reference $FluidSimulation/$GranularSimulation directly and would break if the nodes
+# were removed from world.tscn instead). Reversible: flip back to true to restore CA.
+@export var enabled: bool = true
+
 # 64 bytes covers 512 slots (512 / 32 * 4) — exactly the full fixed world (8³ chunks).
 # If buffer_grow ever pushes capacity past 512, _dirty_chunks_buf must also grow.
 const DIRTY_BUF_BYTES := 64
@@ -103,7 +110,7 @@ func _ready() -> void:
 		# _demand_accum_buf sized lazily in step() once the voxel buffer's real
 		# capacity is known (mirrors FluidSimulation's own flux-buffer growth pattern).
 	var runtime := get_parent()
-	if runtime.has_method("register_simulation"):
+	if enabled and runtime.has_method("register_simulation"):
 		runtime.register_simulation(self)
 
 	Performance.add_custom_monitor("Voxel/active_chunks", func(): return _active_chunks.size())

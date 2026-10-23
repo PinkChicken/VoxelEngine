@@ -1,0 +1,229 @@
+#version 450
+layout(local_size_x = 64) in;
+
+// MPM production pass 2/4 — Particle-to-Grid (P2G) scatter. Per-material behaviour is
+// TABLE-DRIVEN (MaterialDB.mpm_buffer_rid, binding 13) — no hardcoded material-id branch
+// (tools/fluid_prototypes/MPM_EVALUATION_BRIEF.md §35.2 named this the actual blocker in the
+// retired prototype: `is_sand = (mat == 2)`, one global E/mu/lambda/alpha for the whole
+// domain). Fixed-point integer atomics for the scatter (portable; no float-atomic extension
+// needed — see tools/mpm_prototype/GODOT_PORT_PLAN.md §1).
+
+layout(set = 0, binding = 0, std430) readonly buffer Params {
+	int n_grid; int n_particles; int bound; int pad0;
+	float dt; float dx; float inv_dx; float gravity;
+	float p_vol; float fp_scale; float pad1; float pad2;
+} P;
+layout(set = 0, binding = 1, std430) readonly buffer Pos   { float data[]; } p_pos;
+layout(set = 0, binding = 2, std430) readonly buffer Vel   { float data[]; } p_vel;
+layout(set = 0, binding = 3, std430) readonly buffer Caff  { float data[]; } p_C;
+layout(set = 0, binding = 4, std430) readonly buffer Jbuf  { float data[]; } p_J;
+layout(set = 0, binding = 5, std430) readonly buffer MatB  { uint  data[]; } p_mat;
+layout(set = 0, binding = 6, std430) readonly buffer Mass  { float data[]; } p_mass;
+layout(set = 0, binding = 7, std430) readonly buffer Alive { uint  data[]; } p_alive;
+layout(set = 0, binding = 8, std430)          buffer GMom  { int data[]; } g_mom;
+layout(set = 0, binding = 9, std430)          buffer GMass { int data[]; } g_mass;
+layout(set = 0, binding = 11, std430)         buffer Fdef  { float data[]; } p_F;
+// Per-material density, RENDER-ONLY (mpm_raymarch.comp reads this for majority-material +
+// alpha; nothing in the physics loop reads it). Additive on top of g_mass, which stays the
+// physics-authoritative total.
+layout(set = 0, binding = 12, std430)         buffer GMassMat { int data[]; } g_mass_mat;
+// MaterialDB.build_mpm_buffer()'s GPU mirror — 32 bytes/material, indexed directly by
+// material id. Layout must match material_db.gd exactly.
+layout(set = 0, binding = 13, std430) readonly buffer MatTable { uint data[]; } mat_table;
+
+const uint NMAT = 8u;
+const uint MODEL_NOT_SIMULATED = 0u;
+const uint MODEL_STATIC        = 1u;
+const uint MODEL_FLUID         = 2u;
+const uint MODEL_GRANULAR      = 3u;
+const uint MODEL_ELASTIC       = 4u;
+const uint MAT_STRIDE_U32 = 8u;  // 32 bytes / 4
+
+uint mat_model(uint mat_id)     { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
+float mat_stiffness(uint mat_id){ return uintBitsToFloat(mat_table.data[mat_id * MAT_STRIDE_U32 + 2u]); }
+float mat_viscosity(uint mat_id){ return uintBitsToFloat(mat_table.data[mat_id * MAT_STRIDE_U32 + 3u]); }
+float mat_alpha(uint mat_id)    { return uintBitsToFloat(mat_table.data[mat_id * MAT_STRIDE_U32 + 4u]); }
+float mat_mu(uint mat_id)       { return uintBitsToFloat(mat_table.data[mat_id * MAT_STRIDE_U32 + 5u]); }
+float mat_lambda(uint mat_id)   { return uintBitsToFloat(mat_table.data[mat_id * MAT_STRIDE_U32 + 6u]); }
+
+// --- symmetric 3x3 Jacobi eigensolver -> SVD of F (row-major float[9]) ---
+// A one-sided approach: eigen-decompose S = F^T F -> V (eigenvectors), sigma = sqrt(eig);
+// then U column i = F * V_i / sigma_i. Robust for the near-identity F sand produces.
+void jacobi_rot(inout float S[9], inout float V[9], int p, int q) {
+	float spq = S[3*p+q];
+	if (abs(spq) < 1e-20) return;
+	float theta = 0.5 * (S[3*q+q] - S[3*p+p]) / spq;
+	float t = sign(theta) / (abs(theta) + sqrt(theta*theta + 1.0));
+	if (theta == 0.0) t = 1.0;
+	float c = 1.0 / sqrt(t*t + 1.0);
+	float s = t * c;
+	for (int i = 0; i < 3; i++) {          // S <- J^T S
+		float sip = S[3*i+p]; float siq = S[3*i+q];
+		S[3*i+p] = c*sip - s*siq;
+		S[3*i+q] = s*sip + c*siq;
+	}
+	for (int i = 0; i < 3; i++) {          // S <- S J
+		float spi = S[3*p+i]; float sqi = S[3*q+i];
+		S[3*p+i] = c*spi - s*sqi;
+		S[3*q+i] = s*spi + c*sqi;
+	}
+	for (int i = 0; i < 3; i++) {          // V <- V J
+		float vip = V[3*i+p]; float viq = V[3*i+q];
+		V[3*i+p] = c*vip - s*viq;
+		V[3*i+q] = s*vip + c*viq;
+	}
+}
+
+void svd3(float F[9], out float U[9], out float sig[3], out float V[9]) {
+	float S[9];
+	for (int r = 0; r < 3; r++)
+	for (int cc = 0; cc < 3; cc++) {
+		float v = 0.0;
+		for (int k = 0; k < 3; k++) v += F[3*k+r] * F[3*k+cc];   // (F^T F)[r][cc]
+		S[3*r+cc] = v;
+	}
+	for (int i = 0; i < 9; i++) V[i] = 0.0;
+	V[0] = 1.0; V[4] = 1.0; V[8] = 1.0;
+	for (int sweep = 0; sweep < 8; sweep++) {
+		jacobi_rot(S, V, 0, 1);
+		jacobi_rot(S, V, 0, 2);
+		jacobi_rot(S, V, 1, 2);
+	}
+	sig[0] = sqrt(max(S[0], 1e-12));
+	sig[1] = sqrt(max(S[4], 1e-12));
+	sig[2] = sqrt(max(S[8], 1e-12));
+	for (int i = 0; i < 3; i++) {           // U_i = F V_i / sigma_i
+		for (int r = 0; r < 3; r++) {
+			float v = 0.0;
+			for (int k = 0; k < 3; k++) v += F[3*r+k] * V[3*k+i];
+			U[3*r+i] = v / sig[i];
+		}
+	}
+}
+
+void main() {
+	uint p = gl_GlobalInvocationID.x;
+	if (p >= uint(P.n_particles)) return;
+	if (p_alive.data[p] == 0u) return;
+
+	uint mat_id = p_mat.data[p];
+	uint model = mat_model(mat_id);
+	if (model == MODEL_NOT_SIMULATED || model == MODEL_STATIC) return;  // STATIC: brief §37 — real
+	// terrain-voxel wall particles are a later, dedicated step, not this one.
+
+	int ng = P.n_grid;
+	vec3 pos  = vec3(p_pos.data[3u*p], p_pos.data[3u*p+1u], p_pos.data[3u*p+2u]);
+	vec3 vel  = vec3(p_vel.data[3u*p], p_vel.data[3u*p+1u], p_vel.data[3u*p+2u]);
+	float mass = p_mass.data[p];
+	float C0 = p_C.data[9u*p],    C1 = p_C.data[9u*p+1u], C2 = p_C.data[9u*p+2u];
+	float C3 = p_C.data[9u*p+3u], C4 = p_C.data[9u*p+4u], C5 = p_C.data[9u*p+5u];
+	float C6 = p_C.data[9u*p+6u], C7 = p_C.data[9u*p+7u], C8 = p_C.data[9u*p+8u];
+
+	// --- stress: 3x3 tau (scaled) as `st` ---
+	float st0, st1, st2, st3, st4, st5, st6, st7, st8;
+
+	if (model == MODEL_GRANULAR) {
+		float mu_sand = mat_mu(mat_id);
+		float lambda_sand = mat_lambda(mat_id);
+		float alpha_sand = mat_alpha(mat_id);
+		float F[9];
+		for (int t = 0; t < 9; t++) F[t] = p_F.data[9u*p + uint(t)];
+		float U[9]; float V[9]; float sig[3];
+		svd3(F, U, sig, V);
+		// Drucker-Prager return mapping on Hencky strain (mirrors the retired mpm2d_sand.py).
+		// SIGMA CLAMP (standard MPM stabilization): max(sig,1e-6) alone only stops log() from
+		// crashing on exact zero — it does NOT stop a near-degenerate cell (heavy compaction)
+		// from producing an enormous-but-finite stress that blows the grid velocity up for one
+		// substep. Every production MPM sand/snow implementation clamps sigma to a bounded range.
+		const float SIGMA_MIN = 0.05;
+		const float SIGMA_MAX = 5.0;
+		sig[0] = clamp(sig[0], SIGMA_MIN, SIGMA_MAX);
+		sig[1] = clamp(sig[1], SIGMA_MIN, SIGMA_MAX);
+		sig[2] = clamp(sig[2], SIGMA_MIN, SIGMA_MAX);
+		float e0 = log(sig[0]);
+		float e1 = log(sig[1]);
+		float e2 = log(sig[2]);
+		float esum = e0 + e1 + e2;
+		float eh0 = e0 - esum/3.0, eh1 = e1 - esum/3.0, eh2 = e2 - esum/3.0;
+		float ehn = sqrt(eh0*eh0 + eh1*eh1 + eh2*eh2);
+		float ne0 = e0, ne1 = e1, ne2 = e2;
+		if (esum > 0.0) { ne0 = 0.0; ne1 = 0.0; ne2 = 0.0; }
+		else if (ehn > 1e-12) {
+			float dg = ehn + (3.0*lambda_sand + 2.0*mu_sand)/(2.0*mu_sand) * esum * alpha_sand;
+			if (dg > 0.0) { ne0 = e0 - dg/ehn*eh0; ne1 = e1 - dg/ehn*eh1; ne2 = e2 - dg/ehn*eh2; }
+		}
+		// write back plastic-corrected F = U diag(exp(ne)) V^T
+		float ns0 = exp(ne0), ns1 = exp(ne1), ns2 = exp(ne2);
+		for (int r = 0; r < 3; r++)
+		for (int cc = 0; cc < 3; cc++) {
+			float v = U[3*r]*ns0*V[3*cc] + U[3*r+1]*ns1*V[3*cc+1] + U[3*r+2]*ns2*V[3*cc+2];
+			p_F.data[9u*p + uint(3*r+cc)] = v;
+		}
+		// Kirchhoff stress tau = U diag(2mu ne + lam*tr) U^T
+		float tr = ne0 + ne1 + ne2;
+		float d0 = 2.0*mu_sand*ne0 + lambda_sand*tr;
+		float d1 = 2.0*mu_sand*ne1 + lambda_sand*tr;
+		float d2 = 2.0*mu_sand*ne2 + lambda_sand*tr;
+		float coef = -P.dt * P.p_vol * 4.0 * P.inv_dx * P.inv_dx;
+		st0 = coef*(U[0]*d0*U[0] + U[1]*d1*U[1] + U[2]*d2*U[2]);
+		st1 = coef*(U[0]*d0*U[3] + U[1]*d1*U[4] + U[2]*d2*U[5]);
+		st2 = coef*(U[0]*d0*U[6] + U[1]*d1*U[7] + U[2]*d2*U[8]);
+		st3 = coef*(U[3]*d0*U[0] + U[4]*d1*U[1] + U[5]*d2*U[2]);
+		st4 = coef*(U[3]*d0*U[3] + U[4]*d1*U[4] + U[5]*d2*U[5]);
+		st5 = coef*(U[3]*d0*U[6] + U[4]*d1*U[7] + U[5]*d2*U[8]);
+		st6 = coef*(U[6]*d0*U[0] + U[7]*d1*U[1] + U[8]*d2*U[2]);
+		st7 = coef*(U[6]*d0*U[3] + U[7]*d1*U[4] + U[8]*d2*U[5]);
+		st8 = coef*(U[6]*d0*U[6] + U[7]*d1*U[7] + U[8]*d2*U[8]);
+	} else if (model == MODEL_FLUID) {
+		float E = mat_stiffness(mat_id);
+		float viscosity = mat_viscosity(mat_id);
+		float Jp = p_J.data[p];
+		float s = -P.dt * 4.0 * E * P.p_vol * (Jp - 1.0) * P.inv_dx * P.inv_dx;
+		// Viscosity shear term (brief §35.1a, ported from A:\TaichiGPU\main.py:111-116) — the
+		// field that was missing entirely from the retired prototype, and the reason water and
+		// oil were physically identical apart from mass. 0.0 = pressure-only, exactly the old
+		// water-only behaviour.
+		float visc_coef = -P.dt * 4.0 * viscosity * P.p_vol * P.inv_dx * P.inv_dx;
+		st0 = s + visc_coef*(C0+C0); st1 = visc_coef*(C1+C3);      st2 = visc_coef*(C2+C6);
+		st3 = visc_coef*(C3+C1);     st4 = s + visc_coef*(C4+C4);  st5 = visc_coef*(C5+C7);
+		st6 = visc_coef*(C6+C2);     st7 = visc_coef*(C7+C5);      st8 = s + visc_coef*(C8+C8);
+	} else {
+		// MODEL_ELASTIC: fixed-corotated not ported yet (brief §35.6 M4 — no current DB
+		// material uses it). Zero stress rather than silently reusing sand or water's model —
+		// particles still advect via APIC (mass*C term below), they just exert no elastic force.
+		st0 = 0.0; st1 = 0.0; st2 = 0.0; st3 = 0.0; st4 = 0.0; st5 = 0.0; st6 = 0.0; st7 = 0.0; st8 = 0.0;
+	}
+
+	vec3 Xp = pos * P.inv_dx;
+	ivec3 base = ivec3(Xp - 0.5);
+	vec3 fx = Xp - vec3(base);
+	vec3 w[3];
+	w[0] = 0.5 * (1.5 - fx) * (1.5 - fx);
+	w[1] = 0.75 - (fx - 1.0) * (fx - 1.0);
+	w[2] = 0.5 * (fx - 0.5) * (fx - 0.5);
+	float scale = P.fp_scale;
+	uint matId = min(mat_id, NMAT - 1u);
+
+	for (int i = 0; i < 3; i++)
+	for (int j = 0; j < 3; j++)
+	for (int k = 0; k < 3; k++) {
+		ivec3 node = base + ivec3(i, j, k);
+		if (node.x < 0 || node.y < 0 || node.z < 0 ||
+			node.x >= ng || node.y >= ng || node.z >= ng) continue;
+		vec3 dpos = (vec3(i, j, k) - fx) * P.dx;
+		float weight = w[i].x * w[j].y * w[k].z;
+		// affine = stress(3x3) + mass*C ; contribution = weight*(mass*vel + affine*dpos)
+		vec3 ad;
+		ad.x = (st0*dpos.x + st1*dpos.y + st2*dpos.z) + mass*(C0*dpos.x + C1*dpos.y + C2*dpos.z);
+		ad.y = (st3*dpos.x + st4*dpos.y + st5*dpos.z) + mass*(C3*dpos.x + C4*dpos.y + C5*dpos.z);
+		ad.z = (st6*dpos.x + st7*dpos.y + st8*dpos.z) + mass*(C6*dpos.x + C7*dpos.y + C8*dpos.z);
+		vec3 mom = weight * (mass * vel + ad);
+		float mc = weight * mass;
+		uint ni = (uint(node.z) * uint(ng) + uint(node.y)) * uint(ng) + uint(node.x);
+		atomicAdd(g_mass.data[ni],        int(round(mc * scale)));
+		atomicAdd(g_mom.data[3u*ni],      int(round(mom.x * scale)));
+		atomicAdd(g_mom.data[3u*ni + 1u], int(round(mom.y * scale)));
+		atomicAdd(g_mom.data[3u*ni + 2u], int(round(mom.z * scale)));
+		atomicAdd(g_mass_mat.data[ni * NMAT + matId], int(round(mc * scale)));
+	}
+}

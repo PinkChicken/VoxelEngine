@@ -17,10 +17,22 @@ var _active: Array[VoxelSimulation]          # simulations currently with work
 var _accumulator: float = 0.0
 var paused: bool = false
 
+# MLS-MPM migration (2026-08-12, brief §37) — NOT a VoxelSimulation (see mpm_simulation.gd's
+# header for why), so it doesn't go through register_simulation()/_active; ticked directly
+# here instead. mpm_simulation is a CHILD of this node, so unlike _material_db above (a later
+# SIBLING of this node's own ancestor WorldOrchestrator, not ready yet at this point) it's
+# already ready by the time this runs — Godot readies children before their own parent.
+var mpm_simulation: MPMSimulation
+# Substeps of MPM physics per real 60Hz tick. 24 mirrors the retired evaluation's own tuned
+# default (brief §32.3) — a starting point, not a value re-derived for this game's specific
+# performance profile; tune directly if pacing looks wrong in play.
+@export var mpm_substeps_per_tick: int = 24
+
 
 func _ready() -> void:
 	_chunk_manager = get_node("/root/world/ChunkManager")
 	_material_db   = get_node("/root/world/MaterialDB")
+	mpm_simulation = get_node_or_null("MPMSimulation")
 	var orch := get_node("/root/world/WorldOrchestrator")
 	orch.chunks_committed.connect(_on_chunks_committed)
 	orch.chunk_loaded.connect(func(cp: Vector3i): _on_chunks_committed([cp]))
@@ -121,3 +133,6 @@ func _tick() -> void:
 		if not still_active.has(sim) and sim.has_work():
 			still_active.append(sim)
 	_active = still_active
+
+	if mpm_simulation and mpm_simulation.is_bound():
+		mpm_simulation.tick_all(mpm_substeps_per_tick)

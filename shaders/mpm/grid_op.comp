@@ -1,0 +1,123 @@
+#version 450
+layout(local_size_x = 64) in;
+
+// MPM production pass 3/4 — Grid update. Decode fixed-point accumulators to float velocity,
+// divide momentum by mass, apply gravity, then apply boundary conditions: an outer safety-box
+// clamp (the local MPM window's own edge — real windowing/streaming as particles move is future
+// work, brief §19.1) AND a no-slip read of real STATIC-material voxels (rock, glass, whatever
+// else MaterialDB tags mpm_model=STATIC — deliberately NOT "terrain": the same voxel a static
+// no-slip node reads today is exactly what a later reaction (acid eating stone, lava burning
+// wood) would promote into a particle, so this must key off MaterialDB's table, not a hardcoded
+// material check).
+//
+// Addressing mirrors shaders/granular_sim.comp's world_to_flat()/read_a() exactly — same
+// chunk_table/grid_min/grid_span scheme, same packed-uint voxel format (material id in the low
+// byte) — so this reads the real _voxel_buf_a/chunk_table once MPMSimulation.bind_voxel_world()
+// is pointed at WorldOrchestrator's real RIDs instead of a synthetic test buffer.
+
+layout(set = 0, binding = 0, std430) readonly buffer Params {
+	int n_grid; int n_particles; int bound; int pad0;
+	float dt; float dx; float inv_dx; float gravity;
+	float p_vol; float fp_scale; float pad1; float pad2;
+} P;
+layout(set = 0, binding = 8, std430) readonly buffer GMom  { int data[]; } g_mom;
+layout(set = 0, binding = 9, std430) readonly buffer GMass { int data[]; } g_mass;
+layout(set = 0, binding = 10, std430)         buffer GVel  { float data[]; } g_vel;
+layout(set = 0, binding = 13, std430) readonly buffer MatTable { uint data[]; } mat_table;
+layout(set = 0, binding = 14, std430) readonly buffer VoxelParams {
+	int chunk_size;
+	int grid_min_x; int grid_min_y; int grid_min_z;
+	int grid_span_x; int grid_span_y; int grid_span_z;
+	int origin_x; int origin_y; int origin_z;
+	int voxel_world_valid;  // 0 = no voxel world bound yet (bind_voxel_world() not called) — skip the read entirely
+	int pad1;
+} VP;
+layout(set = 0, binding = 15, std430) readonly buffer VoxelBufA { uint data[]; } voxels_a;
+layout(set = 0, binding = 16, std430) readonly buffer ChunkTable { int data[]; } chunk_table;
+
+const uint MODEL_STATIC = 1u;
+const uint MAT_STRIDE_U32 = 8u;
+uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
+
+// Ported 1:1 from shaders/granular_sim.comp's world_to_flat() (same chunk_table scheme).
+int world_to_flat(ivec3 gpos) {
+	int cs = VP.chunk_size;
+	int vpc = cs * cs * cs;
+	ivec3 cp = ivec3(floor(vec3(gpos) / float(cs)));
+	ivec3 lcp = cp - ivec3(VP.grid_min_x, VP.grid_min_y, VP.grid_min_z);
+	if (lcp.x < 0 || lcp.x >= VP.grid_span_x ||
+		lcp.y < 0 || lcp.y >= VP.grid_span_y ||
+		lcp.z < 0 || lcp.z >= VP.grid_span_z) return -1;
+	int tbl = lcp.z * VP.grid_span_x * VP.grid_span_y + lcp.y * VP.grid_span_x + lcp.x;
+	int slot = chunk_table.data[tbl];
+	if (slot < 0) return -1;
+	ivec3 lp = gpos - cp * cs;
+	return slot * vpc + lp.z * cs * cs + lp.y * cs + lp.x;
+}
+
+bool is_static_node(ivec3 local_node) {
+	if (VP.voxel_world_valid == 0) return false;
+	ivec3 world_voxel = ivec3(VP.origin_x, VP.origin_y, VP.origin_z) + local_node;
+	int flat_idx = world_to_flat(world_voxel);
+	if (flat_idx < 0) return false;
+	uint voxel = voxels_a.data[flat_idx];
+	uint mat_id = voxel & 0xFFu;
+	if (mat_id == 0u) return false;
+	return mat_model(mat_id) == MODEL_STATIC;
+}
+
+void main() {
+	uint idx = gl_GlobalInvocationID.x;
+	int ng = P.n_grid;
+	uint G = uint(ng) * uint(ng) * uint(ng);
+	if (idx >= G) return;
+
+	int ix = int(idx % uint(ng));
+	int iy = int((idx / uint(ng)) % uint(ng));
+	int iz = int(idx / (uint(ng) * uint(ng)));
+
+	if (is_static_node(ivec3(ix, iy, iz))) {
+		// No-slip: this node belongs to a real STATIC-material voxel — zero velocity
+		// regardless of whatever mass/momentum P2G also scattered into it this tick (a fluid
+		// or sand particle touching rock gets a hard boundary here, exactly like the retired
+		// evaluation's wall-particle mechanism, brief §35.1b — just driven by real voxel data
+		// instead of dummy particles).
+		g_vel.data[3u*idx]      = 0.0;
+		g_vel.data[3u*idx + 1u] = 0.0;
+		g_vel.data[3u*idx + 2u] = 0.0;
+		return;
+	}
+
+	float scale = P.fp_scale;
+	float m = float(g_mass.data[idx]) / scale;
+	vec3 vel = vec3(0.0);
+	if (m > 0.0) {
+		vel = vec3(float(g_mom.data[3u*idx]),
+				   float(g_mom.data[3u*idx + 1u]),
+				   float(g_mom.data[3u*idx + 2u])) / scale / m;
+	}
+	vel.y -= P.dt * P.gravity;
+
+	// SAFETY CLAMP: a node moving more than a handful of cells in one substep is already
+	// outside the MPM kernel's valid support (a particle's B-spline weights only reach its
+	// 3x3x3 neighbourhood) — converts silent instability that reads as material vanishing at
+	// a violent impact into a clean, physically-inert cap. 8x dx/dt is loose enough to never
+	// engage in ordinary flow; it only clips genuine transient spikes.
+	float max_speed = (P.dx / max(P.dt, 1e-9)) * 8.0;
+	float spd = length(vel);
+	if (spd > max_speed) {
+		vel *= max_speed / spd;
+	}
+
+	int b = P.bound;
+	if (ix < b       && vel.x < 0.0) vel.x = 0.0;
+	if (ix > ng - b  && vel.x > 0.0) vel.x = 0.0;
+	if (iy < b       && vel.y < 0.0) vel.y = 0.0;
+	if (iy > ng - b  && vel.y > 0.0) vel.y = 0.0;
+	if (iz < b       && vel.z < 0.0) vel.z = 0.0;
+	if (iz > ng - b  && vel.z > 0.0) vel.z = 0.0;
+
+	g_vel.data[3u*idx]      = vel.x;
+	g_vel.data[3u*idx + 1u] = vel.y;
+	g_vel.data[3u*idx + 2u] = vel.z;
+}

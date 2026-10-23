@@ -25,3 +25,21 @@ CLAUDE.md
 *.md
 !ARCHITECTURE.md
 !docs/BUG_LOG.md
+
+# Local-only: REA ("Reverse Engineer Anything") third-party MCP tool checkout —
+# ~58 MB / 4.7k files, MIT, unpacked without a .git. Analysis tooling, not
+# project source; must never enter this repo's history.
+rea-main/
+
+# Local-only: the 17 MB MLS-MPM reference paper — same rationale as Reference*.pdf.
+MPM reference.pdf
+
+# Retired MPM evaluation harness (brief §37.1 deleted it; a copy still sits on
+# disk for local probing). The production node is simulations/mpm_simulation.gd.
+mpm_test.gd
+mpm_test.gd.uid
+mpm_test.tscn
+
+# Local-only: the Taichi MPM benches — reference/findings, not code to build on
+# (brief §37.1). Mirrors the tools/fluid_prototypes/python/ rule above.
+tools/mpm_prototype/

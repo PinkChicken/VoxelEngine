@@ -2,6 +2,11 @@ class_name WorldOrchestrator extends Node
 
 signal chunks_committed(chunk_positions: Array[Vector3i])
 signal chunk_loaded(chunk_pos: Vector3i)
+# MLS-MPM migration (2026-08-12) — individual placed-voxel positions/materials (not just
+# chunk positions), emitted by EditDispatcher._dispatch() alongside chunks_committed, same
+# pattern as that signal (declared here, emitted by the writer that has _orchestrator).
+# MPMSimulation listens for this to promote newly-placed sand/water into particles.
+signal voxels_placed(positions: Array[Vector3i], material_ids: Array[int])
 
 var _chunk_manager: ChunkManager
 var _material_db: MaterialDB

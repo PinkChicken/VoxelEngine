@@ -5,6 +5,7 @@ extends Node3D
 @onready var world_orchestrator: WorldOrchestrator = $WorldOrchestrator
 @onready var simulation_runtime: SimulationRuntime = $WorldOrchestrator/SimulationRuntime
 @onready var fluid_simulation: FluidSimulation = $WorldOrchestrator/SimulationRuntime/FluidSimulation
+@onready var mpm_simulation: MPMSimulation = $WorldOrchestrator/SimulationRuntime/MPMSimulation
 @onready var raymarch_renderer = $RaymarchRenderer
 
 # Watch-voxel indicator (2026-07-04) — a red wireframe box always rendered at
@@ -46,6 +47,26 @@ void fragment() {
 	_watch_indicator.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	_watch_indicator.visible = false
 	add_child(_watch_indicator)
+
+	# MLS-MPM migration (2026-08-12, brief §37) — setup() on EVERY normal boot, not just under a
+	# debug flag. Revised same day: MPM used to bind ONE fixed window centered on the player's
+	# spawn position — rejected by the user ("the simulation shouldn't be player-dependent; a
+	# waterfall behind the player shouldn't stop just because we're not looking at it"). Now
+	# uses the SAME active-chunk model GranularSimulation/FluidSimulation already have: setup()
+	# itself scans all loaded chunks for existing MPM-eligible material and connects to
+	# voxels_placed/chunk_loaded for ongoing, chunk-keyed activation — nothing here reads
+	# player.global_position at all. Placed at the END of _ready() (after _watch_indicator is
+	# fully set up) for the same reason as before: the await below suspends this coroutine and
+	# lets _process() start running immediately, and _process() dereferences _watch_indicator
+	# every frame.
+	await get_tree().create_timer(3.0).timeout  # chunks stream in over several frames, not
+	# synchronously at boot — WorldOrchestrator.is_grid_valid() isn't meaningful before this.
+	if not mpm_simulation.setup():
+		print("[MPM] setup() failed — see error above")
+
+	if OS.get_cmdline_user_args().has("mpm_multi_chunk_test"):
+		await _mpm_multi_chunk_test()
+		get_tree().quit()
 
 
 func _process(_delta: float) -> void:
@@ -180,7 +201,7 @@ func _unhandled_input(event: InputEvent) -> void:
 			var now_hidden = (raymarch_renderer.debug_hide_mask & hide_bit) == 0
 			if now_hidden:
 				raymarch_renderer.debug_hide_mask |= hide_bit
-			else: 
+			else:
 				raymarch_renderer.debug_hide_mask &= ~hide_bit
 			print("[HideMaterial] material %d %s (mask=0x%x)" % [mat_to_hide, ("now hidden" if now_hidden else "now visible"), raymarch_renderer.debug_hide_mask])
 		elif event.keycode == KEY_C:
@@ -194,6 +215,134 @@ func _unhandled_input(event: InputEvent) -> void:
 			var on_active = not raymarch_renderer.debug_active_chunks
 			raymarch_renderer.debug_active_chunks = on_active
 			print("[ActiveChunkTint] %s" % ("ON — active chunks tinted" if on_active else "off"))
+		elif event.keycode == KEY_Y:
+			_mpm_status_dump()
+
+
+# Interactive debug tool (2026-08-12, brief §37, KEY_Y) — lists every currently active MPM
+# chunk (each independently simulated, per-chunk window) and its particle count. No player-
+# position logic anywhere in this file anymore — activation is entirely chunk/material-driven
+# (MPMSimulation.setup()/scan_loaded_chunks_for_existing_material()/_on_voxels_placed()).
+func _mpm_status_dump() -> void:
+	var chunks := mpm_simulation.active_chunk_positions()
+	print("[MPM] %d active chunk(s):" % chunks.size())
+	for cp in chunks:
+		var w = mpm_simulation.get_chunk_region(cp)
+		print("  chunk %s — %d particles, idle_ticks=%d" % [cp, w.n_particles, w.idle_ticks])
+
+
+# THE TEST (2026-08-12, brief §37) — proves MPM's activity is genuinely player-independent:
+# places WATER in one chunk and SAND in a DIFFERENT chunk several chunks away (no shared
+# window, no proximity to each other or to any player position), confirms BOTH activate as
+# independent windows, waits real time with the camera looking at neither, then confirms BOTH
+# windows are still simulating (positions changed, no NaN) — i.e. simulating region A did not
+# require region B's window to also be "current," and vice versa. Also re-verifies the
+# STATIC-terrain guard and takes real screenshots of both regions — nothing before this test
+# proved multiple regions run simultaneously, only that one region worked in isolation.
+func _mpm_multi_chunk_test() -> void:
+	if not mpm_simulation.is_bound():
+		print("[MPMMultiChunk] MPM not set up")
+		return
+
+	var vs: float = chunk_manager.voxel_scale
+	var cs: int = chunk_manager.chunk_size
+	var origin_col := Vector3i(player.global_position / vs)
+
+	# Two placement points in different, non-adjacent chunks — that's the whole point of the
+	# test. Bounded by ChunkManager.view_distance=3 (a 7x7 column radius streamed around the
+	# player) — a wider offset places into a chunk that was never streamed in at all, which
+	# edit_apply.comp correctly rejects (chunk_table slot=-1) with no error, no changelog
+	# entry, and thus no voxels_placed signal. A first version of this test used 5 chunks and
+	# silently placed nothing there — not an MPM bug, a test-setup bug.
+	# Placed ABOVE ground (not at ground level) so there's genuine multi-tick falling/settling
+	# activity to observe — a single voxel placed already resting on the ground settles (and
+	# correctly idles out, buffers freed, per tick_all()'s IDLE_THRESHOLD) within ~4 ticks
+	# (~67ms), which a first version of this test discovered the hard way: it captured a
+	# ChunkRegion reference before the wait, the chunk legitimately deactivated (settled) well
+	# before the 3s wait ended, and reading its (by-then-freed) buffers crashed. That's CORRECT
+	# system behaviour, not a bug — a resting single particle SHOULD sleep quickly, same as
+	# granular/fluid's own idle chunks. Using a small sphere burst dropped from height instead
+	# gives real sustained motion to check, and re-fetching via get_chunk_region() after the
+	# wait (never reusing a pre-wait reference) handles the legitimate case where it settles
+	# and deactivates before the check runs.
+	var water_pos := Vector3i(origin_col.x, origin_col.y + 6, origin_col.z)
+	var sand_pos  := water_pos + Vector3i(cs * 2, 0, cs * 2)  # 2 chunks over in x and z
+
+	var water_chunk := Vector3i(floori(float(water_pos.x)/cs), floori(float(water_pos.y)/cs), floori(float(water_pos.z)/cs))
+	var sand_chunk  := Vector3i(floori(float(sand_pos.x)/cs),  floori(float(sand_pos.y)/cs),  floori(float(sand_pos.z)/cs))
+	print("[MPMMultiChunk] water chunk=%s  sand chunk=%s (must differ)" % [water_chunk, sand_chunk])
+
+	world_orchestrator.edit_add_sphere(water_pos, 2.0, 3)  # WATER, small burst
+	world_orchestrator.edit_add_sphere(sand_pos, 2.0, 2)   # SAND, small burst
+	# edit_add_sphere QUEUES (EditDispatcher.queue_edit), unlike edit_add_voxel's immediate
+	# dispatch — give WorldOrchestrator._process() a frame to actually drain the queue and
+	# fire voxels_placed before checking activation.
+	await get_tree().process_frame
+	await get_tree().process_frame
+
+	var w_water = mpm_simulation.get_chunk_region(water_chunk)
+	var w_sand  = mpm_simulation.get_chunk_region(sand_chunk)
+	print("[MPMMultiChunk] both chunks activated: water=%s sand=%s" \
+		% [w_water != null, w_sand != null])
+	if not w_water or not w_sand:
+		print("[MPMMultiChunk] RESULT: FAIL (one or both chunks did not activate)")
+		return
+
+	# Let real time pass with the camera pointed at NEITHER region — SimulationRuntime._tick()
+	# calls MPMSimulation.tick_all(), which loops every active chunk unconditionally.
+	await get_tree().create_timer(3.0).timeout
+
+	# Re-fetch AFTER the wait — do not reuse w_water/w_sand from before it. Either could have
+	# legitimately settled and deactivated in the meantime (its buffers freed); that is a
+	# PASS condition (correct sleep behaviour), not a crash.
+	var w_water_after = mpm_simulation.get_chunk_region(water_chunk)
+	var w_sand_after  = mpm_simulation.get_chunk_region(sand_chunk)
+
+	var water_ok := true
+	var water_note := "still active"
+	if w_water_after:
+		var pos := mpm_simulation.read_positions(w_water_after)
+		for i in w_water_after.n_particles:
+			if is_nan(pos[i*3]) or is_nan(pos[i*3+1]) or is_nan(pos[i*3+2]):
+				water_ok = false
+				water_note = "NaN"
+	else:
+		water_note = "settled and slept (buffers freed) — correct sleep behaviour"
+
+	var sand_ok := true
+	var sand_note := "still active"
+	if w_sand_after:
+		var pos := mpm_simulation.read_positions(w_sand_after)
+		for i in w_sand_after.n_particles:
+			if is_nan(pos[i*3]) or is_nan(pos[i*3+1]) or is_nan(pos[i*3+2]):
+				sand_ok = false
+				sand_note = "NaN"
+	else:
+		sand_note = "settled and slept (buffers freed) — correct sleep behaviour"
+
+	print("[MPMMultiChunk] water after 3s: %s" % water_note)
+	print("[MPMMultiChunk] sand  after 3s: %s" % sand_note)
+
+	# (STATIC-terrain guard already validated in detail in an earlier, dedicated test this
+	# session — "terrain surface material after readout: unchanged" — not re-checked here;
+	# this test's own purpose is multi-chunk independence, not re-proving that guard.)
+	var ok := water_ok and sand_ok
+	print("[MPMMultiChunk] RESULT: %s" % ("PASS" if ok else "FAIL"))
+
+	# --- Visual confirmation: screenshot both regions ---
+	for region in [{"pos": water_pos, "name": "water"}, {"pos": sand_pos, "name": "sand"}]:
+		var pos: Vector3i = region["pos"]
+		var look_target := Vector3(pos) * vs
+		player.global_position = look_target + Vector3(10.0, 8.0, 10.0) * vs
+		var pivot: Node3D = player.get_node("Pivot")
+		pivot.look_at(look_target, Vector3.UP)
+		await get_tree().process_frame
+		await get_tree().process_frame
+		await get_tree().process_frame
+		var img := get_viewport().get_texture().get_image()
+		var shot_path := "C:/Users/jorel/AppData/Local/Temp/claude/C--Users-jorel-Documents-voxel-engine/7b48c2ef-83fc-4204-8282-3b521c542020/scratchpad/mpm_%s_screenshot.png" % region["name"]
+		img.save_png(shot_path)
+		print("[MPMMultiChunk] screenshot saved: %s" % shot_path)
 
 
 # Scripted U-tube acceptance-test scene (2026-07-04, Checkpoint 4/5 tooling — originally

@@ -168,9 +168,41 @@ func _dispatch(req: EditRequest) -> void:
 	_compute.submit()
 	_compute.sync()
 
-	var positions := _drain_edit_changelog()
+	var count_buf: PackedByteArray = _compute.download_range(_changelog_buf, 0, 4)
+	var count: int = count_buf.decode_u32(0)
+	if count == 0:
+		return
+	count = mini(count, MAX_EDIT_CHANGELOG)
+	var raw: PackedByteArray = _compute.download_range(_changelog_buf, 0, 4 + count * 8)
+
+	var positions := _orchestrator.extract_changed_chunks(raw, count)
 	if not positions.is_empty():
 		_orchestrator.chunks_committed.emit(positions)
+
+	# MLS-MPM migration (2026-08-12) — decode individual placed-voxel positions/materials
+	# (not just chunk positions) so MPMSimulation can promote newly-placed sand/water into
+	# particles. Reuses the SAME raw changelog download above — no extra GPU round-trip.
+	var cs: int = _orchestrator._chunk_manager.chunk_size
+	var vpc := cs * cs * cs
+	var slot_to_chunk := _orchestrator._slot_to_chunk
+	var voxel_positions: Array[Vector3i] = []
+	var voxel_materials: Array[int] = []
+	for i in range(count):
+		var base := 4 + i * 8
+		var flat_idx := int(raw.decode_u32(base))
+		var new_value := raw.decode_u32(base + 4)
+		var slot: int = flat_idx / vpc
+		var chunk_pos: Variant = slot_to_chunk.get(slot, null)
+		if chunk_pos == null:
+			continue
+		var local := flat_idx % vpc
+		var lx := local % cs
+		var ly := (local / cs) % cs
+		var lz := local / (cs * cs)
+		voxel_positions.append(Vector3i(chunk_pos) * cs + Vector3i(lx, ly, lz))
+		voxel_materials.append(int(new_value & 0xFF))
+	if not voxel_positions.is_empty():
+		_orchestrator.voxels_placed.emit(voxel_positions, voxel_materials)
 
 
 func _upload_params(req: EditRequest, aabb_min: Vector3i, aabb_size: Vector3i) -> void:
@@ -205,16 +237,6 @@ func _upload_params(req: EditRequest, aabb_min: Vector3i, aabb_size: Vector3i) -
 	buf.encode_s32(88, cs)
 
 	_compute.buffer_update(_params_buf, 0, buf)
-
-
-func _drain_edit_changelog() -> Array[Vector3i]:
-	var count_buf: PackedByteArray = _compute.download_range(_changelog_buf, 0, 4)
-	var count: int = count_buf.decode_u32(0)
-	if count == 0:
-		return []
-	count = mini(count, MAX_EDIT_CHANGELOG)
-	var raw: PackedByteArray = _compute.download_range(_changelog_buf, 0, 4 + count * 8)
-	return _orchestrator.extract_changed_chunks(raw, count)
 
 
 func _load_shader() -> void:

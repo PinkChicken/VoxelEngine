@@ -1,0 +1,117 @@
+#version 450
+layout(local_size_x = 64) in;
+
+// MPM production pass 4/4 — Grid-to-Particle (G2P) gather. Mirrors A:\TaichiGPU\main.py's G2P
+// step (lines 171-209), extended to 3D with the same quadratic B-spline weights p2g.comp
+// already uses. Table-driven like p2g.comp: GRANULAR/ELASTIC particles carry a deformation
+// gradient F and get it advanced here (F <- (I + dt*C) F); FLUID particles carry a scalar
+// volume ratio J and get it advanced here (J <- J * (1 + dt*trace(C))). p2g.comp's SVD +
+// Drucker-Prager return mapping then reads and plastically corrects this F next substep — the
+// order matters and is deliberate (see p2g.comp's header comment).
+
+layout(set = 0, binding = 0, std430) readonly buffer Params {
+	int n_grid; int n_particles; int bound; int pad0;
+	float dt; float dx; float inv_dx; float gravity;
+	float p_vol; float fp_scale; float pad1; float pad2;
+} P;
+layout(set = 0, binding = 1, std430)          buffer Pos   { float data[]; } p_pos;
+layout(set = 0, binding = 2, std430)          buffer Vel   { float data[]; } p_vel;
+layout(set = 0, binding = 3, std430)          buffer Caff  { float data[]; } p_C;
+layout(set = 0, binding = 4, std430)          buffer Jbuf  { float data[]; } p_J;
+layout(set = 0, binding = 5, std430) readonly buffer MatB  { uint  data[]; } p_mat;
+layout(set = 0, binding = 7, std430) readonly buffer Alive { uint  data[]; } p_alive;
+layout(set = 0, binding = 10, std430) readonly buffer GVel { float data[]; } g_vel;
+layout(set = 0, binding = 11, std430)          buffer Fdef { float data[]; } p_F;
+layout(set = 0, binding = 13, std430) readonly buffer MatTable { uint data[]; } mat_table;
+
+const uint MODEL_NOT_SIMULATED = 0u;
+const uint MODEL_STATIC        = 1u;
+const uint MODEL_FLUID         = 2u;
+const uint MODEL_GRANULAR      = 3u;
+const uint MODEL_ELASTIC       = 4u;
+const uint MAT_STRIDE_U32 = 8u;
+
+uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
+
+void main() {
+	uint p = gl_GlobalInvocationID.x;
+	if (p >= uint(P.n_particles)) return;
+	if (p_alive.data[p] == 0u) return;
+
+	uint mat_id = p_mat.data[p];
+	uint model = mat_model(mat_id);
+	if (model == MODEL_NOT_SIMULATED || model == MODEL_STATIC) return;  // never moves / no particle yet
+
+	int ng = P.n_grid;
+	vec3 pos = vec3(p_pos.data[3u*p], p_pos.data[3u*p+1u], p_pos.data[3u*p+2u]);
+	vec3 Xp = pos * P.inv_dx;
+	ivec3 base = ivec3(Xp - 0.5);
+	vec3 fx = Xp - vec3(base);
+	vec3 w[3];
+	w[0] = 0.5 * (1.5 - fx) * (1.5 - fx);
+	w[1] = 0.75 - (fx - 1.0) * (fx - 1.0);
+	w[2] = 0.5 * (fx - 0.5) * (fx - 0.5);
+
+	vec3 new_vel = vec3(0.0);
+	// new_C: 3x3 affine velocity gradient, accumulated as flat components (row-major).
+	float nc0=0.0, nc1=0.0, nc2=0.0, nc3=0.0, nc4=0.0, nc5=0.0, nc6=0.0, nc7=0.0, nc8=0.0;
+
+	for (int i = 0; i < 3; i++)
+	for (int j = 0; j < 3; j++)
+	for (int k = 0; k < 3; k++) {
+		ivec3 node = base + ivec3(i, j, k);
+		if (node.x < 0 || node.y < 0 || node.z < 0 ||
+			node.x >= ng || node.y >= ng || node.z >= ng) continue;
+		vec3 dpos = (vec3(i, j, k) - fx) * P.dx;
+		float weight = w[i].x * w[j].y * w[k].z;
+		uint ni = (uint(node.z) * uint(ng) + uint(node.y)) * uint(ng) + uint(node.x);
+		vec3 gv = vec3(g_vel.data[3u*ni], g_vel.data[3u*ni+1u], g_vel.data[3u*ni+2u]);
+		new_vel += weight * gv;
+		// new_C += 4 * weight * outer(gv, dpos) / dx^2
+		float coef = 4.0 * weight * P.inv_dx * P.inv_dx;
+		nc0 += coef * gv.x*dpos.x; nc1 += coef * gv.x*dpos.y; nc2 += coef * gv.x*dpos.z;
+		nc3 += coef * gv.y*dpos.x; nc4 += coef * gv.y*dpos.y; nc5 += coef * gv.y*dpos.z;
+		nc6 += coef * gv.z*dpos.x; nc7 += coef * gv.z*dpos.y; nc8 += coef * gv.z*dpos.z;
+	}
+
+	p_vel.data[3u*p]      = new_vel.x;
+	p_vel.data[3u*p + 1u] = new_vel.y;
+	p_vel.data[3u*p + 2u] = new_vel.z;
+
+	// Domain is [0, n_grid) in real voxel units, NOT a normalized [0,1] cube — this clamp
+	// used to read `vec3(1.0)` (main.py's original unit-cube convention) before the grid was
+	// locked to real voxel resolution (brief §37); left unported once, it silently trapped
+	// every particle at y=1.0 the first time this ran against real static-voxel boundaries.
+	vec3 new_pos = pos + P.dt * new_vel;
+	new_pos = clamp(new_pos, vec3(0.0), vec3(float(P.n_grid) - 1e-4));
+	p_pos.data[3u*p]      = new_pos.x;
+	p_pos.data[3u*p + 1u] = new_pos.y;
+	p_pos.data[3u*p + 2u] = new_pos.z;
+
+	p_C.data[9u*p]      = nc0; p_C.data[9u*p+1u] = nc1; p_C.data[9u*p+2u] = nc2;
+	p_C.data[9u*p+3u]   = nc3; p_C.data[9u*p+4u] = nc4; p_C.data[9u*p+5u] = nc5;
+	p_C.data[9u*p+6u]   = nc6; p_C.data[9u*p+7u] = nc7; p_C.data[9u*p+8u] = nc8;
+
+	if (model == MODEL_FLUID) {
+		float trace_c = nc0 + nc4 + nc8;
+		p_J.data[p] = p_J.data[p] * (1.0 + P.dt * trace_c);
+	} else {
+		// GRANULAR / ELASTIC: F <- (I + dt*C) F. p2g.comp's SVD + Drucker-Prager return
+		// mapping (GRANULAR only) reads and plastically corrects this next substep.
+		float F0 = p_F.data[9u*p],    F1 = p_F.data[9u*p+1u], F2 = p_F.data[9u*p+2u];
+		float F3 = p_F.data[9u*p+3u], F4 = p_F.data[9u*p+4u], F5 = p_F.data[9u*p+5u];
+		float F6 = p_F.data[9u*p+6u], F7 = p_F.data[9u*p+7u], F8 = p_F.data[9u*p+8u];
+		float I0 = 1.0 + P.dt*nc0, I1 = P.dt*nc1,       I2 = P.dt*nc2;
+		float I3 = P.dt*nc3,       I4 = 1.0 + P.dt*nc4, I5 = P.dt*nc5;
+		float I6 = P.dt*nc6,       I7 = P.dt*nc7,       I8 = 1.0 + P.dt*nc8;
+		p_F.data[9u*p]      = I0*F0 + I1*F3 + I2*F6;
+		p_F.data[9u*p+1u]   = I0*F1 + I1*F4 + I2*F7;
+		p_F.data[9u*p+2u]   = I0*F2 + I1*F5 + I2*F8;
+		p_F.data[9u*p+3u]   = I3*F0 + I4*F3 + I5*F6;
+		p_F.data[9u*p+4u]   = I3*F1 + I4*F4 + I5*F7;
+		p_F.data[9u*p+5u]   = I3*F2 + I4*F5 + I5*F8;
+		p_F.data[9u*p+6u]   = I6*F0 + I7*F3 + I8*F6;
+		p_F.data[9u*p+7u]   = I6*F1 + I7*F4 + I8*F7;
+		p_F.data[9u*p+8u]   = I6*F2 + I7*F5 + I8*F8;
+	}
+}
