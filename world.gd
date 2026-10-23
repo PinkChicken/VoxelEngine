@@ -305,10 +305,10 @@ func _mpm_status_dump() -> void:
 	if info.is_empty():
 		print("[MPM] no live region — %d chunk(s) requested, none simulated (asleep or refused)" % chunks.size())
 		return
-	print("[MPM] region origin=%s dims=%s nodes=%d | %d/%d requested, %d covered by grid, %d/%d particles, idle_ticks=%d" % [
+	print("[MPM] region origin=%s dims=%s nodes=%d | %d/%d requested, %d occupied, %d covered | %d/%d particles, idle_ticks=%d" % [
 		info["origin"], info["dims"], info["nodes"],
 		int(info["requested"]), mpm_simulation.max_active_chunks,
-		mpm_simulation.active_chunk_positions().size(),
+		int(info["occupied"]), mpm_simulation.active_chunk_positions().size(),
 		int(info["particles"]), int(info["capacity"]), int(info["idle_ticks"])])
 	var requested := mpm_simulation.requested_chunk_positions()
 	if not requested.is_empty():

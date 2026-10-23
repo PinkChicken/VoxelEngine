@@ -90,6 +90,9 @@ const MAX_REGION_NODES := 1048576
 const BOUND := 3
 const NMAT := 8  # must match clear_grid.comp/p2g.comp's NMAT — the render mass-breakdown slot count
 const DIRTY_BUF_BYTES := 64  # matches GranularSimulation's own constant/convention
+# Region-grid chunk occupancy bitmask: 512 chunks' worth, far more than a bounding box under
+# MAX_REGION_NODES can hold. Must be a multiple of 4 (u32 words).
+const OCCUPANCY_BYTES := 64
 const IDLE_THRESHOLD := 4    # ticks with no motion before the whole region sleeps — matches
 							 # GranularSimulation's own threshold (granular_simulation.gd)
 # Target magnitude for a busy grid node's fixed-point accumulator (fp_scale is derived from
@@ -123,6 +126,10 @@ class ChunkRegion:
 	# and consumed by _grow_region_if_needed(). Reset per readout.
 	var face_mask_buf: RID
 	var face_mask: int = 0
+	# 1 bit per chunk of this region's grid: does the chunk contain material? Written by
+	# readout.comp, downloaded each tick, consumed by _release_idle_chunks().
+	var occupancy_buf: RID
+	var occupied: Dictionary = {}  # Vector3i chunk coord -> true
 
 	var set_clear: RID; var set_p2g: RID; var set_grid_op: RID; var set_g2p: RID; var set_readout: RID
 
@@ -453,6 +460,7 @@ func _build_region(origin: Vector3i, dims: Vector3i, chunks: Array[Vector3i], pr
 	w.params_buf = _new_zero_buf(48)
 	w.dirty_chunks_buf = _new_zero_buf(DIRTY_BUF_BYTES)
 	w.face_mask_buf = _new_zero_buf(4)
+	w.occupancy_buf = _new_zero_buf(OCCUPANCY_BYTES)
 
 	w.voxel_params_buf = _new_zero_buf(48)
 	var b := PackedByteArray(); b.resize(48)
@@ -506,19 +514,25 @@ func _copy_particles_shifted(prev: ChunkRegion, w: ChunkRegion) -> void:
 	# boundary wall and reappear as material teleported to the edge. Readout already wrote its
 	# voxels before the chunk was released, so nothing is lost visually — it is simply frozen as
 	# static voxels until something disturbs it again.
+	# Particles must never be KILLED here. Clamp them back inside instead: killing loses material
+	# permanently (the voxels are stale, and nothing re-activates a chunk that no longer changes),
+	# which is what left an intact water sphere hanging motionless in mid-air. With occupancy-based
+	# release the box should not shrink over material at all, so this is a safety net — but a
+	# safety net that preserves mass rather than silently deleting it.
 	var alive := PackedInt32Array(); alive.resize(n)
-	var limit := Vector3(w.dims)
-	var dropped := 0
+	var hi := Vector3(w.dims) - Vector3(1e-4, 1e-4, 1e-4)
+	var clamped := 0
 	for i in n:
 		var px: float = pos[i*3]     + shift.x
 		var py: float = pos[i*3 + 1] + shift.y
 		var pz: float = pos[i*3 + 2] + shift.z
-		pos[i*3] = px; pos[i*3 + 1] = py; pos[i*3 + 2] = pz
-		if px < 0.0 or py < 0.0 or pz < 0.0 or px >= limit.x or py >= limit.y or pz >= limit.z:
-			alive[i] = 0
-			dropped += 1
-		else:
-			alive[i] = 1
+		var cx := clampf(px, 0.0, hi.x)
+		var cy := clampf(py, 0.0, hi.y)
+		var cz := clampf(pz, 0.0, hi.z)
+		if cx != px or cy != py or cz != pz:
+			clamped += 1
+		pos[i*3] = cx; pos[i*3 + 1] = cy; pos[i*3 + 2] = cz
+		alive[i] = 1
 	_compute.buffer_update(w.pos, 0, pos.to_byte_array())
 	_compute.buffer_update(w.alive, 0, alive.to_byte_array())
 	_compute.buffer_copy(prev.vel,   w.vel,   0, 0, n * 3 * 4)
@@ -527,8 +541,8 @@ func _copy_particles_shifted(prev: ChunkRegion, w: ChunkRegion) -> void:
 	_compute.buffer_copy(prev.mat,   w.mat,   0, 0, n * 4)
 	_compute.buffer_copy(prev.mass,  w.mass,  0, 0, n * 4)
 	_compute.buffer_copy(prev.F,     w.F,     0, 0, n * 9 * 4)
-	if dropped > 0:
-		print("[MPM] region resized: %d particle(s) left the new bounds and were frozen as voxels" % dropped)
+	if clamped > 0:
+		print("[MPM] region resized: %d particle(s) clamped back inside the new bounds" % clamped)
 	w.n_particles = n
 	w.groups_particles = int(ceil(float(n) / 64.0))
 	_upload_region_params(w)
@@ -544,7 +558,7 @@ func _destroy_region() -> void:
 func _free_region_buffers(w: ChunkRegion) -> void:
 	for rid in [w.params_buf, w.pos, w.vel, w.C, w.J, w.mat, w.mass, w.alive, w.F,
 		w.g_mom, w.g_mass, w.g_vel, w.g_mass_mat,
-		w.voxel_params_buf, w.dirty_chunks_buf, w.face_mask_buf]:
+		w.voxel_params_buf, w.dirty_chunks_buf, w.face_mask_buf, w.occupancy_buf]:
 		if rid.is_valid():
 			_compute.free_rid(rid)
 
@@ -833,7 +847,7 @@ func _build_region_sets(w: ChunkRegion) -> void:
 		_u(0, w.params_buf), _u(9, w.g_mass), _u(12, w.g_mass_mat),
 		_u(13, _material_db.mpm_buffer_rid), _u(14, w.voxel_params_buf),
 		_u(15, w.voxel_buf_a), _u(16, w.chunk_table), _u(17, _orchestrator.get_changelog_buf()),
-		_u(18, w.dirty_chunks_buf), _u(19, w.face_mask_buf)
+		_u(18, w.dirty_chunks_buf), _u(19, w.face_mask_buf), _u(20, w.occupancy_buf)
 	], _readout.shader)
 
 
@@ -934,14 +948,14 @@ func _release_idle_chunks(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
 	if _active_chunks.size() <= 1:
 		return false
 
-	var changed_set: Dictionary = {}
-	for cp in changed:
-		changed_set[cp] = true
-
 	var to_release: Array[Vector3i] = []
 	for key in _active_chunks:
 		var cp: Vector3i = key
-		if changed_set.has(cp):
+		# NEVER release a chunk that still holds material. The previous test was "no readout
+		# change for N ticks", which is true of a chunk holding RESTING water — so the region
+		# shrank over settled pools and _copy_particles_shifted killed what it left outside,
+		# freezing the water in mid-air. Occupancy is the honest question.
+		if w.occupied.has(cp):
 			_chunk_idle[cp] = 0
 			continue
 		var age: int = int(_chunk_idle.get(cp, 0)) + 1
@@ -1083,6 +1097,8 @@ func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
 	var zero_face := PackedByteArray(); zero_face.resize(4); zero_face.fill(0)
 	_compute.buffer_update(w.face_mask_buf, 0, zero_face)
 	w.face_mask = 0
+	var zero_occ := PackedByteArray(); zero_occ.resize(OCCUPANCY_BYTES); zero_occ.fill(0)
+	_compute.buffer_update(w.occupancy_buf, 0, zero_occ)
 	_orchestrator.reset_changelog()
 
 	_compute.run_with_set(_readout, w.set_readout, w.groups_grid)
@@ -1095,8 +1111,40 @@ func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
 	var face_raw: PackedByteArray = _compute.download_range(w.face_mask_buf, 0, 4)
 	if face_raw.size() >= 4:
 		w.face_mask = int(face_raw.decode_u32(0))
+	w.occupied = _decode_occupancy(w, _compute.download_range(w.occupancy_buf, 0, OCCUPANCY_BYTES))
 	var bitmask: PackedByteArray = _compute.download_range(w.dirty_chunks_buf, 0, DIRTY_BUF_BYTES)
 	return _decode_dirty_bitmask(bitmask)
+
+
+# Turn the occupancy bitmask into a set of chunk coords (world chunk space, same convention as
+# _active_chunks) so _release_idle_chunks() can ask a direct question: does this chunk hold
+# material? Bit index follows readout.comp's layout: (cz * dcx + cy) * dcx + cx over the region's
+# own chunk grid.
+func _decode_occupancy(w: ChunkRegion, raw: PackedByteArray) -> Dictionary:
+	var out: Dictionary = {}
+	var dcx := int(w.dims.x) / n_grid
+	var dcy := int(w.dims.y) / n_grid
+	var dcz := int(w.dims.z) / n_grid
+	if dcx <= 0 or dcy <= 0 or dcz <= 0:
+		return out
+	var bmin := Vector3i(w.origin.x / n_grid, w.origin.y / n_grid, w.origin.z / n_grid)
+	var words := raw.size() / 4
+	for wi in range(words):
+		var word: int = raw.decode_u32(wi * 4)
+		if word == 0:
+			continue
+		for bit in range(32):
+			if word & (1 << bit) == 0:
+				continue
+			var idx: int = wi * 32 + bit
+			var cz: int = idx / (dcx * dcy)
+			var rem: int = idx % (dcx * dcy)
+			var cy: int = rem / dcx
+			var cx: int = rem % dcx
+			if cz >= dcz:
+				continue
+			out[bmin + Vector3i(cx, cy, cz)] = true
+	return out
 
 
 # Ported from GranularSimulation._decode_dirty_bitmask() — same bit layout, same reach into
@@ -1172,6 +1220,7 @@ func region_grid_info() -> Dictionary:
 		# Which boundary planes currently hold material (bit 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z).
 		# The single most useful field for "why isn't the region following the water".
 		"faces": _region.face_mask,
+		"occupied": _region.occupied.size(),
 	}
 
 
