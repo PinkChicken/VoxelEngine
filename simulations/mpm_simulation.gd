@@ -451,20 +451,34 @@ func _ensure_region() -> bool:
 	if _active_chunks.is_empty():
 		_destroy_region()
 		return false
-	# Nothing to recentre on yet — the region was just rebuilt and no readout has run on it. This
-	# guard matters: without it the window would recentre from the fallback set, rebuild, lose its
-	# occupancy, recentre again from the fallback, and oscillate every tick.
-	if _region != null and _region.occupied.is_empty():
-		return false
-
 	var chunks: Array[Vector3i] = []
 	for key in _active_chunks:
 		var c: Vector3i = key
 		chunks.append(c)
 
 	var dims := region_chunks * n_grid
-	var origin := _window_origin_for(_material_centroid_chunk(chunks))
 	var sig := _active_signature()
+
+	var origin: Vector3i
+	if _region == null:
+		# FIRST BUILD — centre the window on the requested set.
+		var bb := _bbox_chunks(chunks)
+		var span := bb[1] - bb[0] + Vector3i.ONE
+		var pad := (region_chunks - span) / 2
+		origin = (bb[0] - pad) * n_grid
+	else:
+		# EXISTING REGION — shift at most ONE chunk, and only toward material that has reached an
+		# edge. Never re-centre on a computed midpoint: occupancy is derived from INSIDE the
+		# window, so a midpoint chases whatever fragment is still inside and abandons the bulk.
+		# Measured: "window moved: 14146 particle(s) left the window" on a 14,147-particle body —
+		# the window walked off the water and froze essentially all of it, repeatedly. That is the
+		# half-sphere that never dripped.
+		if _region.occupied.is_empty():
+			return false
+		var shift := _edge_shift(_region)
+		if shift == Vector3i.ZERO:
+			return false
+		origin = _region.origin + shift * n_grid
 
 	if _region != null and _region.dims == dims and _region.origin == origin:
 		if _region.signature == sig:
@@ -491,38 +505,48 @@ func _ensure_region() -> bool:
 	return true
 
 
-# Where the window should sit, given where the material's MASS is.
+# ONE CHUNK toward whichever side has material at (or past) the window edge. A TRANSLATION, never
+# a re-centring, so it can strand at most one chunk's worth of material instead of the whole body.
 #
-# Anchored on the CENTROID of the occupied chunks, not on the bounding box. Bbox-with-padding put
-# the body in the window's min corner whenever the span was already window-sized — measured: 2
-# occupied chunks in a 2x2x2 window, padding (2-2)/2 = 0, so origin = bmin and the water had a
-# hard wall immediately at -X and -Y with all the free space behind it. That is the "invisible
-# wall with only 4 active chunks" report. The centroid gives roughly half a window of room on
-# every side, so the boundary trails the material instead of leading it.
-func _window_origin_for(centroid_chunk: Vector3i) -> Vector3i:
-	var half := Vector3i(region_chunks.x / 2, region_chunks.y / 2, region_chunks.z / 2)
-	return (centroid_chunk - half) * n_grid
+# An axis is skipped when the material already spans the full window in it: the same water then
+# touches BOTH edges and shifting would ratchet the window back and forth forever.
+func _edge_shift(w: ChunkRegion) -> Vector3i:
+	var wmin := Vector3i(w.origin.x / n_grid, w.origin.y / n_grid, w.origin.z / n_grid)
+	var wmax := wmin + region_chunks - Vector3i.ONE
+	var bb := _bbox_chunks_from(w.occupied)
+	var omin := bb[0]
+	var omax := bb[1]
+	var span := omax - omin + Vector3i.ONE
+	var shift := Vector3i.ZERO
+	if span.x < region_chunks.x:
+		if omin.x <= wmin.x: shift.x = -1
+		elif omax.x >= wmax.x: shift.x = 1
+	if span.y < region_chunks.y:
+		if omin.y <= wmin.y: shift.y = -1
+		elif omax.y >= wmax.y: shift.y = 1
+	if span.z < region_chunks.z:
+		if omin.z <= wmin.z: shift.z = -1
+		elif omax.z >= wmax.z: shift.z = 1
+	return shift
 
 
-# Centroid of the material in chunk coords: prefers readout's occupancy mask (where the water
-# actually is), falls back to the requested set before the first readout has run.
-func _material_centroid_chunk(fallback: Array[Vector3i]) -> Vector3i:
-	var src: Dictionary = {}
-	if _region != null and not _region.occupied.is_empty():
-		src = _region.occupied
-	else:
-		for c in fallback:
-			src[c] = true
-	if src.is_empty():
-		return Vector3i.ZERO
-	var sum := Vector3i.ZERO
+func _bbox_chunks_from(src: Dictionary) -> Array[Vector3i]:
+	var bmin := Vector3i(2147483647, 2147483647, 2147483647)
+	var bmax := Vector3i(-2147483648, -2147483648, -2147483648)
 	for key in src:
 		var c: Vector3i = key
-		sum += c
-	var n := maxi(src.size(), 1)
-	# Integer rounding on each axis; Godot's Vector3i division truncates, which is fine here since
-	# the window snaps to whole chunks anyway.
-	return Vector3i(roundi(float(sum.x) / n), roundi(float(sum.y) / n), roundi(float(sum.z) / n))
+		bmin = Vector3i(mini(bmin.x, c.x), mini(bmin.y, c.y), mini(bmin.z, c.z))
+		bmax = Vector3i(maxi(bmax.x, c.x), maxi(bmax.y, c.y), maxi(bmax.z, c.z))
+	if bmin.x > bmax.x:
+		return [Vector3i.ZERO, Vector3i.ZERO]
+	return [bmin, bmax]
+
+
+func _bbox_chunks(arr: Array[Vector3i]) -> Array[Vector3i]:
+	var d: Dictionary = {}
+	for c in arr:
+		d[c] = true
+	return _bbox_chunks_from(d)
 
 
 # Order-independent fingerprint of the active chunk set (positional hash combine).
