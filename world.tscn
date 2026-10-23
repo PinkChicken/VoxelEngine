@@ -113,12 +113,19 @@ enabled = false
 
 [node name="MPMSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=918273645]
 script = ExtResource("13_mpm")
+n_grid = null
+gravity = null
+sim_seconds_per_tick = null
+max_particles = null
+max_active_chunks = null
 
 [node name="MaterialDB" type="Node" parent="." unique_id=1815152731]
 script = ExtResource("8_udhof")
 
 [node name="RaymarchRenderer" type="Node" parent="." unique_id=234594842]
 script = ExtResource("6_udhof")
+debug_chunk_borders = true
+debug_active_chunks = true
 
 [node name="HotBar" type="CanvasLayer" parent="." unique_id=1070206372]
 script = ExtResource("9_hotbar")

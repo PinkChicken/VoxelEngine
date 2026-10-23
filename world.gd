@@ -75,6 +75,24 @@ void fragment() {
 		await _mpm_multi_chunk_test()
 		get_tree().quit()
 
+	if OS.get_cmdline_user_args().has("mpm_stress"):
+		await _mpm_stress()
+
+
+# STRESS HARNESS (2026-08-13) — one deliberately oversized water body, dropped above the player,
+# so the cost curve can be read off [MPM perf] lines while the region grows under it. Run with:
+#   ... res://world.tscn -- mpm_stress
+# `mpm_stress` implies MPM solver mode AND log_mpm_perf (see SimulationRuntime._resolve_solver_mode).
+# Watch how ms/tick tracks `nodes` (grid size) vs `particles`: that ratio is what decides whether
+# `promote_stride` (fewer, bigger particles) is worth spending fidelity on, or whether the grid
+# itself is the cost and the answer is a smaller region instead.
+func _mpm_stress() -> void:
+	var vs: float = chunk_manager.voxel_scale
+	var center := Vector3i(player.global_position / vs) + Vector3i(0, 20, 0)
+	print("[MPMStress] spawning a radius-11 water body at voxel %s" % center)
+	world_orchestrator.edit_add_sphere(center, 11.0, 3)  # 3 = WATER, ~5.6k voxels
+	print("[MPMStress] watch the [MPM perf] lines and press Y for region state")
+
 
 func _process(_delta: float) -> void:
 	_watch_indicator.visible = fluid_simulation.watch_enabled
@@ -243,12 +261,14 @@ func _mpm_status_dump() -> void:
 	if info.is_empty():
 		print("[MPM] no live region — %d chunk(s) requested, none simulated (asleep or refused)" % chunks.size())
 		return
-	print("[MPM] region origin=%s dims=%s nodes=%d | %d/%d chunks, %d/%d particles, idle_ticks=%d" % [
+	print("[MPM] region origin=%s dims=%s nodes=%d | %d/%d requested, %d covered by grid, %d/%d particles, idle_ticks=%d" % [
 		info["origin"], info["dims"], info["nodes"],
-		info["chunks"], mpm_simulation.max_active_chunks,
-		info["particles"], info["capacity"], info["idle_ticks"]])
-	if not chunks.is_empty():
-		print("  chunks: %s" % [chunks])
+		int(info["requested"]), mpm_simulation.max_active_chunks,
+		mpm_simulation.active_chunk_positions().size(),
+		int(info["particles"]), int(info["capacity"]), int(info["idle_ticks"])])
+	var requested := mpm_simulation.requested_chunk_positions()
+	if not requested.is_empty():
+		print("  requested (drives budget + growth): %s" % [requested])
 
 
 # THE TEST (2026-08-12, brief §37) — proves MPM's activity is genuinely player-independent:

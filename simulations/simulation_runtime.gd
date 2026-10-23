@@ -48,6 +48,14 @@ var mpm_simulation: MPMSimulation
 # default (brief §32.3) — a starting point, not a value re-derived for this game's specific
 # performance profile; tune directly if pacing looks wrong in play.
 @export var mpm_substeps_per_tick: int = 24
+# Per-tick wall-clock timing for the MPM path. This is the measurement ARCHITECTURE.md §7.0 has
+# asked for since before the migration: every cost estimate in that section is a hypothesis read
+# off the code. Enable with `-- mpm_perf` (or `-- mpm_stress`, which implies it) and it prints an
+# average every 60 ticks including the live node/particle counts, so the cost curve can be
+# attributed to grid size vs particle count rather than guessed at.
+@export var log_mpm_perf: bool = false
+var _perf_usec: int = 0
+var _perf_ticks: int = 0
 
 
 func _ready() -> void:
@@ -67,10 +75,12 @@ func _ready() -> void:
 # and so the print below always reflects the mode actually in effect.
 func _resolve_solver_mode() -> void:
 	var args := OS.get_cmdline_user_args()
-	if args.has("mpm") or args.has("mpm_multi_chunk_test"):
+	if args.has("mpm") or args.has("mpm_multi_chunk_test") or args.has("mpm_perf") or args.has("mpm_stress"):
 		solver_mode = SolverMode.MPM
 	elif args.has("ca"):
 		solver_mode = SolverMode.CA
+	if args.has("mpm_perf") or args.has("mpm_stress"):
+		log_mpm_perf = true
 	var mode_name := "MPM" if is_mpm_mode() else "CA"
 	print("[SimRuntime] solver mode = %s (one solver owns the voxel buffer this run)" % mode_name)
 
@@ -173,7 +183,19 @@ func _tick() -> void:
 	# would put two independent owners on the same voxels (see SolverMode's header comment).
 	if is_mpm_mode():
 		if mpm_simulation and mpm_simulation.is_bound():
+			var t0 := Time.get_ticks_usec()
 			mpm_simulation.tick_all(mpm_substeps_per_tick)
+			if log_mpm_perf:
+				_perf_usec += Time.get_ticks_usec() - t0
+				_perf_ticks += 1
+				if _perf_ticks >= 60:
+					var info := mpm_simulation.region_grid_info()
+					print("[MPM perf] %.2f ms/tick avg over %d ticks | nodes=%d particles=%d substeps=%d" % [
+						float(_perf_usec) / 1000.0 / float(_perf_ticks), _perf_ticks,
+						int(info.get("nodes", 0)), int(info.get("particles", 0)),
+						mpm_substeps_per_tick])
+					_perf_usec = 0
+					_perf_ticks = 0
 		return
 
 	var to_run := _active.duplicate()

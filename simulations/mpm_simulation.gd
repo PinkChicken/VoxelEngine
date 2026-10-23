@@ -72,6 +72,18 @@ class_name MPMSimulation extends Node
 # letting the bounding box get big enough to tank the per-substep dispatch cost — the real
 # driver of cost is the BOX, not the chunk count, so this is a balance point, not a free win.
 @export var max_active_chunks: int = 16
+
+# PROMOTION SAMPLING STRIDE. 1 = one particle per voxel (full fidelity). N = one particle per
+# NxNxN voxel block: N^3 fewer particles, each carrying N^3 times the mass, on the SAME grid
+# resolution. This is the "make each particle bigger so we use fewer" knob — but note what it
+# does and does not save: the grid passes (clear/P2G/grid_op/G2P) all still run over the same
+# node count, so it cuts only the per-particle work, and it does so by SAMPLING, so the surface
+# gets correspondingly blockier.
+#
+# Left at 1 deliberately: the cost curve has not been measured yet, and this project's own rule
+# (ARCHITECTURE.md §7.0) is measure before cutting. Use the `mpm_perf` / `mpm_stress` modes to
+# see whether particles or grid nodes dominate before spending fidelity here.
+@export var promote_stride: int = 1
 # Hard ceiling on region grid nodes. 1M nodes ≈ 60 MB of grid buffers (60 B/node) and ≈ 15.6k
 # workgroups per pass. Exceeded → the chunk that would cross it is refused, not allocated.
 const MAX_REGION_NODES := 1048576
@@ -322,17 +334,20 @@ func _promote_chunk_voxels(cp: Vector3i) -> void:
 	var pos: Array[Vector3] = []
 	var mats: Array[int] = []
 	var mss: Array[float] = []
-	for ly in range(n_grid):
-		for lz in range(n_grid):
-			for lx in range(n_grid):
+	var st := maxi(promote_stride, 1)
+	var st_v := float(st)
+	var st_mass := float(st * st * st)
+	for ly in range(0, n_grid, st):
+		for lz in range(0, n_grid, st):
+			for lx in range(0, n_grid, st):
 				var wp := origin + Vector3i(lx, ly, lz)
 				var mat := _orchestrator.query_voxel_material(wp)
 				if not _is_mpm_material(mat):
 					continue
 				var def := _material_db.get_def(mat)
-				pos.append(Vector3(wp - _region.origin) + Vector3(0.5, 0.5, 0.5))
+				pos.append(Vector3(wp - _region.origin) + Vector3(0.5, 0.5, 0.5) * st_v)
 				mats.append(mat)
-				mss.append(def.mpm_density * p_vol)
+				mss.append(def.mpm_density * p_vol * st_mass)
 	_append_particles(_region, pos, mats, mss)
 
 
@@ -453,7 +468,7 @@ func _copy_particles_shifted(prev: ChunkRegion, w: ChunkRegion) -> void:
 		w.groups_particles = 0
 		return
 	var shift := Vector3(prev.origin - w.origin)
-	var pos := _compute.download(prev.pos).to_float32_array()
+	var pos 		= _compute.download(prev.pos).to_float32_array()
 	for i in n:
 		pos[i*3]     += shift.x
 		pos[i*3 + 1] += shift.y
@@ -493,12 +508,15 @@ func _free_region_buffers(w: ChunkRegion) -> void:
 func promote_existing_voxels(w: ChunkRegion, chunks: Array[Vector3i]) -> int:
 	var found_pos: Array[Vector3i] = []
 	var found_mat: Array[int] = []
+	var st := maxi(promote_stride, 1)
+	var st_v := float(st)
+	var st_mass := float(st * st * st)
 	for cp in chunks:
 		var origin := cp * n_grid
 		_orchestrator.sync_chunk_to_cpu(cp)  # block_data is stale-by-design (CLAUDE.md)
-		for ly in range(n_grid):
-			for lz in range(n_grid):
-				for lx in range(n_grid):
+		for ly in range(0, n_grid, st):
+			for lz in range(0, n_grid, st):
+				for lx in range(0, n_grid, st):
 					var wp := origin + Vector3i(lx, ly, lz)
 					var mat := _orchestrator.query_voxel_material(wp)
 					if _is_mpm_material(mat):
@@ -512,8 +530,9 @@ func promote_existing_voxels(w: ChunkRegion, chunks: Array[Vector3i]) -> int:
 		var wp := found_pos[i]
 		var mat_id := found_mat[i]
 		var def := _material_db.get_def(mat_id)
-		var local := Vector3(wp - w.origin) + Vector3(0.5, 0.5, 0.5)  # voxel center, region-local
-		return {"pos": local, "mat": mat_id, "mass": def.mpm_density * p_vol}
+		# Block CENTRE when sampling above one voxel per particle, region-local.
+		var local := Vector3(wp - w.origin) + Vector3(0.5, 0.5, 0.5) * st_v
+		return {"pos": local, "mat": mat_id, "mass": def.mpm_density * p_vol * st_mass}
 	)
 	return n
 
@@ -988,6 +1007,26 @@ func get_chunk_region(chunk_pos: Vector3i) -> ChunkRegion:
 
 
 func active_chunk_positions() -> Array:
+	# Chunks the region's GRID actually covers — every chunk being simulated. This is NOT
+	# _active_chunks (the set that was explicitly requested): the grid is the BOUNDING BOX of
+	# that set, so it normally covers MORE chunks. That gap is exactly why the debug tint looked
+	# like it only appeared under edits — a box-covered chunk is fully simulated whether or not
+	# anything ever explicitly asked for it.
+	if _region == null:
+		return []
+	var bmin := Vector3i(_region.origin.x / n_grid, _region.origin.y / n_grid, _region.origin.z / n_grid)
+	var span := Vector3i(_region.dims.x / n_grid, _region.dims.y / n_grid, _region.dims.z / n_grid)
+	var out: Array = []
+	for y in range(span.y):
+		for z in range(span.z):
+			for x in range(span.x):
+				out.append(bmin + Vector3i(x, y, z))
+	return out
+
+
+# The explicitly-requested set (edits / boot scan / growth). Separate from grid coverage because
+# it is what drives the chunk budget and the growth decisions, not what the overlay should show.
+func requested_chunk_positions() -> Array:
 	return _active_chunks.keys()
 
 
@@ -999,6 +1038,7 @@ func region_grid_info() -> Dictionary:
 		"dims": _region.dims,
 		"nodes": _region.dims.x * _region.dims.y * _region.dims.z,
 		"chunks": _region.chunks.size(),
+		"requested": _active_chunks.size(),
 		"particles": _region.n_particles,
 		# Exposed because "is it going to sleep?" is the question this dump exists to answer:
 		# the region sleeps after IDLE_THRESHOLD consecutive ticks with an empty readout
