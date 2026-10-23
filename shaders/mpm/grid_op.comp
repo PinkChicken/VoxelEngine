@@ -36,6 +36,13 @@ layout(set = 0, binding = 14, std430) readonly buffer VoxelParams {
 } VP;
 layout(set = 0, binding = 15, std430) readonly buffer VoxelBufA { uint data[]; } voxels_a;
 layout(set = 0, binding = 16, std430) readonly buffer ChunkTable { int data[]; } chunk_table;
+// FACE PUSH mask (2026-08-13) — 6 bits, one per region face, set when material at that face is
+// moving OUTWARD. Region growth keys off this. It lives here rather than in readout.comp because
+// this pass is the only one with velocity in hand, and velocity is the whole point: the previous
+// test was mass PRESENCE at a face, and a pool at rest in its box touches every face by
+// definition — so the box grew, the pool spread to fill it, every face lit again, and so on until
+// MAX_REGION_NODES. That feedback loop is the "box of spaz". Contact is not intent to leave.
+layout(set = 0, binding = 21, std430) buffer FaceMask { uint data[]; } face_mask;
 
 const uint MODEL_STATIC = 1u;
 const uint MAT_STRIDE_U32 = 8u;
@@ -110,10 +117,28 @@ void main() {
 		vel *= max_speed / spd;
 	}
 
+	int b = P.bound;  // shared by the face-push test below and the damping band after it
+
+	// FACE PUSH — is material at a face actually trying to LEAVE? Tested BEFORE the boundary
+	// clamp below, because that clamp zeroes exactly the outward component we need to see.
+	//
+	// PUSH_SPEED is deliberately above the free-fall per-substep increment (dt*g ≈ 0.0068 at
+	// dt=6.94e-4, g=9.8) so a pool merely sitting still — which still carries that tiny
+	// gravity increment every substep — never asks the region to grow. Settled water is silent;
+	// water arriving at speed is not.
+	if (g_mass.data[idx] != 0) {
+		const float PUSH_SPEED = 0.5;  // voxel units / simulated second
+		if (ix < b            && vel.x < -PUSH_SPEED) atomicOr(face_mask.data[0], 1u);
+		if (ix >= P.dim_x - b && vel.x >  PUSH_SPEED) atomicOr(face_mask.data[0], 2u);
+		if (iy < b            && vel.y < -PUSH_SPEED) atomicOr(face_mask.data[0], 4u);
+		if (iy >= P.dim_y - b && vel.y >  PUSH_SPEED) atomicOr(face_mask.data[0], 8u);
+		if (iz < b            && vel.z < -PUSH_SPEED) atomicOr(face_mask.data[0], 16u);
+		if (iz >= P.dim_z - b && vel.z >  PUSH_SPEED) atomicOr(face_mask.data[0], 32u);
+	}
+
 	// Edge damping band. This is the REGION edge (2026-08-13), not a chunk edge — a chunk
 	// boundary in the middle of a shared region gets no special treatment, which is exactly
 	// what makes a lake spanning chunks behave as one body.
-	int b = P.bound;
 	if (ix < b           && vel.x < 0.0) vel.x = 0.0;
 	if (ix > P.dim_x - b && vel.x > 0.0) vel.x = 0.0;
 	if (iy < b           && vel.y < 0.0) vel.y = 0.0;

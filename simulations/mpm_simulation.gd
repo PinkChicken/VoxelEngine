@@ -842,7 +842,7 @@ func _build_region_sets(w: ChunkRegion) -> void:
 	w.set_grid_op = _compute.create_uniform_set([
 		_u(0, w.params_buf), _u(8, w.g_mom), _u(9, w.g_mass), _u(10, w.g_vel),
 		_u(13, _material_db.mpm_buffer_rid), _u(14, w.voxel_params_buf),
-		_u(15, w.voxel_buf_a), _u(16, w.chunk_table)
+		_u(15, w.voxel_buf_a), _u(16, w.chunk_table), _u(21, w.face_mask_buf)
 	], _grid_op.shader)
 	w.set_g2p = _compute.create_uniform_set([
 		_u(0, w.params_buf), _u(1, w.pos), _u(2, w.vel), _u(3, w.C), _u(4, w.J), _u(5, w.mat),
@@ -885,6 +885,12 @@ func tick_all(substeps_per_tick: int) -> void:
 		_applied_sim_dt = want_dt
 		sim_dt = want_dt
 		_upload_region_params(w)
+
+	# The face-push mask is accumulated by grid_op across ALL substeps, so it is cleared here,
+	# once per tick before them — not in the readout, which runs afterwards and only reads it.
+	var zero_face := PackedByteArray(); zero_face.resize(4); zero_face.fill(0)
+	_compute.buffer_update(w.face_mask_buf, 0, zero_face)
+	w.face_mask = 0
 
 	_run_region_substeps(w, substeps_per_tick)
 	var changed := _readout_region(w)
@@ -1104,9 +1110,6 @@ func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
 
 	var zero_dirty := PackedByteArray(); zero_dirty.resize(DIRTY_BUF_BYTES); zero_dirty.fill(0)
 	_compute.buffer_update(w.dirty_chunks_buf, 0, zero_dirty)
-	var zero_face := PackedByteArray(); zero_face.resize(4); zero_face.fill(0)
-	_compute.buffer_update(w.face_mask_buf, 0, zero_face)
-	w.face_mask = 0
 	var zero_occ := PackedByteArray(); zero_occ.resize(OCCUPANCY_BYTES); zero_occ.fill(0)
 	_compute.buffer_update(w.occupancy_buf, 0, zero_occ)
 	_orchestrator.reset_changelog()
