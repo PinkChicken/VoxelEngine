@@ -114,6 +114,27 @@ void main() {
 	// distinguishes "genuinely empty" from "one particle's kernel tail reaching this node."
 	const float MASS_THRESHOLD = 1e-6;
 
+	// FACE PRESENCE (2026-08-13, second attempt). Set the face bits from MASS PRESENCE at a
+	// boundary plane, NOT from having written a change there.
+	//
+	// Keying on writes was wrong in a way that produced the reported symptom exactly: water
+	// falling onto the floor of the region comes to REST there, and resting material produces no
+	// write (nothing changed, and the fill deadband suppresses the churn) — so no face bit was
+	// ever set, the region never grew downward, and the water sat on an invisible floor forever.
+	// Measured: 8 minutes of simulation with the region 1 chunk tall in Y and growing 2x2 -> 5x5
+	// in X/Z, i.e. it grew in every direction except the one gravity needed.
+	//
+	// Presence is self-limiting: after growing, that material is interior, the new plane is empty,
+	// and the bit clears.
+	if (mass >= MASS_THRESHOLD) {
+		if (ix == 0)            atomicOr(face_mask.data[0], 1u);
+		if (ix == P.dim_x - 1)  atomicOr(face_mask.data[0], 2u);
+		if (iy == 0)            atomicOr(face_mask.data[0], 4u);
+		if (iy == P.dim_y - 1)  atomicOr(face_mask.data[0], 8u);
+		if (iz == 0)            atomicOr(face_mask.data[0], 16u);
+		if (iz == P.dim_z - 1)  atomicOr(face_mask.data[0], 32u);
+	}
+
 	uint new_voxel;
 	if (mass < MASS_THRESHOLD) {
 		if (cur_mat == 0u) return;  // already air, nothing to change — don't spam the changelog
@@ -152,14 +173,5 @@ void main() {
 		changelog.entries[log_slot * 2u]      = uint(flat_idx);
 		changelog.entries[log_slot * 2u + 1u] = new_voxel;
 		mark_dirty(flat_idx, vpc);
-		// Record which faces of the region this change happened on. Only REAL writes count
-		// (i.e. past the fill deadband above), so a pool resting at the edge — no change, no
-		// write — does not ask for the region to grow.
-		if (ix == 0)            atomicOr(face_mask.data[0], 1u);
-		if (ix == P.dim_x - 1)  atomicOr(face_mask.data[0], 2u);
-		if (iy == 0)            atomicOr(face_mask.data[0], 4u);
-		if (iy == P.dim_y - 1)  atomicOr(face_mask.data[0], 8u);
-		if (iz == 0)            atomicOr(face_mask.data[0], 16u);
-		if (iz == P.dim_z - 1)  atomicOr(face_mask.data[0], 32u);
 	}
 }

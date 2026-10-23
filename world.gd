@@ -113,6 +113,20 @@ func _mpm_reset() -> void:
 	print("[MPM] region + active set dropped — voxels kept; press R for a full world regen")
 
 
+# Decode the face-presence mask for the Y dump.
+func _mpm_face_names(mask: int) -> String:
+	if mask == 0:
+		return "none"
+	var names: Array[String] = []
+	if mask & 1:  names.append("-X")
+	if mask & 2:  names.append("+X")
+	if mask & 4:  names.append("-Y")
+	if mask & 8:  names.append("+Y")
+	if mask & 16: names.append("-Z")
+	if mask & 32: names.append("+Z")
+	return " ".join(names)
+
+
 func _process(_delta: float) -> void:
 	_watch_indicator.visible = fluid_simulation.watch_enabled
 	if fluid_simulation.watch_enabled:
@@ -302,6 +316,8 @@ func _mpm_status_dump() -> void:
 	# On-demand timing — no averaging window needed, and no CLI flag.
 	print("  last tick: %.2f ms  (G to log 60-tick averages, B to spawn a stress water body)" % (
 		float(simulation_runtime.last_mpm_tick_usec) / 1000.0))
+	print("  faces holding material: %s  (bit0=-X bit1=+X bit2=-Y bit3=+Y bit4=-Z bit5=+Z)" % (
+		_mpm_face_names(int(info["faces"]))))
 
 
 # THE TEST (2026-08-12, brief §37) — proves MPM's activity is genuinely player-independent:

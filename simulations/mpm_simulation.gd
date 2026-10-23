@@ -1169,6 +1169,9 @@ func region_grid_info() -> Dictionary:
 		# dirty-set AND a max particle speed under REST_SPEED.
 		"idle_ticks": _region.idle_ticks,
 		"capacity": max_particles,
+		# Which boundary planes currently hold material (bit 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z).
+		# The single most useful field for "why isn't the region following the water".
+		"faces": _region.face_mask,
 	}
 
 
