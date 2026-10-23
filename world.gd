@@ -226,10 +226,11 @@ func _unhandled_input(event: InputEvent) -> void:
 			_mpm_status_dump()
 
 
-# Interactive debug tool (2026-08-12, brief §37, KEY_Y) — lists every currently active MPM
-# chunk (each independently simulated, per-chunk window) and its particle count. No player-
-# position logic anywhere in this file anymore — activation is entirely chunk/material-driven
-# (MPMSimulation.setup()/scan_loaded_chunks_for_existing_material()/_on_voxels_placed()).
+# Interactive debug tool (2026-08-12, brief §37, KEY_Y) — dumps the live MPM region: grid
+# origin/dims/node count, how many chunks it covers, particle count against capacity, and
+# idle_ticks (whether it is trending toward sleeping). No player-position logic anywhere in this
+# file — activation is entirely chunk/material-driven (MPMSimulation.setup()/
+# scan_loaded_chunks_for_existing_material()/_on_voxels_placed()).
 func _mpm_status_dump() -> void:
 	if not mpm_simulation.is_bound():
 		var mode_name := "MPM" if simulation_runtime.is_mpm_mode() else "CA"
@@ -242,8 +243,10 @@ func _mpm_status_dump() -> void:
 	if info.is_empty():
 		print("[MPM] no live region — %d chunk(s) requested, none simulated (asleep or refused)" % chunks.size())
 		return
-	print("[MPM] region origin=%s dims=%s nodes=%d | %d/8 chunk(s), %d particles" % [
-		info["origin"], info["dims"], info["nodes"], info["chunks"], info["particles"]])
+	print("[MPM] region origin=%s dims=%s nodes=%d | %d/%d chunks, %d/%d particles, idle_ticks=%d" % [
+		info["origin"], info["dims"], info["nodes"],
+		info["chunks"], mpm_simulation.max_active_chunks,
+		info["particles"], info["capacity"], info["idle_ticks"]])
 	if not chunks.is_empty():
 		print("  chunks: %s" % [chunks])
 

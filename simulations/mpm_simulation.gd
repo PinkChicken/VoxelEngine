@@ -797,7 +797,18 @@ func active_chunk_positions() -> Array:
 func region_grid_info() -> Dictionary:
 	if _region == null:
 		return {}
-	return {"origin": _region.origin, "dims": _region.dims, "nodes": _region.dims.x * _region.dims.y * _region.dims.z, "chunks": _region.chunks.size(), "particles": _region.n_particles}
+	return {
+		"origin": _region.origin,
+		"dims": _region.dims,
+		"nodes": _region.dims.x * _region.dims.y * _region.dims.z,
+		"chunks": _region.chunks.size(),
+		"particles": _region.n_particles,
+		# Exposed because "is it going to sleep?" is the question this dump exists to answer:
+		# the region sleeps after IDLE_THRESHOLD consecutive ticks with an empty readout
+		# dirty-set AND a max particle speed under REST_SPEED.
+		"idle_ticks": _region.idle_ticks,
+		"capacity": max_particles,
+	}
 
 
 func read_positions(w: ChunkRegion) -> PackedFloat32Array:
