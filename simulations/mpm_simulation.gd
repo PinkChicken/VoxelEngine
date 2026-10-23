@@ -119,6 +119,10 @@ class ChunkRegion:
 	var mat: RID; var mass: RID; var alive: RID; var F: RID
 	var g_mom: RID; var g_mass: RID; var g_vel: RID; var g_mass_mat: RID
 	var voxel_params_buf: RID; var voxel_buf_a: RID; var chunk_table: RID; var dirty_chunks_buf: RID
+	# 6-bit "material touched this face plane" mask written by readout.comp, downloaded each tick
+	# and consumed by _grow_region_if_needed(). Reset per readout.
+	var face_mask_buf: RID
+	var face_mask: int = 0
 
 	var set_clear: RID; var set_p2g: RID; var set_grid_op: RID; var set_g2p: RID; var set_readout: RID
 
@@ -237,6 +241,12 @@ func setup() -> bool:
 
 func is_bound() -> bool:
 	return is_instance_valid(_orchestrator)
+
+
+# Is there live material being simulated right now? (False when nothing activated, or the region
+# has slept.) Used so perf averages don't dilute real ticks with idle ones.
+func is_simulating() -> bool:
+	return _region != null and _region.n_particles > 0
 
 
 # Drop ALL simulation state: the region (and with it every particle), the active-chunk set, and
@@ -437,6 +447,7 @@ func _build_region(origin: Vector3i, dims: Vector3i, chunks: Array[Vector3i], pr
 	w.g_mass_mat = _new_zero_buf(nodes * NMAT * 4)
 	w.params_buf = _new_zero_buf(48)
 	w.dirty_chunks_buf = _new_zero_buf(DIRTY_BUF_BYTES)
+	w.face_mask_buf = _new_zero_buf(4)
 
 	w.voxel_params_buf = _new_zero_buf(48)
 	var b := PackedByteArray(); b.resize(48)
@@ -512,7 +523,7 @@ func _destroy_region() -> void:
 func _free_region_buffers(w: ChunkRegion) -> void:
 	for rid in [w.params_buf, w.pos, w.vel, w.C, w.J, w.mat, w.mass, w.alive, w.F,
 		w.g_mom, w.g_mass, w.g_vel, w.g_mass_mat,
-		w.voxel_params_buf, w.dirty_chunks_buf]:
+		w.voxel_params_buf, w.dirty_chunks_buf, w.face_mask_buf]:
 		if rid.is_valid():
 			_compute.free_rid(rid)
 
@@ -801,7 +812,7 @@ func _build_region_sets(w: ChunkRegion) -> void:
 		_u(0, w.params_buf), _u(9, w.g_mass), _u(12, w.g_mass_mat),
 		_u(13, _material_db.mpm_buffer_rid), _u(14, w.voxel_params_buf),
 		_u(15, w.voxel_buf_a), _u(16, w.chunk_table), _u(17, _orchestrator.get_changelog_buf()),
-		_u(18, w.dirty_chunks_buf)
+		_u(18, w.dirty_chunks_buf), _u(19, w.face_mask_buf)
 	], _readout.shader)
 
 
@@ -897,6 +908,20 @@ func _grow_region_if_needed(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
 	if changed.is_empty() or w.chunks.is_empty():
 		return false
 
+	# GATE ON THE FACE MASK. A face chunk is 32 voxels deep, so "a face chunk changed" is true for
+	# any body sitting anywhere inside the outer chunks — which grew the box on all six faces for
+	# material that was nowhere near the edge. readout.comp now reports which face PLANES actually
+	# changed, so a direction is only grown when material is genuinely touching that edge.
+	var mask := w.face_mask
+	if mask == 0:
+		return false
+	var grow_xm := (mask & 1) != 0
+	var grow_xp := (mask & 2) != 0
+	var grow_ym := (mask & 4) != 0
+	var grow_yp := (mask & 8) != 0
+	var grow_zm := (mask & 16) != 0
+	var grow_zp := (mask & 32) != 0
+
 	var bmin := Vector3i(w.origin.x / n_grid, w.origin.y / n_grid, w.origin.z / n_grid)
 	var span := Vector3i(w.dims.x / n_grid, w.dims.y / n_grid, w.dims.z / n_grid)
 	var bmax := bmin + span - Vector3i.ONE
@@ -904,12 +929,12 @@ func _grow_region_if_needed(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
 	var proposals: Array[Vector3i] = []
 	var proposed: Dictionary = {}
 	for cp in changed:
-		if cp.x == bmin.x: _propose(proposals, proposed, cp + Vector3i(-1, 0, 0))
-		if cp.x == bmax.x: _propose(proposals, proposed, cp + Vector3i( 1, 0, 0))
-		if cp.y == bmin.y: _propose(proposals, proposed, cp + Vector3i(0, -1, 0))
-		if cp.y == bmax.y: _propose(proposals, proposed, cp + Vector3i(0,  1, 0))
-		if cp.z == bmin.z: _propose(proposals, proposed, cp + Vector3i(0, 0, -1))
-		if cp.z == bmax.z: _propose(proposals, proposed, cp + Vector3i(0, 0,  1))
+		if grow_xm and cp.x == bmin.x: _propose(proposals, proposed, cp + Vector3i(-1, 0, 0))
+		if grow_xp and cp.x == bmax.x: _propose(proposals, proposed, cp + Vector3i( 1, 0, 0))
+		if grow_ym and cp.y == bmin.y: _propose(proposals, proposed, cp + Vector3i(0, -1, 0))
+		if grow_yp and cp.y == bmax.y: _propose(proposals, proposed, cp + Vector3i(0,  1, 0))
+		if grow_zm and cp.z == bmin.z: _propose(proposals, proposed, cp + Vector3i(0, 0, -1))
+		if grow_zp and cp.z == bmax.z: _propose(proposals, proposed, cp + Vector3i(0, 0,  1))
 	if proposals.is_empty():
 		return false
 
@@ -979,6 +1004,9 @@ func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
 
 	var zero_dirty := PackedByteArray(); zero_dirty.resize(DIRTY_BUF_BYTES); zero_dirty.fill(0)
 	_compute.buffer_update(w.dirty_chunks_buf, 0, zero_dirty)
+	var zero_face := PackedByteArray(); zero_face.resize(4); zero_face.fill(0)
+	_compute.buffer_update(w.face_mask_buf, 0, zero_face)
+	w.face_mask = 0
 	_orchestrator.reset_changelog()
 
 	_compute.run_with_set(_readout, w.set_readout, w.groups_grid)
@@ -987,6 +1015,10 @@ func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
 
 	_orchestrator.apply_changelog()
 
+	# 4 bytes — cheaper than the dirty bitmask download next to it.
+	var face_raw: PackedByteArray = _compute.download_range(w.face_mask_buf, 0, 4)
+	if face_raw.size() >= 4:
+		w.face_mask = int(face_raw.decode_u32(0))
 	var bitmask: PackedByteArray = _compute.download_range(w.dirty_chunks_buf, 0, DIRTY_BUF_BYTES)
 	return _decode_dirty_bitmask(bitmask)
 

@@ -191,10 +191,13 @@ func _tick() -> void:
 	# would put two independent owners on the same voxels (see SolverMode's header comment).
 	if is_mpm_mode():
 		if mpm_simulation and mpm_simulation.is_bound():
+			var simulated := mpm_simulation.is_simulating()
 			var t0 := Time.get_ticks_usec()
 			mpm_simulation.tick_all(mpm_substeps_per_tick)
 			last_mpm_tick_usec = Time.get_ticks_usec() - t0
-			if log_mpm_perf:
+			# Only ticks with a live region count toward the average — otherwise an idle engine
+			# dilutes them to a meaningless 0.00 ms.
+			if log_mpm_perf and simulated:
 				_perf_usec += last_mpm_tick_usec
 				_perf_ticks += 1
 				if _perf_ticks >= 60:
