@@ -136,6 +136,10 @@ var _warned_region_cap := false
 var _warned_capacity := false
 # Ticks to wait before the region may grow again — see _grow_region_if_needed().
 var _grow_cooldown := 0
+# Ticks since each REQUESTED chunk last produced a readout change. A requested chunk that stays
+# quiet is released, which lets the region's bounding box SHRINK — see _release_idle_chunks().
+var _chunk_idle: Dictionary = {}  # Vector3i -> int
+const RELEASE_TICKS := 30
 # Substep dt actually uploaded to the shaders; recomputed from sim_seconds_per_tick.
 var sim_dt: float = 1.0e-4
 var _applied_sim_dt: float = -1.0
@@ -255,6 +259,7 @@ func is_simulating() -> bool:
 # freed and recreated underneath it. Also usable as a manual hard reset.
 func reset() -> void:
 	_active_chunks.clear()
+	_chunk_idle.clear()
 	_destroy_region()
 	_warned_budget = false
 	_warned_region_cap = false
@@ -495,19 +500,35 @@ func _copy_particles_shifted(prev: ChunkRegion, w: ChunkRegion) -> void:
 		w.groups_particles = 0
 		return
 	var shift := Vector3(prev.origin - w.origin)
-	var pos 		= _compute.download(prev.pos).to_float32_array()
+	var pos: PackedFloat32Array = _compute.download(prev.pos).to_float32_array()
+	# A particle left OUTSIDE the new box by a shrink is killed rather than left to drift: g2p
+	# clamps every position into the region, so an outside particle would be snapped onto the
+	# boundary wall and reappear as material teleported to the edge. Readout already wrote its
+	# voxels before the chunk was released, so nothing is lost visually — it is simply frozen as
+	# static voxels until something disturbs it again.
+	var alive := PackedInt32Array(); alive.resize(n)
+	var limit := Vector3(w.dims)
+	var dropped := 0
 	for i in n:
-		pos[i*3]     += shift.x
-		pos[i*3 + 1] += shift.y
-		pos[i*3 + 2] += shift.z
+		var px: float = pos[i*3]     + shift.x
+		var py: float = pos[i*3 + 1] + shift.y
+		var pz: float = pos[i*3 + 2] + shift.z
+		pos[i*3] = px; pos[i*3 + 1] = py; pos[i*3 + 2] = pz
+		if px < 0.0 or py < 0.0 or pz < 0.0 or px >= limit.x or py >= limit.y or pz >= limit.z:
+			alive[i] = 0
+			dropped += 1
+		else:
+			alive[i] = 1
 	_compute.buffer_update(w.pos, 0, pos.to_byte_array())
+	_compute.buffer_update(w.alive, 0, alive.to_byte_array())
 	_compute.buffer_copy(prev.vel,   w.vel,   0, 0, n * 3 * 4)
 	_compute.buffer_copy(prev.C,     w.C,     0, 0, n * 9 * 4)
 	_compute.buffer_copy(prev.J,     w.J,     0, 0, n * 4)
 	_compute.buffer_copy(prev.mat,   w.mat,   0, 0, n * 4)
 	_compute.buffer_copy(prev.mass,  w.mass,  0, 0, n * 4)
-	_compute.buffer_copy(prev.alive, w.alive, 0, 0, n * 4)
 	_compute.buffer_copy(prev.F,     w.F,     0, 0, n * 9 * 4)
+	if dropped > 0:
+		print("[MPM] region resized: %d particle(s) left the new bounds and were frozen as voxels" % dropped)
 	w.n_particles = n
 	w.groups_particles = int(ceil(float(n) / 64.0))
 	_upload_region_params(w)
@@ -853,6 +874,11 @@ func tick_all(substeps_per_tick: int) -> void:
 	# grow in that direction. The first version of this only grew downward, which is exactly why
 	# water hit a side wall, flowed the one way a chunk happened to already be active, and not
 	# the other. See _grow_region_if_needed().
+	#
+	# Release runs FIRST so a stream that has moved on frees its chunks before we consider growing
+	# into new ones — otherwise the box only ever inflates.
+	if _release_idle_chunks(w, changed):
+		return  # the region was resized; `w` is stale from here on
 	if _grow_region_if_needed(w, changed):
 		return  # the region was resized; `w` is stale from here on
 
@@ -884,6 +910,56 @@ func tick_all(substeps_per_tick: int) -> void:
 		_destroy_region()
 	else:
 		w.idle_ticks = 0
+
+
+# RELEASE QUIET CHUNKS SO THE BOX CAN SHRINK.
+#
+# 2026-08-13, after a measured run: a water body dropped at y=64 grew the region 64^3 -> 96x96x64
+# -> 128x128x64 and then hit MAX_REGION_NODES, at which point it could no longer grow DOWNWARD and
+# the water stopped falling in mid-air. The cause is structural, not tuning: _active_chunks only
+# ever grew, so the bounding box accumulated every chunk the material had ever touched. A stream
+# falling from y=64 to the ground drags a box down the whole column behind it, and the box volume
+# is what every node-parallel pass pays for.
+#
+# The fix is that the region follows ACTIVITY, not material. A requested chunk that produces no
+# readout change for RELEASE_TICKS is dropped from the set, so the box contracts behind a stream
+# and slides down with it. Its material is not lost: readout already wrote it into the voxel world,
+# where it persists (frozen) and re-activates on the next edit or disturbance.
+#
+# RELEASE_TICKS must stay comfortably above _grow_cooldown (15) or a chunk could be released and
+# immediately re-grown, thrashing the region every tick.
+#
+# Returns true if the region was resized (caller must not touch its ChunkRegion afterwards).
+func _release_idle_chunks(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
+	if _active_chunks.size() <= 1:
+		return false
+
+	var changed_set: Dictionary = {}
+	for cp in changed:
+		changed_set[cp] = true
+
+	var to_release: Array[Vector3i] = []
+	for key in _active_chunks:
+		var cp: Vector3i = key
+		if changed_set.has(cp):
+			_chunk_idle[cp] = 0
+			continue
+		var age: int = int(_chunk_idle.get(cp, 0)) + 1
+		_chunk_idle[cp] = age
+		if age >= RELEASE_TICKS:
+			to_release.append(cp)
+
+	if to_release.is_empty():
+		return false
+	# Don't strip the region bare — if everything is quiet, the whole region should go to sleep
+	# via the normal idle path, which also frees the buffers.
+	if to_release.size() >= _active_chunks.size():
+		return false
+
+	for cp in to_release:
+		_active_chunks.erase(cp)
+		_chunk_idle.erase(cp)
+	return _ensure_region()
 
 
 # GROW IN EVERY DIRECTION the material is actually pushing against.
