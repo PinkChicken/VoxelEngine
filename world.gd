@@ -125,9 +125,11 @@ var _mpm_preset_index: int = 0
 func _mpm_cycle_material() -> void:
 	_mpm_preset_index = (_mpm_preset_index + 1) % MPM_PARAM_PRESETS.size()
 	var p: Dictionary = MPM_PARAM_PRESETS[_mpm_preset_index]
-	material_db.override_mpm(3, p["density"], p["stiffness"], p["viscosity"])
-	# The region's uniform sets hold the old MaterialDB RID, so it must be rebuilt, not reused.
-	mpm_simulation.hard_rebuild()
+	# Drive the export setters rather than the material DB directly, so the Inspector sliders stay
+	# in sync with the preset that O just selected.
+	mpm_simulation.water_stiffness = p["stiffness"]
+	mpm_simulation.water_viscosity = p["viscosity"]
+	mpm_simulation.water_density = p["density"]
 	print("[MPM params] %s — density %.2f, stiffness %.0f, viscosity %.1f (region rebuilt from voxels)" % [
 		p["name"], p["density"], p["stiffness"], p["viscosity"]])
 

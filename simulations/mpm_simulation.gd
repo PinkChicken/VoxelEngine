@@ -108,6 +108,36 @@ var _timescale_index: int = 0
 # the material. 2x2x2 = 64^3 = 262,144 nodes ≈ 2.4 ms/tick on the measured hardware. Change this
 # to trade cost for reach — it is the only thing that decides either.
 @export var region_chunks: Vector3i = Vector3i(2, 2, 2)
+
+@export_group("Water physics (live)")
+# LIVE overrides for WATER (id 3). Edit these in the REMOTE Inspector while the game runs —
+# Godot: Debugger > Remote Scene Tree > WorldOrchestrator/SimulationRuntime/MPMSimulation — and
+# you get real sliders against the running fluid, no relaunch.
+#
+# stiffness and viscosity are read straight out of the material table every substep, so they take
+# effect immediately. density feeds particle MASS at seed time, so changing it forces a region
+# rebuild (state preserved; seed-time mass re-derived).
+@export_range(0.05, 8.0, 0.05) var water_density: float = 1.0:
+	set(v):
+		water_density = v
+		_apply_water_override(true)
+@export_range(50.0, 200000.0, 50.0) var water_stiffness: float = 8000.0:
+	set(v):
+		water_stiffness = v
+		_apply_water_override(false)
+@export_range(0.0, 50.0, 0.1) var water_viscosity: float = 0.0:
+	set(v):
+		water_viscosity = v
+		_apply_water_override(false)
+
+
+func _apply_water_override(reseed: bool) -> void:
+	# Setters fire during scene load, before _ready has resolved the material DB.
+	if not is_setup or not is_instance_valid(_material_db):
+		return
+	_material_db.override_mpm(3, water_density, water_stiffness, water_viscosity)
+	if reseed:
+		hard_rebuild()
 # Hard ceiling on region grid nodes. 1M nodes ≈ 60 MB of grid buffers (60 B/node) and ≈ 15.6k
 # workgroups per pass. Exceeded → the chunk that would cross it is refused, not allocated.
 const MAX_REGION_NODES := 1048576
@@ -116,14 +146,13 @@ const MAX_REGION_NODES := 1048576
 # (water hovering above an invisible floor) and used to hide the edge from face-presence detection
 # (readout.comp now tests the band rather than the plane). 1 keeps the wall as thin as it can be
 # while still stopping material from leaving.
-const BOUND := 1
+@export var bound: int = 1
 const NMAT := 8  # must match clear_grid.comp/p2g.comp's NMAT — the render mass-breakdown slot count
 const DIRTY_BUF_BYTES := 64  # matches GranularSimulation's own constant/convention
 # Region-grid chunk occupancy bitmask: 512 chunks' worth, far more than a bounding box under
 # MAX_REGION_NODES can hold. Must be a multiple of 4 (u32 words).
 const OCCUPANCY_BYTES := 64
-const IDLE_THRESHOLD := 4    # ticks with no motion before the whole region sleeps — matches
-							 # GranularSimulation's own threshold (granular_simulation.gd)
+@export var idle_threshold: int = 4
 # Target magnitude for a busy grid node's fixed-point accumulator (fp_scale is derived from
 # this, not hardcoded — §36.3 found a fixed magic constant silently rounds low-density
 # materials to zero at one dx and silently overflows int32 at another).
@@ -278,6 +307,9 @@ func setup() -> bool:
 		cm.slab_invalidated.connect(Callable(self, "reset"))
 
 	is_setup = true
+	# Push exported water physics into the material table, so values set in the Inspector before
+	# launch are honoured (the setters intentionally no-op until is_setup).
+	_apply_water_override(false)
 	scan_loaded_chunks_for_existing_material()
 	return true
 
@@ -936,7 +968,7 @@ func _upload_region_params(w: ChunkRegion) -> void:
 	b.encode_float(28, gravity)
 	b.encode_float(32, p_vol)
 	b.encode_float(36, fp_scale)
-	b.encode_s32(40, BOUND)
+	b.encode_s32(40, bound)
 	b.encode_s32(44, 0)
 	_compute.buffer_update(w.params_buf, 0, b)
 
@@ -984,7 +1016,7 @@ func _build_region_sets(w: ChunkRegion) -> void:
 # deactivated chunks that were still actively falling, exactly the "waterfall stops" failure
 # this whole design exists to prevent, just one layer deeper than player-position coupling.
 # Velocity is the actual physical quantity that means "at rest," not a proxy for it.
-const REST_SPEED := 0.02
+@export var rest_speed: float = 0.02
 
 # Public entry point — call ONCE per real simulation tick (SimulationRuntime._tick()). Runs the
 # region's physics substeps + readout, then sleeps the whole region once it has been motionless
@@ -1047,7 +1079,7 @@ func tick_all(substeps_per_tick: int) -> void:
 		return
 
 	w.idle_ticks += 1
-	if w.idle_ticks < IDLE_THRESHOLD:
+	if w.idle_ticks < idle_threshold:
 		return
 
 	var max_speed := 0.0
@@ -1056,7 +1088,7 @@ func tick_all(substeps_per_tick: int) -> void:
 		var spd := Vector3(vel[i*3], vel[i*3+1], vel[i*3+2]).length()
 		max_speed = max(max_speed, spd)
 
-	if max_speed < REST_SPEED:
+	if max_speed < rest_speed:
 		# Everything is at rest and already written back to voxels. Sleep the region and clear
 		# the intent set; a later edit or a streamed chunk re-activates from voxels.
 		_active_chunks.clear()
