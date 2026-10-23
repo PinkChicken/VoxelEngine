@@ -76,22 +76,41 @@ void fragment() {
 		get_tree().quit()
 
 	if OS.get_cmdline_user_args().has("mpm_stress"):
-		await _mpm_stress()
+		_mpm_stress()
 
 
-# STRESS HARNESS (2026-08-13) — one deliberately oversized water body, dropped above the player,
-# so the cost curve can be read off [MPM perf] lines while the region grows under it. Run with:
-#   ... res://world.tscn -- mpm_stress
-# `mpm_stress` implies MPM solver mode AND log_mpm_perf (see SimulationRuntime._resolve_solver_mode).
-# Watch how ms/tick tracks `nodes` (grid size) vs `particles`: that ratio is what decides whether
-# `promote_stride` (fewer, bigger particles) is worth spending fidelity on, or whether the grid
-# itself is the cost and the answer is a smaller region instead.
+# STRESS HARNESS — one deliberately oversized water body, dropped above the player, so the cost
+# curve can be read while the region grows under it. KEY_B in-game, or `-- mpm_stress` from a
+# terminal (that form also forces MPM mode + perf logging; see
+# SimulationRuntime._resolve_solver_mode). How ms/tick tracks `nodes` (grid size) vs `particles`
+# is what decides whether `promote_stride` (fewer, bigger particles) is worth spending surface
+# fidelity on, or whether the grid itself is the cost and the answer is a smaller region.
 func _mpm_stress() -> void:
 	var vs: float = chunk_manager.voxel_scale
 	var center := Vector3i(player.global_position / vs) + Vector3i(0, 20, 0)
-	print("[MPMStress] spawning a radius-11 water body at voxel %s" % center)
-	world_orchestrator.edit_add_sphere(center, 11.0, 3)  # 3 = WATER, ~5.6k voxels
-	print("[MPMStress] watch the [MPM perf] lines and press Y for region state")
+	print("[MPMStress] spawning a radius-11 WATER body at voxel %s (~5.6k voxels, ~5.6k particles)" % center)
+	world_orchestrator.edit_add_sphere(center, 11.0, 3)  # 3 = WATER
+	if not simulation_runtime.log_mpm_perf:
+		print("[MPMStress] perf logging is OFF — press G to start reporting 60-tick averages, Y for region state")
+	else:
+		print("[MPMStress] watch [MPM perf] lines; press Y for region state")
+
+
+# KEY_G — toggle the 60-tick average. The window is reset on every toggle so the first printed
+# average after enabling covers only ticks that were actually being measured.
+func _mpm_toggle_perf() -> void:
+	simulation_runtime.log_mpm_perf = not simulation_runtime.log_mpm_perf
+	simulation_runtime.reset_perf_window()
+	print("[MPMPerf] %s" % (
+		"ON — a 60-tick average prints after each window" if simulation_runtime.log_mpm_perf else "off"))
+
+
+# KEY_Z — drop the MPM region without touching the world. Distinct from R (full terrain regen):
+# this is "stop simulating, keep what's there", which is what you want before re-running a test
+# from a clean simulation state. Material survives as voxels and re-activates on the next edit.
+func _mpm_reset() -> void:
+	mpm_simulation.reset()
+	print("[MPM] region + active set dropped — voxels kept; press R for a full world regen")
 
 
 func _process(_delta: float) -> void:
@@ -242,6 +261,14 @@ func _unhandled_input(event: InputEvent) -> void:
 			print("[ActiveChunkTint] %s" % ("ON — active chunks tinted" if on_active else "off"))
 		elif event.keycode == KEY_Y:
 			_mpm_status_dump()
+		elif event.keycode == KEY_B:
+			# MPM stress test. CLI modes (`-- mpm_stress`) are unusable when launching from the
+			# editor, which passes no user args, so the tests that matter are bound to keys.
+			_mpm_stress()
+		elif event.keycode == KEY_G:
+			_mpm_toggle_perf()
+		elif event.keycode == KEY_Z:
+			_mpm_reset()
 
 
 # Interactive debug tool (2026-08-12, brief §37, KEY_Y) — dumps the live MPM region: grid
@@ -272,6 +299,9 @@ func _mpm_status_dump() -> void:
 	var requested := mpm_simulation.requested_chunk_positions()
 	if not requested.is_empty():
 		print("  requested (drives budget + growth): %s" % [requested])
+	# On-demand timing — no averaging window needed, and no CLI flag.
+	print("  last tick: %.2f ms  (G to log 60-tick averages, B to spawn a stress water body)" % (
+		float(simulation_runtime.last_mpm_tick_usec) / 1000.0))
 
 
 # THE TEST (2026-08-12, brief §37) — proves MPM's activity is genuinely player-independent:

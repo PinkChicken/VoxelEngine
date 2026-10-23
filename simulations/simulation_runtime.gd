@@ -56,6 +56,14 @@ var mpm_simulation: MPMSimulation
 @export var log_mpm_perf: bool = false
 var _perf_usec: int = 0
 var _perf_ticks: int = 0
+# Wall-clock cost of the most recent MPM tick, always recorded (two cheap clock reads per tick)
+# so world.gd's Y dump can report it on demand without needing the 60-tick averaging window.
+var last_mpm_tick_usec: int = 0
+
+
+func reset_perf_window() -> void:
+	_perf_usec = 0
+	_perf_ticks = 0
 
 
 func _ready() -> void:
@@ -185,8 +193,9 @@ func _tick() -> void:
 		if mpm_simulation and mpm_simulation.is_bound():
 			var t0 := Time.get_ticks_usec()
 			mpm_simulation.tick_all(mpm_substeps_per_tick)
+			last_mpm_tick_usec = Time.get_ticks_usec() - t0
 			if log_mpm_perf:
-				_perf_usec += Time.get_ticks_usec() - t0
+				_perf_usec += last_mpm_tick_usec
 				_perf_ticks += 1
 				if _perf_ticks >= 60:
 					var info := mpm_simulation.region_grid_info()
