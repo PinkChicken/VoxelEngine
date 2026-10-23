@@ -109,6 +109,16 @@ var _timescale_index: int = 0
 # to trade cost for reach — it is the only thing that decides either.
 @export var region_chunks: Vector3i = Vector3i(2, 2, 2)
 
+@export_group("Region growth")
+# Grow the window when material touches a face, instead of only translating. Dynamic local
+# allocation — a chunk the material has reached becomes part of the simulated window.
+#
+# BOUNDED by max_axis_chunks and MAX_REGION_NODES. That ceiling is the thing the original growth
+# implementation lacked, and its absence (not growth itself) is what produced the runaway: with no
+# cap, every response to "the fluid is pressing this wall" was to hand it another chunk of room.
+@export var grow_window: bool = true
+@export var max_axis_chunks: int = 3
+
 @export_group("Water physics (live)")
 # LIVE overrides for WATER (id 3). Edit these in the REMOTE Inspector while the game runs —
 # Godot: Debugger > Remote Scene Tree > WorldOrchestrator/SimulationRuntime/MPMSimulation — and
@@ -181,11 +191,11 @@ class ChunkRegion:
 	var g_mom: RID; var g_mass: RID; var g_vel: RID; var g_mass_mat: RID
 	var voxel_params_buf: RID; var voxel_buf_a: RID; var chunk_table: RID; var dirty_chunks_buf: RID
 	# 6-bit "material touched this face plane" mask written by readout.comp, downloaded each tick
-	# and consumed by _grow_region_if_needed(). Reset per readout.
+	# and consumed by _growth_for(). Reset per readout.
 	var face_mask_buf: RID
 	var face_mask: int = 0
 	# 1 bit per chunk of this region's grid: does the chunk contain material? Written by
-	# readout.comp, downloaded each tick, consumed by _release_idle_chunks().
+	# readout.comp, downloaded each tick, consumed by _growth_for() for growth and by the Y dump.
 	var occupancy_buf: RID
 	var occupied: Dictionary = {}  # Vector3i chunk coord -> true
 
@@ -199,12 +209,6 @@ var _active_chunks: Dictionary = {}  # Vector3i -> true
 var _warned_budget := false
 var _warned_region_cap := false
 var _warned_capacity := false
-# Ticks to wait before the region may grow again — see _grow_region_if_needed().
-var _grow_cooldown := 0
-# Ticks since each REQUESTED chunk last produced a readout change. A requested chunk that stays
-# quiet is released, which lets the region's bounding box SHRINK — see _release_idle_chunks().
-var _chunk_idle: Dictionary = {}  # Vector3i -> int
-const RELEASE_TICKS := 30
 # Ticks to wait between window moves. A rebuild reallocates every grid and particle buffer, so a
 # centroid hovering on a chunk boundary must not trigger one per tick.
 var _recenter_cooldown := 0
@@ -349,12 +353,11 @@ func cycle_timescale(substeps: int) -> String:
 # freed and recreated underneath it. Also usable as a manual hard reset.
 func reset() -> void:
 	_active_chunks.clear()
-	_chunk_idle.clear()
 	_destroy_region()
 	_warned_budget = false
 	_warned_region_cap = false
 	_warned_capacity = false
-	_grow_cooldown = 0
+	_recenter_cooldown = 0
 	_applied_sim_dt = -1.0
 
 
@@ -507,18 +510,26 @@ func _ensure_region() -> bool:
 		var pad := (region_chunks - span) / 2
 		origin = (bb[0] - pad) * n_grid
 	else:
-		# EXISTING REGION — shift at most ONE chunk, and only toward material that has reached an
-		# edge. Never re-centre on a computed midpoint: occupancy is derived from INSIDE the
-		# window, so a midpoint chases whatever fragment is still inside and abandons the bulk.
-		# Measured: "window moved: 14146 particle(s) left the window" on a 14,147-particle body —
-		# the window walked off the water and froze essentially all of it, repeatedly. That is the
-		# half-sphere that never dripped.
+		# EXISTING REGION — either GROW toward material at a face, or SHIFT one chunk toward it.
 		if _region.occupied.is_empty():
 			return false
-		var shift := _edge_shift(_region)
-		if shift == Vector3i.ZERO:
-			return false
-		origin = _region.origin + shift * n_grid
+		if grow_window:
+			# Material is touching a face: that chunk becomes part of the window. BOUNDED —
+			# max_axis_chunks per axis and MAX_REGION_NODES overall — which is the guard that was
+			# missing from the original growth rules. Those ran away because they had no ceiling
+			# and kept granting the fluid more room; this one stops at a fixed budget.
+			var g := _growth_for(_region)
+			var gmin: Vector3i = g[0]
+			var gmax: Vector3i = g[1]
+			if gmin == Vector3i.ZERO and gmax == Vector3i.ZERO:
+				return false
+			origin = _region.origin - gmin * n_grid
+			dims = _region.dims + (gmin + gmax) * n_grid
+		else:
+			var shift := _edge_shift(_region)
+			if shift == Vector3i.ZERO:
+				return false
+			origin = _region.origin + shift * n_grid
 
 	if _region != null and _region.dims == dims and _region.origin == origin:
 		if _region.signature == sig:
@@ -543,6 +554,41 @@ func _ensure_region() -> bool:
 	if prev != null:
 		_free_region_buffers(prev)
 	return true
+
+
+# One chunk of growth per face that the material is currently touching, subject to
+# max_axis_chunks and MAX_REGION_NODES. Returns [grow_min, grow_max] as per-axis 0/1 flags.
+#
+# This is the dynamic-local-allocation model restored, but with the ceiling the original lacked:
+# growth can never exceed a fixed node budget, so "give the fluid more room" is bounded rather
+# than an invitation to expand forever.
+func _growth_for(w: ChunkRegion) -> Array:
+	var none := Vector3i.ZERO
+	var wmin := Vector3i(w.origin.x / n_grid, w.origin.y / n_grid, w.origin.z / n_grid)
+	var wmax := wmin + (w.dims / n_grid) - Vector3i.ONE
+	var bb := _bbox_chunks_from(w.occupied)
+	var omin := bb[0]
+	var omax := bb[1]
+	var gmin := Vector3i.ZERO
+	var gmax := Vector3i.ZERO
+	if omin.x <= wmin.x: gmin.x = 1
+	if omax.x >= wmax.x: gmax.x = 1
+	if omin.y <= wmin.y: gmin.y = 1
+	if omax.y >= wmax.y: gmax.y = 1
+	if omin.z <= wmin.z: gmin.z = 1
+	if omax.z >= wmax.z: gmax.z = 1
+	if gmin == Vector3i.ZERO and gmax == Vector3i.ZERO:
+		return [none, none]
+	# Per-axis ceiling.
+	var cap := max_axis_chunks * n_grid
+	var d := w.dims + (gmin + gmax) * n_grid
+	if d.x > cap: gmin.x = 0; gmax.x = 0
+	if d.y > cap: gmin.y = 0; gmax.y = 0
+	if d.z > cap: gmin.z = 0; gmax.z = 0
+	d = w.dims + (gmin + gmax) * n_grid
+	if int(d.x) * int(d.y) * int(d.z) > MAX_REGION_NODES:
+		return [none, none]
+	return [gmin, gmax]
 
 
 # ONE CHUNK toward whichever side has material at (or past) the window edge. A TRANSLATION, never
@@ -1053,7 +1099,7 @@ func tick_all(substeps_per_tick: int) -> void:
 	# FOLLOW THE MATERIAL OUTWARD — if anything changed on a face of the region's bounding box,
 	# grow in that direction. The first version of this only grew downward, which is exactly why
 	# water hit a side wall, flowed the one way a chunk happened to already be active, and not
-	# the other. See _grow_region_if_needed().
+	# the other. See _ensure_region().
 	#
 	# Release runs FIRST so a stream that has moved on frees its chunks before we consider growing
 	# into new ones — otherwise the box only ever inflates.
@@ -1095,147 +1141,6 @@ func tick_all(substeps_per_tick: int) -> void:
 		_destroy_region()
 	else:
 		w.idle_ticks = 0
-
-
-# RELEASE QUIET CHUNKS SO THE BOX CAN SHRINK.
-#
-# 2026-08-13, after a measured run: a water body dropped at y=64 grew the region 64^3 -> 96x96x64
-# -> 128x128x64 and then hit MAX_REGION_NODES, at which point it could no longer grow DOWNWARD and
-# the water stopped falling in mid-air. The cause is structural, not tuning: _active_chunks only
-# ever grew, so the bounding box accumulated every chunk the material had ever touched. A stream
-# falling from y=64 to the ground drags a box down the whole column behind it, and the box volume
-# is what every node-parallel pass pays for.
-#
-# The fix is that the region follows ACTIVITY, not material. A requested chunk that produces no
-# readout change for RELEASE_TICKS is dropped from the set, so the box contracts behind a stream
-# and slides down with it. Its material is not lost: readout already wrote it into the voxel world,
-# where it persists (frozen) and re-activates on the next edit or disturbance.
-#
-# RELEASE_TICKS must stay comfortably above _grow_cooldown (15) or a chunk could be released and
-# immediately re-grown, thrashing the region every tick.
-#
-# Returns true if the region was resized (caller must not touch its ChunkRegion afterwards).
-func _release_idle_chunks(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
-	if _active_chunks.size() <= 1:
-		return false
-
-	var to_release: Array[Vector3i] = []
-	for key in _active_chunks:
-		var cp: Vector3i = key
-		# NEVER release a chunk that still holds material. The previous test was "no readout
-		# change for N ticks", which is true of a chunk holding RESTING water — so the region
-		# shrank over settled pools and _copy_particles_shifted killed what it left outside,
-		# freezing the water in mid-air. Occupancy is the honest question.
-		if w.occupied.has(cp):
-			_chunk_idle[cp] = 0
-			continue
-		var age: int = int(_chunk_idle.get(cp, 0)) + 1
-		_chunk_idle[cp] = age
-		if age >= RELEASE_TICKS:
-			to_release.append(cp)
-
-	if to_release.is_empty():
-		return false
-	# Don't strip the region bare — if everything is quiet, the whole region should go to sleep
-	# via the normal idle path, which also frees the buffers.
-	if to_release.size() >= _active_chunks.size():
-		return false
-
-	for cp in to_release:
-		_active_chunks.erase(cp)
-		_chunk_idle.erase(cp)
-	return _ensure_region()
-
-
-# GROW IN EVERY DIRECTION the material is actually pushing against.
-#
-# 2026-08-13, second pass. The first version only grew DOWNWARD (-Y), which produced the reported
-# asymmetry exactly: water spreading sideways reached the side of the region's bounding box, hit
-# a wall (g2p clamps to the region, grid_op damps a BOUND band at its faces), and could only
-# escape if a neighbouring chunk happened to already be active — so it flowed one way and not the
-# other. Sideways growth simply was not implemented. Now any changed chunk sitting on a bbox FACE
-# proposes the chunk just outside that face, for all six faces at once.
-#
-# Returns true if the region was rebuilt (caller must not touch its ChunkRegion afterwards).
-#
-# RATE LIMIT: "on a face and changed" is a proxy, and a settling pool jitters its fill value so
-# readout reports a change every tick. Without a cooldown an idle pool would ratchet outward one
-# chunk at a time until the budget died. 15 ticks also gives the spread time to actually reach
-# the new chunk before we judge the next face.
-func _grow_region_if_needed(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
-	if _grow_cooldown > 0:
-		_grow_cooldown -= 1
-		return false
-	if changed.is_empty() or w.chunks.is_empty():
-		return false
-
-	# GATE ON THE FACE MASK. A face chunk is 32 voxels deep, so "a face chunk changed" is true for
-	# any body sitting anywhere inside the outer chunks — which grew the box on all six faces for
-	# material that was nowhere near the edge. readout.comp now reports which face PLANES actually
-	# changed, so a direction is only grown when material is genuinely touching that edge.
-	var mask := w.face_mask
-	if mask == 0:
-		return false
-	var grow_xm := (mask & 1) != 0
-	var grow_xp := (mask & 2) != 0
-	var grow_ym := (mask & 4) != 0
-	var grow_yp := (mask & 8) != 0
-	var grow_zm := (mask & 16) != 0
-	var grow_zp := (mask & 32) != 0
-
-	var bmin := Vector3i(w.origin.x / n_grid, w.origin.y / n_grid, w.origin.z / n_grid)
-	var span := Vector3i(w.dims.x / n_grid, w.dims.y / n_grid, w.dims.z / n_grid)
-	var bmax := bmin + span - Vector3i.ONE
-
-	var proposals: Array[Vector3i] = []
-	var proposed: Dictionary = {}
-	# GRAVITY FIRST. When the chunk budget is tight, growing DOWNWARD is the direction that
-	# matters, and lateral spread can otherwise consume every slot before gravity is even
-	# considered — which is exactly what happened in the run where 16/16 chunks were taken by a
-	# 5x5 pancake while Y never grew at all.
-	for cp in changed:
-		if grow_ym and cp.y == bmin.y: _propose(proposals, proposed, cp + Vector3i(0, -1, 0))
-	for cp in changed:
-		if grow_xm and cp.x == bmin.x: _propose(proposals, proposed, cp + Vector3i(-1, 0, 0))
-		if grow_xp and cp.x == bmax.x: _propose(proposals, proposed, cp + Vector3i( 1, 0, 0))
-		if grow_zm and cp.z == bmin.z: _propose(proposals, proposed, cp + Vector3i(0, 0, -1))
-		if grow_zp and cp.z == bmax.z: _propose(proposals, proposed, cp + Vector3i(0, 0,  1))
-		if grow_yp and cp.y == bmax.y: _propose(proposals, proposed, cp + Vector3i(0,  1, 0))
-	if proposals.is_empty():
-		return false
-
-	# Commit every viable proposal BEFORE rebuilding, so one growth step covers all directions
-	# simultaneously instead of one direction per cooldown period.
-	var added := false
-	for cp in proposals:
-		if _active_chunks.has(cp):
-			continue
-		if not _chunk_manager.chunks.has(cp):
-			continue  # not streamed in — a genuine edge of the world
-		if _active_chunks.size() >= max_active_chunks:
-			if not _warned_budget:
-				push_warning("MPMSimulation: max_active_chunks=%d reached — material can no longer leave the current region edges." % max_active_chunks)
-				_warned_budget = true
-			break
-		if not _would_fit(cp):
-			if not _warned_region_cap:
-				push_warning("MPMSimulation: region grid would exceed MAX_REGION_NODES=%d including %s — refusing to grow." % [MAX_REGION_NODES, cp])
-				_warned_region_cap = true
-			break
-		_active_chunks[cp] = true
-		added = true
-	if not added:
-		return false
-
-	_grow_cooldown = 15
-	return _ensure_region()
-
-
-func _propose(out: Array[Vector3i], seen: Dictionary, cp: Vector3i) -> void:
-	if seen.has(cp):
-		return
-	seen[cp] = true
-	out.append(cp)
 
 
 func _run_region_substeps(w: ChunkRegion, substeps: int) -> void:
@@ -1290,7 +1195,7 @@ func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
 
 
 # Turn the occupancy bitmask into a set of chunk coords (world chunk space, same convention as
-# _active_chunks) so _release_idle_chunks() can ask a direct question: does this chunk hold
+# _active_chunks) so growth can ask a direct question: does this chunk hold
 # material? Bit index follows readout.comp's layout: (cz * dcx + cy) * dcx + cx over the region's
 # own chunk grid.
 func _decode_occupancy(w: ChunkRegion, raw: PackedByteArray) -> Dictionary:
