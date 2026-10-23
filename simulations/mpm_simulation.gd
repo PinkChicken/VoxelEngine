@@ -103,6 +103,11 @@ var _timescale_index: int = 0
 # (ARCHITECTURE.md §7.0) is measure before cutting. Use the `mpm_perf` / `mpm_stress` modes to
 # see whether particles or grid nodes dominate before spending fidelity here.
 @export var promote_stride: int = 1
+
+# FIXED window size, in chunks. The region is exactly this big, always, and TRANSLATES to follow
+# the material. 2x2x2 = 64^3 = 262,144 nodes ≈ 2.4 ms/tick on the measured hardware. Change this
+# to trade cost for reach — it is the only thing that decides either.
+@export var region_chunks: Vector3i = Vector3i(2, 2, 2)
 # Hard ceiling on region grid nodes. 1M nodes ≈ 60 MB of grid buffers (60 B/node) and ≈ 15.6k
 # workgroups per pass. Exceeded → the chunk that would cross it is refused, not allocated.
 const MAX_REGION_NODES := 1048576
@@ -290,8 +295,9 @@ func cycle_timescale(substeps: int) -> String:
 	sim_seconds_per_tick = TIMESCALE_LADDER[_timescale_index]
 	_applied_sim_dt = -1.0  # force a param re-upload on the next tick
 	var dt := sim_seconds_per_tick / maxf(float(substeps), 1.0)
-	return "timescale %d/%d: %.4f s per tick, substep dt=%.2e  (1 = real time; lower = finer + slower)" % [
-		_timescale_index + 1, TIMESCALE_LADDER.size(), sim_seconds_per_tick, dt]
+	return "timescale " + str(_timescale_index + 1) + " of " + str(TIMESCALE_LADDER.size()) \
+		+ " — " + String.num(sim_seconds_per_tick, 4) + " s per tick, substep dt " \
+		+ String.num(dt, 8) + " (1 = real time; lower = finer and slower)"
 
 
 # Drop ALL simulation state: the region (and with it every particle), the active-chunk set, and
@@ -423,43 +429,50 @@ func _promote_chunk_voxels(cp: Vector3i) -> void:
 	_append_particles(_region, pos, mats, mss)
 
 
-# (Re)builds the region if its geometry no longer matches the active set. This is the ONLY
-# place grid buffers are created. Rebuilding re-seeds particles from the voxel world (which is
-# the authoritative, readout-written state), so in-flight velocities are lost across a rebuild
-# — acceptable because rebuilds only happen when the region's chunk set changes, which is a
-# rare, structural event, not a per-tick one.
+# FIXED-SIZE SLIDING WINDOW (2026-08-13). Replaces the growing bounding box entirely.
+#
+# Why the bbox had to go: growth had to be decided from contact with the region's own walls, and
+# there is no local measurement that distinguishes "this fluid would keep going if the wall
+# weren't there" from "this fluid is confined" — pressure against a wall IS pressure. Four
+# criteria were tried (chunk changed / mass at plane / mass in band / outward velocity) and every
+# one either never fired or ran away, because a pressurised fluid genuinely does reach every wall
+# at genuine speed. Giving it a bigger box just gave it more room to spread into, which lit the
+# next set of faces. That feedback loop is the "box of spaz", and it is not fixable by a better
+# growth rule — only by not growing.
+#
+# So the window has a FIXED size (region_chunks) and TRANSLATES instead. Cost is decided up front
+# and never changes; there is no growth policy, no release policy, and no resize-under-pressure.
+# Material that leaves the window is written to voxels and frozen, which is the same deal Noita
+# makes with unloaded chunks.
 func _ensure_region() -> bool:
 	if _active_chunks.is_empty():
 		_destroy_region()
 		return false
+	# Nothing to recentre on yet — the region was just rebuilt and no readout has run on it. This
+	# guard matters: without it the window would recentre from the fallback set, rebuild, lose its
+	# occupancy, recentre again from the fallback, and oscillate every tick.
+	if _region != null and _region.occupied.is_empty():
+		return false
 
-	var bmin := Vector3i(2147483647, 2147483647, 2147483647)
-	var bmax := Vector3i(-2147483648, -2147483648, -2147483648)
 	var chunks: Array[Vector3i] = []
 	for key in _active_chunks:
 		var c: Vector3i = key
 		chunks.append(c)
-		bmin = Vector3i(mini(bmin.x, c.x), mini(bmin.y, c.y), mini(bmin.z, c.z))
-		bmax = Vector3i(maxi(bmax.x, c.x), maxi(bmax.y, c.y), maxi(bmax.z, c.z))
 
-	var dims := (bmax - bmin + Vector3i.ONE) * n_grid
-	var origin := bmin * n_grid
+	var dims := region_chunks * n_grid
+	var origin := _window_origin_for(_window_center_chunk(chunks))
 	var sig := _active_signature()
 
 	if _region != null and _region.dims == dims and _region.origin == origin:
 		if _region.signature == sig:
 			return false
-		# Same bbox, different membership — the GRID is unchanged, so nothing needs rebuilding
-		# and nothing needs re-seeding. Material cannot exist outside the bbox (g2p clamps to
-		# it), so a chunk joining inside it has no pre-existing voxels to promote.
 		_region.chunks = chunks
 		_region.signature = sig
 		return false
 
-	# Geometry changed. PRESERVE the particle set across the resize instead of re-seeding it from
-	# voxels. Re-seeding was why every chunk activation looked like the whole simulation
-	# "refreshing": velocities, the affine matrix C, the volume ratio J and sand's deformation
-	# gradient F were all discarded and every particle restarted at rest, mid-fall.
+	# Geometry changed. PRESERVE the particle set across the move instead of re-seeding it from
+	# voxels: velocities, the affine matrix C, the volume ratio J and sand's deformation gradient
+	# F all survive, and a translation is exact (the offset is a whole number of chunks).
 	var prev := _region
 	_region = null
 	var w := _build_region(origin, dims, chunks, prev)
@@ -468,6 +481,33 @@ func _ensure_region() -> bool:
 	if prev != null:
 		_free_region_buffers(prev)
 	return true
+
+
+# Where the window SHOULD be centred, in chunk coords. Prefers the material's own extent (from
+# readout's occupancy mask) so the window follows the water rather than the set of chunks that
+# were once activated; falls back to the requested set before the first readout has run.
+func _window_center_chunk(fallback: Array[Vector3i]) -> Vector3i:
+	if _region != null and not _region.occupied.is_empty():
+		var bmin := Vector3i(2147483647, 2147483647, 2147483647)
+		var bmax := Vector3i(-2147483648, -2147483648, -2147483648)
+		for key in _region.occupied:
+			var c: Vector3i = key
+			bmin = Vector3i(mini(bmin.x, c.x), mini(bmin.y, c.y), mini(bmin.z, c.z))
+			bmax = Vector3i(maxi(bmax.x, c.x), maxi(bmax.y, c.y), maxi(bmax.z, c.z))
+		return (bmin + bmax) / 2
+	var fmin := Vector3i(2147483647, 2147483647, 2147483647)
+	var fmax := Vector3i(-2147483648, -2147483648, -2147483648)
+	for c in fallback:
+		fmin = Vector3i(mini(fmin.x, c.x), mini(fmin.y, c.y), mini(fmin.z, c.z))
+		fmax = Vector3i(maxi(fmax.x, c.x), maxi(fmax.y, c.y), maxi(fmax.z, c.z))
+	if fmin.x > fmax.x:
+		return Vector3i.ZERO
+	return (fmin + fmax) / 2
+
+
+func _window_origin_for(center_chunk: Vector3i) -> Vector3i:
+	var half := Vector3i(region_chunks.x / 2, region_chunks.y / 2, region_chunks.z / 2)
+	return (center_chunk - half) * n_grid
 
 
 # Order-independent fingerprint of the active chunk set (positional hash combine).
@@ -931,10 +971,11 @@ func tick_all(substeps_per_tick: int) -> void:
 	#
 	# Release runs FIRST so a stream that has moved on frees its chunks before we consider growing
 	# into new ones — otherwise the box only ever inflates.
-	if _release_idle_chunks(w, changed):
-		return  # the region was resized; `w` is stale from here on
-	if _grow_region_if_needed(w, changed):
-		return  # the region was resized; `w` is stale from here on
+	# FIXED WINDOW, TRANSLATING. No growth, no release — see _ensure_region()'s header for why no
+	# growth criterion can work (pressure on a wall is indistinguishable from pressure into
+	# space). This is a no-op unless the material's centre has moved at least one chunk.
+	if _ensure_region():
+		return  # the window moved; `w` is stale from here on
 
 	# IDLE DETECTION — cheap signal first. An empty readout dirty-set means the grid wrote
 	# nothing back this tick, which needs no extra GPU→CPU round trip because the bitmask was
