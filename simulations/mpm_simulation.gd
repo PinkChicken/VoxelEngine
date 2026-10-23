@@ -349,7 +349,7 @@ func scan_loaded_chunks_for_existing_material() -> void:
 			continue
 		var chunk: Chunk = _chunk_manager.chunks[cp]
 		if chunk.active_simulation_mask() & CANDIDATE_MASK != 0:
-			_try_add_chunk(cp, true)
+			_try_add_chunk(cp)
 
 
 func _on_chunk_loaded(chunk_pos: Vector3i) -> void:
@@ -360,7 +360,7 @@ func _on_chunk_loaded(chunk_pos: Vector3i) -> void:
 		return
 	const CANDIDATE_MASK := 1 | 2
 	if chunk.active_simulation_mask() & CANDIDATE_MASK != 0:
-		_try_add_chunk(chunk_pos, true)
+		_try_add_chunk(chunk_pos)
 
 
 # Would adding `cp` keep the region grid within MAX_REGION_NODES? Computed on the prospective
@@ -392,14 +392,14 @@ func _try_add_chunk(cp: Vector3i, promote: bool = false) -> bool:
 			push_warning("MPMSimulation: region grid would exceed MAX_REGION_NODES=%d including %s — refusing to grow (far-apart active chunks are the cause; see class header's TRADEOFF)" % [MAX_REGION_NODES, cp])
 			_warned_region_cap = true
 		return false
-	var had_region := _region != null
 	_active_chunks[cp] = true
+	# NO incremental promotion here. readout writes every particle's voxels into the world each
+	# tick, so appending a chunk's voxels as particles DUPLICATES everything already represented —
+	# measured: the particle count climbed 5575 -> 8083 -> 10849 -> 28491 across a run that should
+	# have conserved it, and each duplicate added mass, which pushed the body harder, which
+	# activated more chunks. Fresh material is picked up by _build_region()'s promote when a region
+	# is created from nothing; that is the only place it is safe.
 	_ensure_region()
-	# A resize PRESERVES the live particle set and promotes nothing (see _ensure_region), so a
-	# chunk discovered OUTSIDE an edit — boot scan, or streaming in — would otherwise never get
-	# its pre-existing material turned into particles. A fresh build already promoted it.
-	if promote and had_region and _region != null:
-		_promote_chunk_voxels(cp)
 	return true
 
 
@@ -460,7 +460,8 @@ func _ensure_region() -> bool:
 		chunks.append(c)
 
 	var dims := region_chunks * n_grid
-	var origin := _window_origin_for(_window_center_chunk(chunks))
+	var bb := _material_bbox_chunks(chunks)
+	var origin := _window_origin_for(bb[0], bb[1])
 	var sig := _active_signature()
 
 	if _region != null and _region.dims == dims and _region.origin == origin:
@@ -477,37 +478,46 @@ func _ensure_region() -> bool:
 	_region = null
 	var w := _build_region(origin, dims, chunks, prev)
 	w.signature = sig
+	# A move must not inherit the previous region's idle streak: after rebuilding, the first
+	# readout often writes nothing (the voxels already match), which looked exactly like "settled"
+	# and put the region to sleep four ticks later — the reported "chunks freeze before the sphere
+	# has even fallen".
+	w.idle_ticks = 0
 	_region = w
 	if prev != null:
 		_free_region_buffers(prev)
 	return true
 
 
-# Where the window SHOULD be centred, in chunk coords. Prefers the material's own extent (from
-# readout's occupancy mask) so the window follows the water rather than the set of chunks that
-# were once activated; falls back to the requested set before the first readout has run.
-func _window_center_chunk(fallback: Array[Vector3i]) -> Vector3i:
+# Where the window SHOULD be, given the material's chunk-space bounding box. Padded so the body
+# sits CENTRED and, critically, so the box is actually INSIDE the window: centring on the bbox
+# midpoint and subtracting half the window rounded the wrong way for an even-sized span, leaving
+# the top chunk of material outside (measured: spawn at voxel y=78 is chunk y=2, window covered
+# y 0..1, so every particle was clamped onto the ceiling).
+func _window_origin_for(bmin: Vector3i, bmax: Vector3i) -> Vector3i:
+	var span := bmax - bmin + Vector3i.ONE
+	var pad := (region_chunks - span) / 2  # negative when the body is bigger than the window
+	return (bmin - pad) * n_grid
+
+
+# Chunk-space bounding box of the material: prefers readout's occupancy mask (where the water
+# actually is now), falls back to the requested set before the first readout has run.
+func _material_bbox_chunks(fallback: Array[Vector3i]) -> Array[Vector3i]:
+	var src: Dictionary = {}
 	if _region != null and not _region.occupied.is_empty():
-		var bmin := Vector3i(2147483647, 2147483647, 2147483647)
-		var bmax := Vector3i(-2147483648, -2147483648, -2147483648)
-		for key in _region.occupied:
-			var c: Vector3i = key
-			bmin = Vector3i(mini(bmin.x, c.x), mini(bmin.y, c.y), mini(bmin.z, c.z))
-			bmax = Vector3i(maxi(bmax.x, c.x), maxi(bmax.y, c.y), maxi(bmax.z, c.z))
-		return (bmin + bmax) / 2
-	var fmin := Vector3i(2147483647, 2147483647, 2147483647)
-	var fmax := Vector3i(-2147483648, -2147483648, -2147483648)
-	for c in fallback:
-		fmin = Vector3i(mini(fmin.x, c.x), mini(fmin.y, c.y), mini(fmin.z, c.z))
-		fmax = Vector3i(maxi(fmax.x, c.x), maxi(fmax.y, c.y), maxi(fmax.z, c.z))
-	if fmin.x > fmax.x:
-		return Vector3i.ZERO
-	return (fmin + fmax) / 2
-
-
-func _window_origin_for(center_chunk: Vector3i) -> Vector3i:
-	var half := Vector3i(region_chunks.x / 2, region_chunks.y / 2, region_chunks.z / 2)
-	return (center_chunk - half) * n_grid
+		src = _region.occupied
+	else:
+		for c in fallback:
+			src[c] = true
+	if src.is_empty():
+		return [Vector3i.ZERO, Vector3i.ZERO]
+	var bmin := Vector3i(2147483647, 2147483647, 2147483647)
+	var bmax := Vector3i(-2147483648, -2147483648, -2147483648)
+	for key in src:
+		var c: Vector3i = key
+		bmin = Vector3i(mini(bmin.x, c.x), mini(bmin.y, c.y), mini(bmin.z, c.z))
+		bmax = Vector3i(maxi(bmax.x, c.x), maxi(bmax.y, c.y), maxi(bmax.z, c.z))
+	return [bmin, bmax]
 
 
 # Order-independent fingerprint of the active chunk set (positional hash combine).
@@ -594,18 +604,21 @@ func _copy_particles_shifted(prev: ChunkRegion, w: ChunkRegion) -> void:
 	# release the box should not shrink over material at all, so this is a safety net — but a
 	# safety net that preserves mass rather than silently deleting it.
 	var alive := PackedInt32Array(); alive.resize(n)
-	var hi := Vector3(w.dims) - Vector3(1e-4, 1e-4, 1e-4)
-	var clamped := 0
+	var limit := Vector3(w.dims) - Vector3(1e-4, 1e-4, 1e-4)
+	var outside := 0
 	for i in n:
 		var px: float = pos[i*3]     + shift.x
 		var py: float = pos[i*3 + 1] + shift.y
 		var pz: float = pos[i*3 + 2] + shift.z
-		var cx := clampf(px, 0.0, hi.x)
-		var cy := clampf(py, 0.0, hi.y)
-		var cz := clampf(pz, 0.0, hi.z)
-		if cx != px or cy != py or cz != pz:
-			clamped += 1
-		pos[i*3] = cx; pos[i*3 + 1] = cy; pos[i*3 + 2] = cz
+		# DROP, do not clamp. Clamping teleported them onto whatever wall was nearest, which is
+		# where the flat-axis streaks came from. A particle outside the window becomes frozen
+		# voxels, which is the intended deal — but with the padding fix it should be rare, because
+		# the window is now placed to contain the material rather than rounded around its midpoint.
+		if px < 0.0 or py < 0.0 or pz < 0.0 or px > limit.x or py > limit.y or pz > limit.z:
+			alive[i] = 0
+			outside += 1
+			continue
+		pos[i*3] = px; pos[i*3 + 1] = py; pos[i*3 + 2] = pz
 		alive[i] = 1
 	_compute.buffer_update(w.pos, 0, pos.to_byte_array())
 	_compute.buffer_update(w.alive, 0, alive.to_byte_array())
@@ -615,8 +628,8 @@ func _copy_particles_shifted(prev: ChunkRegion, w: ChunkRegion) -> void:
 	_compute.buffer_copy(prev.mat,   w.mat,   0, 0, n * 4)
 	_compute.buffer_copy(prev.mass,  w.mass,  0, 0, n * 4)
 	_compute.buffer_copy(prev.F,     w.F,     0, 0, n * 9 * 4)
-	if clamped > 0:
-		print("[MPM] region resized: %d particle(s) clamped back inside the new bounds" % clamped)
+	if outside > 0:
+		print("[MPM] window moved: %d particle(s) left the window and are frozen as voxels" % outside)
 	w.n_particles = n
 	w.groups_particles = int(ceil(float(n) / 64.0))
 	_upload_region_params(w)
