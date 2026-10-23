@@ -176,6 +176,9 @@ var _grow_cooldown := 0
 # quiet is released, which lets the region's bounding box SHRINK — see _release_idle_chunks().
 var _chunk_idle: Dictionary = {}  # Vector3i -> int
 const RELEASE_TICKS := 30
+# Ticks to wait between window moves. A rebuild reallocates every grid and particle buffer, so a
+# centroid hovering on a chunk boundary must not trigger one per tick.
+var _recenter_cooldown := 0
 # Substep dt actually uploaded to the shaders; recomputed from sim_seconds_per_tick.
 var sim_dt: float = 1.0e-4
 var _applied_sim_dt: float = -1.0
@@ -460,8 +463,7 @@ func _ensure_region() -> bool:
 		chunks.append(c)
 
 	var dims := region_chunks * n_grid
-	var bb := _material_bbox_chunks(chunks)
-	var origin := _window_origin_for(bb[0], bb[1])
+	var origin := _window_origin_for(_material_centroid_chunk(chunks))
 	var sig := _active_signature()
 
 	if _region != null and _region.dims == dims and _region.origin == origin:
@@ -489,20 +491,22 @@ func _ensure_region() -> bool:
 	return true
 
 
-# Where the window SHOULD be, given the material's chunk-space bounding box. Padded so the body
-# sits CENTRED and, critically, so the box is actually INSIDE the window: centring on the bbox
-# midpoint and subtracting half the window rounded the wrong way for an even-sized span, leaving
-# the top chunk of material outside (measured: spawn at voxel y=78 is chunk y=2, window covered
-# y 0..1, so every particle was clamped onto the ceiling).
-func _window_origin_for(bmin: Vector3i, bmax: Vector3i) -> Vector3i:
-	var span := bmax - bmin + Vector3i.ONE
-	var pad := (region_chunks - span) / 2  # negative when the body is bigger than the window
-	return (bmin - pad) * n_grid
+# Where the window should sit, given where the material's MASS is.
+#
+# Anchored on the CENTROID of the occupied chunks, not on the bounding box. Bbox-with-padding put
+# the body in the window's min corner whenever the span was already window-sized — measured: 2
+# occupied chunks in a 2x2x2 window, padding (2-2)/2 = 0, so origin = bmin and the water had a
+# hard wall immediately at -X and -Y with all the free space behind it. That is the "invisible
+# wall with only 4 active chunks" report. The centroid gives roughly half a window of room on
+# every side, so the boundary trails the material instead of leading it.
+func _window_origin_for(centroid_chunk: Vector3i) -> Vector3i:
+	var half := Vector3i(region_chunks.x / 2, region_chunks.y / 2, region_chunks.z / 2)
+	return (centroid_chunk - half) * n_grid
 
 
-# Chunk-space bounding box of the material: prefers readout's occupancy mask (where the water
-# actually is now), falls back to the requested set before the first readout has run.
-func _material_bbox_chunks(fallback: Array[Vector3i]) -> Array[Vector3i]:
+# Centroid of the material in chunk coords: prefers readout's occupancy mask (where the water
+# actually is), falls back to the requested set before the first readout has run.
+func _material_centroid_chunk(fallback: Array[Vector3i]) -> Vector3i:
 	var src: Dictionary = {}
 	if _region != null and not _region.occupied.is_empty():
 		src = _region.occupied
@@ -510,14 +514,15 @@ func _material_bbox_chunks(fallback: Array[Vector3i]) -> Array[Vector3i]:
 		for c in fallback:
 			src[c] = true
 	if src.is_empty():
-		return [Vector3i.ZERO, Vector3i.ZERO]
-	var bmin := Vector3i(2147483647, 2147483647, 2147483647)
-	var bmax := Vector3i(-2147483648, -2147483648, -2147483648)
+		return Vector3i.ZERO
+	var sum := Vector3i.ZERO
 	for key in src:
 		var c: Vector3i = key
-		bmin = Vector3i(mini(bmin.x, c.x), mini(bmin.y, c.y), mini(bmin.z, c.z))
-		bmax = Vector3i(maxi(bmax.x, c.x), maxi(bmax.y, c.y), maxi(bmax.z, c.z))
-	return [bmin, bmax]
+		sum += c
+	var n := maxi(src.size(), 1)
+	# Integer rounding on each axis; Godot's Vector3i division truncates, which is fine here since
+	# the window snaps to whole chunks anyway.
+	return Vector3i(roundi(float(sum.x) / n), roundi(float(sum.y) / n), roundi(float(sum.z) / n))
 
 
 # Order-independent fingerprint of the active chunk set (positional hash combine).
@@ -986,8 +991,12 @@ func tick_all(substeps_per_tick: int) -> void:
 	# into new ones — otherwise the box only ever inflates.
 	# FIXED WINDOW, TRANSLATING. No growth, no release — see _ensure_region()'s header for why no
 	# growth criterion can work (pressure on a wall is indistinguishable from pressure into
-	# space). This is a no-op unless the material's centre has moved at least one chunk.
-	if _ensure_region():
+	# space). Rate-limited so a centroid that hovers on a chunk boundary cannot reallocate every
+	# tick: a rebuild is state-preserving but it does reallocate every buffer.
+	if _recenter_cooldown > 0:
+		_recenter_cooldown -= 1
+	elif _ensure_region():
+		_recenter_cooldown = 10
 		return  # the window moved; `w` is stale from here on
 
 	# IDLE DETECTION — cheap signal first. An empty readout dirty-set means the grid wrote
