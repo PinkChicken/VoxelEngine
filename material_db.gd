@@ -150,8 +150,10 @@ func override_mpm(mat_id: int, mpm_density: float, mpm_stiffness: float, mpm_vis
 	def.mpm_density = mpm_density
 	def.mpm_stiffness = mpm_stiffness
 	def.mpm_viscosity = mpm_viscosity
-	build_buffer()
-	build_mpm_buffer()
+	# IN PLACE — see update_mpm_buffer_in_place(). The colour/sim-class table (buffer_rid) is not
+	# touched at all: nothing here changes it, and rebuilding it would dangle the raymarcher's
+	# uniform set.
+	update_mpm_buffer_in_place()
 
 
 func build_buffer() -> void:
@@ -189,7 +191,23 @@ func build_buffer() -> void:
 func build_mpm_buffer() -> void:
 	if mpm_buffer_rid.is_valid():
 		_compute.free_rid(mpm_buffer_rid)
+	mpm_buffer_rid = _compute.buffer_upload(_encode_mpm_blob())
 
+
+# Re-upload the MPM table into the EXISTING buffer, keeping its RID. Required for live parameter
+# edits: build_mpm_buffer() frees and recreates the RID, which silently invalidates every uniform
+# set already holding it — measured as "Uniforms were never supplied for set (0)" from
+# RaymarchRenderer's own dispatch (it binds this table too), leaving the raymarched ground frozen
+# while the wireframe overlay kept drawing. The table's size is fixed by max_materials, so an
+# in-place update is always valid and can never dangle.
+func update_mpm_buffer_in_place() -> void:
+	if not mpm_buffer_rid.is_valid():
+		build_mpm_buffer()
+		return
+	_compute.buffer_update(mpm_buffer_rid, 0, _encode_mpm_blob())
+
+
+func _encode_mpm_blob() -> PackedByteArray:
 	# GPU layout per material (32 bytes) — read by shaders/mpm/p2g.comp, indexed directly by
 	# material id (mirrors build_buffer()'s pattern, a separate mirror because these are
 	# MPM-only fields with no equivalent in the flux/render table above).
@@ -226,4 +244,4 @@ func build_mpm_buffer() -> void:
 		data.encode_float(base + 20, mu_sand)
 		data.encode_float(base + 24, lambda_sand)
 
-	mpm_buffer_rid = _compute.buffer_upload(data)
+	return data
