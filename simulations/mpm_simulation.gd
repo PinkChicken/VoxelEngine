@@ -155,6 +155,9 @@ var _g2p: Dictionary
 var _readout: Dictionary
 
 var is_setup: bool = false
+# Why setup() failed, if it did — surfaced by world.gd's Y dump so a dead MPM says which shader
+# or which precondition, instead of the misleading "not bound".
+var setup_error: String = ""
 
 
 func _ready() -> void:
@@ -179,6 +182,7 @@ func _verify_material_table() -> void:
 # connects to the signals that drive chunk activation. Call once. Allocates NO grid buffers
 # here — those come from _ensure_region() as chunks actually need them.
 func setup() -> bool:
+	setup_error = ""
 	dx = 1.0
 	inv_dx = 1.0
 	p_vol = pow(dx * 0.5, 3.0)
@@ -189,14 +193,26 @@ func setup() -> bool:
 	_grid_op = _compute.compile_shader(_load_shader("res://shaders/mpm/grid_op.comp"))
 	_g2p     = _compute.compile_shader(_load_shader("res://shaders/mpm/g2p.comp"))
 	_readout = _compute.compile_shader(_load_shader("res://shaders/mpm/readout.comp"))
-	if _clear.is_empty() or _p2g.is_empty() or _grid_op.is_empty() or _g2p.is_empty() or _readout.is_empty():
-		push_error("MPMSimulation: one or more shaders failed to compile")
+	var failed: Array[String] = []
+	if _clear.is_empty():   failed.append("clear_grid.comp")
+	if _p2g.is_empty():     failed.append("p2g.comp")
+	if _grid_op.is_empty(): failed.append("grid_op.comp")
+	if _g2p.is_empty():     failed.append("g2p.comp")
+	if _readout.is_empty(): failed.append("readout.comp")
+	if not failed.is_empty():
+		# Name the file(s). A shader compile failure only surfaces as "MPM is not running",
+		# which reads like a solver-selection problem and costs a debugging round trip; the
+		# actual GLSL error is push_error'd by compile_shader() and got lost in scrollback
+		# (2026-08-13: a forward reference to `fill` in readout.comp did exactly this).
+		setup_error = "shader compile failed: " + ", ".join(failed)
+		push_error("MPMSimulation: " + setup_error)
 		return false
 
 	var orch: WorldOrchestrator = get_node("/root/world/WorldOrchestrator")
 	var cm: ChunkManager = get_node("/root/world/ChunkManager")
 	if not orch.is_grid_valid():
-		push_error("MPMSimulation.setup(): WorldOrchestrator grid not valid yet")
+		setup_error = "WorldOrchestrator grid not valid yet"
+		push_error("MPMSimulation.setup(): " + setup_error)
 		return false
 	_orchestrator = orch
 	_chunk_manager = cm

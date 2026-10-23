@@ -252,7 +252,10 @@ func _unhandled_input(event: InputEvent) -> void:
 func _mpm_status_dump() -> void:
 	if not mpm_simulation.is_bound():
 		var mode_name := "MPM" if simulation_runtime.is_mpm_mode() else "CA"
-		print("[MPM] not bound — solver mode is %s, so MPM is not running" % mode_name)
+		if mpm_simulation.setup_error != "":
+			print("[MPM] NOT RUNNING — setup() failed: %s" % mpm_simulation.setup_error)
+		else:
+			print("[MPM] not bound — solver mode is %s, so MPM is not running" % mode_name)
 		return
 	# Regions are shared across chunks now (2026-08-13), so there is one grid, not one per
 	# chunk. Report the region, then the chunks it covers.
