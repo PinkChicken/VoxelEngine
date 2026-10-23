@@ -118,6 +118,14 @@ void main() {
 			if (mm > best_mass) { best_mass = mm; best_mat = m; }
 		}
 		if (best_mass == 0) return;  // shouldn't happen given mass>=threshold, but stay safe
+		// FILL DEADBAND (2026-08-13). Particles jittering by a fraction of a voxel produce a
+		// slightly different mass, hence a slightly different quantised fill, EVERY tick. Each
+		// of those writes registers as a change, which is exactly the signal the region's idle
+		// timer uses — so a settled pool could sit there visibly motionless and still never
+		// sleep. Suppressing sub-threshold fill churn lets the timer actually reach zero.
+		const int FILL_DEADBAND = 2;
+		uint cur_fill = (cur_voxel >> 8u) & 0xFFu;
+		if (best_mat == cur_mat && abs(int(fill) - int(cur_fill)) <= FILL_DEADBAND) return;
 		// fill calibration is approximate (brief §37 — this step proves the mechanism writes
 		// correctly, not a tuned visual density; REFERENCE_MASS is a starting point, not a
 		// measured constant). 1..255, never 0 — an occupied cell must never render as air.
