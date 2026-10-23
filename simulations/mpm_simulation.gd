@@ -118,6 +118,8 @@ var _active_chunks: Dictionary = {}  # Vector3i -> true
 var _warned_budget := false
 var _warned_region_cap := false
 var _warned_capacity := false
+# Ticks to wait before the region may grow downward again — see _grow_region_down_if_needed().
+var _grow_cooldown := 0
 # Substep dt actually uploaded to the shaders; recomputed from sim_seconds_per_tick.
 var sim_dt: float = 1.0e-4
 var _applied_sim_dt: float = -1.0
@@ -685,6 +687,14 @@ func tick_all(substeps_per_tick: int) -> void:
 	_run_region_substeps(w, substeps_per_tick)
 	var changed := _readout_region(w)
 
+	# FOLLOW FALLING MATERIAL DOWNWARD — added after a real run showed a region at chunk y 0..1
+	# with NO chunk below y=0 active. Chunks only ever activated from edits, chunk loads and the
+	# boot scan, so nothing grew the region to follow a falling stream: water fell to the bottom
+	# of the grid, g2p clamped it, and it piled up against the region's floor — the vertical
+	# version of "climbs up that wall".
+	if _grow_region_down_if_needed(w, changed):
+		return  # the region was rebuilt; `w` is stale from here on
+
 	# IDLE DETECTION — cheap signal first. An empty readout dirty-set means the grid wrote
 	# nothing back this tick, which needs no extra GPU→CPU round trip because the bitmask was
 	# already downloaded. The previous version called read_velocities() EVERY tick, which
@@ -713,6 +723,60 @@ func tick_all(substeps_per_tick: int) -> void:
 		_destroy_region()
 	else:
 		w.idle_ticks = 0
+
+
+# If the region's BOTTOM-MOST active chunk produced readout changes this tick, material is
+# active at the floor of the simulated domain — add the chunk below so it has somewhere to go.
+# Returns true if the region was rebuilt (caller must not touch its ChunkRegion afterwards).
+#
+# Self-limiting by construction: after the rebuild the origin has dropped a chunk, so the
+# material that triggered this is no longer in the bottom chunk. Resting material produces NO
+# readout change (readout early-outs when new_voxel == cur_voxel), so a settled pool cannot
+# ratchet the region downward one chunk per tick.
+#
+# KNOWN LIMITATION, and it is a visible one: _ensure_region() rebuilds by re-seeding particles
+# from voxels, so a falling stream LOSES ITS VELOCITY each time it crosses a chunk boundary
+# downward. Fixing that means preserving particle buffers across a resize (allocate new, copy
+# the old contents with a position offset, promote only the newly added chunks) instead of
+# re-seeding. Tracked in docs/MIGRATION_MPM.md §7 as the next S3 item.
+func _grow_region_down_if_needed(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
+	# RATE LIMIT. "Bottom chunk changed this tick" is a proxy for "material is active at the
+	# floor", but a settling pool jitters its fill value, which readout reports as a change every
+	# tick — without this it would ratchet one chunk downward per tick until the budget died.
+	if _grow_cooldown > 0:
+		_grow_cooldown -= 1
+		return false
+
+	if changed.is_empty() or w.chunks.is_empty():
+		return false
+
+	var bottom := 2147483647
+	for cp in w.chunks:
+		bottom = mini(bottom, cp.y)
+
+	var at_floor := false
+	for cp in changed:
+		if cp.y == bottom:
+			at_floor = true
+			break
+	if not at_floor:
+		return false
+
+	# One chunk directly below any bottom chunk — it does not need to span the whole footprint,
+	# it only needs to give the falling material somewhere to exist.
+	var below := Vector3i(0, 0, 0)
+	var found := false
+	for cp in w.chunks:
+		if cp.y == bottom:
+			below = Vector3i(cp.x, bottom - 1, cp.z)
+			found = true
+			break
+	if not found or _active_chunks.has(below):
+		return false
+	if not _chunk_manager.chunks.has(below):
+		return false  # not streamed in — a genuine edge of the world
+	_grow_cooldown = 15
+	return _try_add_chunk(below)
 
 
 func _run_region_substeps(w: ChunkRegion, substeps: int) -> void:
