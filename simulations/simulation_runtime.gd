@@ -17,6 +17,26 @@ var _active: Array[VoxelSimulation]          # simulations currently with work
 var _accumulator: float = 0.0
 var paused: bool = false
 
+# --- Solver selection (2026-08-13) — EXACTLY ONE solver owns the voxel buffer per run ---
+#
+# CA and MPM both write `_voxel_buf_a`, through different owners: CA via per-tick changelogs
+# -> patch_apply.comp, MPM via readout.comp. Before this gate all three writers ran every tick
+# simultaneously, which is the maximal-seam configuration and the documented source of most
+# multi-session bugs in docs/BUG_LOG.md (brief §37: "one solver removes the cross-solver seam
+# ... rather than managing it"). The gate makes "one solver at a time" structural instead of a
+# convention nobody enforces.
+#
+# CA  = GranularSimulation + FluidSimulation (the working baseline, and the reference oracle
+#       MPM water is validated against while it is still at pilot scale).
+# MPM = MPMSimulation only; the CA sims are never woken, so they can't compete for the buffer.
+#
+# Default is CA deliberately: MPM is currently pilot-scale (4000 particles/chunk, 8 active
+# chunks) and would visibly degrade the game if made the only solver today. Flipping the
+# cutover is a one-line change — set this export to MPM in world.tscn, or change the default
+# below — and should happen only once MPM reaches parity (see docs/MIGRATION_MPM.md).
+enum SolverMode { CA = 0, MPM = 1 }
+@export_enum("CA", "MPM") var solver_mode: int = SolverMode.CA
+
 # MLS-MPM migration (2026-08-12, brief §37) — NOT a VoxelSimulation (see mpm_simulation.gd's
 # header for why), so it doesn't go through register_simulation()/_active; ticked directly
 # here instead. mpm_simulation is a CHILD of this node, so unlike _material_db above (a later
@@ -36,7 +56,26 @@ func _ready() -> void:
 	var orch := get_node("/root/world/WorldOrchestrator")
 	orch.chunks_committed.connect(_on_chunks_committed)
 	orch.chunk_loaded.connect(func(cp: Vector3i): _on_chunks_committed([cp]))
+	_resolve_solver_mode()
 	call_deferred("_build_material_cache")
+
+
+# Command-line override, applied once at boot so benches/tests can force a solver without
+# editing the scene: `-- mpm` or `-- ca`. The MPM integration test implies MPM.
+# Resolved here (not in world.gd) so this node stays the single source of truth for the mode,
+# and so the print below always reflects the mode actually in effect.
+func _resolve_solver_mode() -> void:
+	var args := OS.get_cmdline_user_args()
+	if args.has("mpm") or args.has("mpm_multi_chunk_test"):
+		solver_mode = SolverMode.MPM
+	elif args.has("ca"):
+		solver_mode = SolverMode.CA
+	var mode_name := "MPM" if is_mpm_mode() else "CA"
+	print("[SimRuntime] solver mode = %s (one solver owns the voxel buffer this run)" % mode_name)
+
+
+func is_mpm_mode() -> bool:
+	return solver_mode == SolverMode.MPM
 
 
 func _build_material_cache() -> void:
@@ -53,6 +92,12 @@ func register_simulation(sim: VoxelSimulation) -> void:
 
 
 func _on_chunks_committed(chunk_positions: Array[Vector3i]) -> void:
+	# MPM owns the buffer this run — never wake the CA sims, so they cannot accumulate
+	# candidates and cannot step. MPM does its own activation (setup()'s scan,
+	# voxels_placed, chunk_loaded), so it needs nothing from this path.
+	if is_mpm_mode():
+		return
+
 	# Per-simulation candidate sets (chunk positions, not voxel positions).
 	# We check each committed chunk plus its vertical neighbours — grains fall
 	# between chunks, so a grain in the chunk above may now be able to move down.
@@ -123,6 +168,13 @@ func step_once() -> void:
 
 
 func _tick() -> void:
+	# MPM path: MPM only. The CA sims below are deliberately not stepped — stepping both
+	# would put two independent owners on the same voxels (see SolverMode's header comment).
+	if is_mpm_mode():
+		if mpm_simulation and mpm_simulation.is_bound():
+			mpm_simulation.tick_all(mpm_substeps_per_tick)
+		return
+
 	var to_run := _active.duplicate()
 	var still_active: Array[VoxelSimulation] = []
 	for sim in to_run:
@@ -133,6 +185,3 @@ func _tick() -> void:
 		if not still_active.has(sim) and sim.has_work():
 			still_active.append(sim)
 	_active = still_active
-
-	if mpm_simulation and mpm_simulation.is_bound():
-		mpm_simulation.tick_all(mpm_substeps_per_tick)

@@ -61,8 +61,15 @@ void fragment() {
 	# every frame.
 	await get_tree().create_timer(3.0).timeout  # chunks stream in over several frames, not
 	# synchronously at boot — WorldOrchestrator.is_grid_valid() isn't meaningful before this.
-	if not mpm_simulation.setup():
-		print("[MPM] setup() failed — see error above")
+	# Solver selection (2026-08-13): only the selected solver runs. In CA mode MPM is not
+	# merely idle, it is never bound — no buffers allocated, no 24-substep tick per frame,
+	# nothing on disk to fight the CA solvers over the voxel buffer. See
+	# SimulationRuntime.SolverMode; force with `-- mpm` / `-- ca`.
+	if simulation_runtime.is_mpm_mode():
+		if not mpm_simulation.setup():
+			print("[MPM] setup() failed — see error above")
+	else:
+		print("[MPM] not started — solver mode is CA (pass `-- mpm` to exercise MPM)")
 
 	if OS.get_cmdline_user_args().has("mpm_multi_chunk_test"):
 		await _mpm_multi_chunk_test()
@@ -224,6 +231,10 @@ func _unhandled_input(event: InputEvent) -> void:
 # position logic anywhere in this file anymore — activation is entirely chunk/material-driven
 # (MPMSimulation.setup()/scan_loaded_chunks_for_existing_material()/_on_voxels_placed()).
 func _mpm_status_dump() -> void:
+	if not mpm_simulation.is_bound():
+		var mode_name := "MPM" if simulation_runtime.is_mpm_mode() else "CA"
+		print("[MPM] not bound — solver mode is %s, so MPM has no active chunks" % mode_name)
+		return
 	var chunks := mpm_simulation.active_chunk_positions()
 	print("[MPM] %d active chunk(s):" % chunks.size())
 	for cp in chunks:
