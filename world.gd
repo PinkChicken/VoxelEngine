@@ -191,20 +191,11 @@ func _unhandled_input(event: InputEvent) -> void:
 			world_orchestrator.debug_load_voxel_snapshot()
 			fluid_simulation.debug_restore_snapshot()
 		elif event.keycode == KEY_T:
-			# Buoyancy trigger tint (mode 0) — flips BOTH halves of the tint (FluidSimulation
-			# writes the per-voxel buffer, RaymarchRenderer reads it) together, since neither
-			# alone shows anything. Marks every voxel buoyancy.py's trigger would fire on: a
-			# LIGHTER liquid, AT REST, with a DENSER different liquid it could rise into
-			# (straight-up always, diagonal-up if isolated). Pressing KEY_T while already in
-			# buoyancy mode turns the tint off; pressing it while in momentum mode switches
-			# to buoyancy. TINT ONLY — no voxel is moved.
-			var already := fluid_simulation.debug_density_trigger_tint and fluid_simulation.tint_mode == 0
-			var on := not already
-			fluid_simulation.debug_density_trigger_tint = on
-			raymarch_renderer.debug_density_touch_tint = on
-			if on:
-				fluid_simulation.tint_mode = 0
-			print("[BuoyancyTint] %s" % ("ON — liquid that could rise (lighter, at rest, denser above) flashes magenta" if on else "off"))
+			# MPM time-scale probe (2026-08-13). T used to be the CA buoyancy tint, which does
+			# nothing now that the CA sims are disabled, so the key is reused for the experiment
+			# that actually matters: is the fluid meta-stable because the substep is too coarse?
+			# Watch whether the body still expands to fill its container as dt gets finer.
+			print("[MPM] %s" % mpm_simulation.cycle_timescale(simulation_runtime.mpm_substeps_per_tick))
 		elif event.keycode == KEY_H:
 			# Punch trigger tint (mode 2, Phase 5 port step 2a) — marks every cell the
 			# momentum PUNCH would fire on: a liquid arriving with real downward flux
@@ -318,6 +309,8 @@ func _mpm_status_dump() -> void:
 		float(simulation_runtime.last_mpm_tick_usec) / 1000.0))
 	print("  faces holding material: %s  (bit0=-X bit1=+X bit2=-Y bit3=+Y bit4=-Z bit5=+Z)" % (
 		_mpm_face_names(int(info["faces"]))))
+	print("  timescale: %.4f s/tick  (T cycles the ladder: 1/60 1/120 1/240 1/480 1/30)" % (
+		mpm_simulation.sim_seconds_per_tick))
 
 
 # THE TEST (2026-08-12, brief §37) — proves MPM's activity is genuinely player-independent:

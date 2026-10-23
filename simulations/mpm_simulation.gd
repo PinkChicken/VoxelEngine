@@ -61,6 +61,25 @@ class_name MPMSimulation extends Node
 # violent impact starts blowing up.
 @export var sim_seconds_per_tick: float = 1.0 / 60.0
 
+# TIMESCALE PROBE. Cycles sim_seconds_per_tick through a ladder so the stability threshold can be
+# found in one session instead of one build per guess (KEY_T in world.gd).
+#
+# Why this exists: the "falls too slowly" fix multiplied sim_dt by 6.94x (1.0e-4 -> 6.94e-4 by
+# making a tick advance real time). An MPM fluid integrated too coarsely does not just look wrong,
+# it EXPANDS — the J-model pressure impulse over-shoots, J drifts away from 1, and the body pushes
+# itself apart until it fills whatever volume it is given. That is indistinguishable from a region
+# growth bug by looking at the region: material genuinely reaches every wall, at genuine speed, so
+# every growth criterion we have tried fires legitimately. If the fluid is meta-stable, the region
+# machinery is being blamed for a solver problem.
+const TIMESCALE_LADDER := [
+	1.0 / 60.0,   # real time — the current default, and the suspected unstable one
+	1.0 / 120.0,  # 2x finer
+	1.0 / 240.0,  # 4x finer
+	1.0 / 480.0,  # 8x finer — near the original hand-tuned value
+	1.0 / 30.0,   # deliberately too coarse, for contrast
+]
+var _timescale_index: int = 0
+
 # Particle capacity for the WHOLE region (not per chunk). One full 32³ chunk of water is 32768
 # voxels, so the old 4000 could not represent even an eighth of a single chunk — and the
 # promotion scan fills in ascending y, so overflow truncated the TOP of a poured sphere. 64K
@@ -263,6 +282,16 @@ func is_bound() -> bool:
 # has slept.) Used so perf averages don't dilute real ticks with idle ones.
 func is_simulating() -> bool:
 	return _region != null and _region.n_particles > 0
+
+
+# Step the timescale ladder. Returns a human-readable summary for the console.
+func cycle_timescale(substeps: int) -> String:
+	_timescale_index = (_timescale_index + 1) % TIMESCALE_LADDER.size()
+	sim_seconds_per_tick = TIMESCALE_LADDER[_timescale_index]
+	_applied_sim_dt = -1.0  # force a param re-upload on the next tick
+	var dt := sim_seconds_per_tick / maxf(float(substeps), 1.0)
+	return "timescale %d/%d: %.4f s per tick, substep dt=%.2e  (1 = real time; lower = finer + slower)" % [
+		_timescale_index + 1, TIMESCALE_LADDER.size(), sim_seconds_per_tick, dt]
 
 
 # Drop ALL simulation state: the region (and with it every particle), the active-chunk set, and
