@@ -41,6 +41,7 @@ var _pixel_count: int
 
 var _granular_sim      # lazily resolved
 var _fluid_sim          # lazily resolved (2026-07-12, density-trigger debug tint)
+var _mpm_sim            # lazily resolved (2026-08-13, active-chunk overlay on the MPM path)
 
 # Pre-allocated per-frame uniform buffers — updated in place each frame instead of alloc/free
 var _params_buf: RID
@@ -463,6 +464,15 @@ func _upload_active_chunks() -> void:
 				"/root/world/WorldOrchestrator/SimulationRuntime/FluidSimulation")
 		if _fluid_sim:
 			positions.append_array(_fluid_sim.get_active_chunk_positions())
+		# MPMSimulation (2026-08-13) — the active overlay predated MPM and only ever asked the
+		# two CA sims, both of which are `enabled = false` in world.tscn. On the MPM path it
+		# therefore always drew NOTHING, which is exactly what "the active chunk tint doesn't
+		# work" looked like. MPM's activation is chunk-keyed the same way, so it merges in here.
+		if not _mpm_sim:
+			_mpm_sim = get_node_or_null(
+				"/root/world/WorldOrchestrator/SimulationRuntime/MPMSimulation")
+		if _mpm_sim:
+			positions.append_array(_mpm_sim.active_chunk_positions())
 	var seen := {}
 	var deduped: Array[Vector3i] = []
 	for p in positions:

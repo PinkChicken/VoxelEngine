@@ -11,7 +11,7 @@
 [ext_resource type="Script" uid="uid://b3ee10d6jlmm0" path="res://simulations/granular_simulation.gd" id="10_ic0uy"]
 [ext_resource type="Script" uid="uid://dotkgnjtfs2ma" path="res://WorldOrchestrator.gd" id="10_orch"]
 [ext_resource type="Script" uid="uid://cq6mfktou74w" path="res://simulations/fluid_simulation.gd" id="12_fluid"]
-[ext_resource type="Script" path="res://simulations/mpm_simulation.gd" id="13_mpm"]
+[ext_resource type="Script" uid="uid://dblt86oqtveuv" path="res://simulations/mpm_simulation.gd" id="13_mpm"]
 
 [sub_resource type="Environment" id="Environment_tlwt5"]
 background_color = Color(0.59273976, 0.6228167, 0.9117132, 1)
@@ -88,14 +88,13 @@ script = ExtResource("10_orch")
 
 [node name="SimulationRuntime" type="Node" parent="WorldOrchestrator" unique_id=1047747846]
 script = ExtResource("9_wse8f")
-solver_mode = 1
 metadata/_custom_type_script = "uid://d2v6l0q3qshsc"
 
 [node name="GranularSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=603403044]
 script = ExtResource("10_ic0uy")
 steps_per_tick = 5
-use_phi_demand_displacement = true
 enabled = false
+use_phi_demand_displacement = true
 metadata/_custom_type_script = "uid://b3ee10d6jlmm0"
 
 [node name="FluidSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=603403045]

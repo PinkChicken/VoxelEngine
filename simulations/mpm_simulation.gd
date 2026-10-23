@@ -118,7 +118,7 @@ var _active_chunks: Dictionary = {}  # Vector3i -> true
 var _warned_budget := false
 var _warned_region_cap := false
 var _warned_capacity := false
-# Ticks to wait before the region may grow downward again — see _grow_region_down_if_needed().
+# Ticks to wait before the region may grow again — see _grow_region_if_needed().
 var _grow_cooldown := 0
 # Substep dt actually uploaded to the shaders; recomputed from sim_seconds_per_tick.
 var sim_dt: float = 1.0e-4
@@ -259,7 +259,7 @@ func scan_loaded_chunks_for_existing_material() -> void:
 			continue
 		var chunk: Chunk = _chunk_manager.chunks[cp]
 		if chunk.active_simulation_mask() & CANDIDATE_MASK != 0:
-			_try_add_chunk(cp)
+			_try_add_chunk(cp, true)
 
 
 func _on_chunk_loaded(chunk_pos: Vector3i) -> void:
@@ -270,7 +270,7 @@ func _on_chunk_loaded(chunk_pos: Vector3i) -> void:
 		return
 	const CANDIDATE_MASK := 1 | 2
 	if chunk.active_simulation_mask() & CANDIDATE_MASK != 0:
-		_try_add_chunk(chunk_pos)
+		_try_add_chunk(chunk_pos, true)
 
 
 # Would adding `cp` keep the region grid within MAX_REGION_NODES? Computed on the prospective
@@ -289,7 +289,7 @@ func _would_fit(cp: Vector3i) -> bool:
 # Request a chunk be simulated. Returns true if it is now part of the active set. Adding a
 # chunk changes the region bounding box, so this rebuilds the region (and re-seeds particles
 # from the voxel world) whenever the geometry actually changes.
-func _try_add_chunk(cp: Vector3i) -> bool:
+func _try_add_chunk(cp: Vector3i, promote: bool = false) -> bool:
 	if _active_chunks.has(cp):
 		return true
 	if _active_chunks.size() >= max_active_chunks:
@@ -302,9 +302,38 @@ func _try_add_chunk(cp: Vector3i) -> bool:
 			push_warning("MPMSimulation: region grid would exceed MAX_REGION_NODES=%d including %s — refusing to grow (far-apart active chunks are the cause; see class header's TRADEOFF)" % [MAX_REGION_NODES, cp])
 			_warned_region_cap = true
 		return false
+	var had_region := _region != null
 	_active_chunks[cp] = true
 	_ensure_region()
+	# A resize PRESERVES the live particle set and promotes nothing (see _ensure_region), so a
+	# chunk discovered OUTSIDE an edit — boot scan, or streaming in — would otherwise never get
+	# its pre-existing material turned into particles. A fresh build already promoted it.
+	if promote and had_region and _region != null:
+		_promote_chunk_voxels(cp)
 	return true
+
+
+# Promote one chunk's pre-existing MPM material by APPENDING to the live region's particle set.
+func _promote_chunk_voxels(cp: Vector3i) -> void:
+	if _region == null:
+		return
+	var origin := cp * n_grid
+	_orchestrator.sync_chunk_to_cpu(cp)  # block_data is stale-by-design (CLAUDE.md)
+	var pos: Array[Vector3] = []
+	var mats: Array[int] = []
+	var mss: Array[float] = []
+	for ly in range(n_grid):
+		for lz in range(n_grid):
+			for lx in range(n_grid):
+				var wp := origin + Vector3i(lx, ly, lz)
+				var mat := _orchestrator.query_voxel_material(wp)
+				if not _is_mpm_material(mat):
+					continue
+				var def := _material_db.get_def(mat)
+				pos.append(Vector3(wp - _region.origin) + Vector3(0.5, 0.5, 0.5))
+				mats.append(mat)
+				mss.append(def.mpm_density * p_vol)
+	_append_particles(_region, pos, mats, mss)
 
 
 # (Re)builds the region if its geometry no longer matches the active set. This is the ONLY
@@ -333,16 +362,24 @@ func _ensure_region() -> bool:
 	if _region != null and _region.dims == dims and _region.origin == origin:
 		if _region.signature == sig:
 			return false
-		# Same bbox, different membership — keep the grid, re-seed particles from the voxel
-		# world so the new chunk's material is picked up.
+		# Same bbox, different membership — the GRID is unchanged, so nothing needs rebuilding
+		# and nothing needs re-seeding. Material cannot exist outside the bbox (g2p clamps to
+		# it), so a chunk joining inside it has no pre-existing voxels to promote.
 		_region.chunks = chunks
 		_region.signature = sig
-		promote_existing_voxels(_region, chunks)
 		return false
 
-	_destroy_region()
-	_region = _build_region(origin, dims, chunks)
-	_region.signature = sig
+	# Geometry changed. PRESERVE the particle set across the resize instead of re-seeding it from
+	# voxels. Re-seeding was why every chunk activation looked like the whole simulation
+	# "refreshing": velocities, the affine matrix C, the volume ratio J and sand's deformation
+	# gradient F were all discarded and every particle restarted at rest, mid-fall.
+	var prev := _region
+	_region = null
+	var w := _build_region(origin, dims, chunks, prev)
+	w.signature = sig
+	_region = w
+	if prev != null:
+		_free_region_buffers(prev)
 	return true
 
 
@@ -355,7 +392,7 @@ func _active_signature() -> int:
 	return h
 
 
-func _build_region(origin: Vector3i, dims: Vector3i, chunks: Array[Vector3i]) -> ChunkRegion:
+func _build_region(origin: Vector3i, dims: Vector3i, chunks: Array[Vector3i], prev: ChunkRegion = null) -> ChunkRegion:
 	var w := ChunkRegion.new()
 	w.origin = origin
 	w.dims = dims
@@ -394,15 +431,54 @@ func _build_region(origin: Vector3i, dims: Vector3i, chunks: Array[Vector3i]) ->
 
 	_upload_region_params(w)
 	_build_region_sets(w)
-	promote_existing_voxels(w, chunks)
+	# Fresh region: seed from whatever MPM material already exists in these chunks. Resize:
+	# carry the live particles over instead, so nothing is reset.
+	if prev != null:
+		_copy_particles_shifted(prev, w)
+	else:
+		promote_existing_voxels(w, chunks)
 	return w
+
+
+# Moves a live particle set from one region's buffers into another's, shifting positions by the
+# difference in grid origin (positions are region-local). Only POSITIONS need the offset, so
+# they go through the CPU; everything else is a straight GPU→GPU copy with no round trip.
+#
+# Position precision note: the offset is an exact multiple of n_grid, so this is exact for any
+# float position — no accumulation error, no drift.
+func _copy_particles_shifted(prev: ChunkRegion, w: ChunkRegion) -> void:
+	var n := prev.n_particles
+	if n <= 0:
+		w.n_particles = 0
+		w.groups_particles = 0
+		return
+	var shift := Vector3(prev.origin - w.origin)
+	var pos := _compute.download(prev.pos).to_float32_array()
+	for i in n:
+		pos[i*3]     += shift.x
+		pos[i*3 + 1] += shift.y
+		pos[i*3 + 2] += shift.z
+	_compute.buffer_update(w.pos, 0, pos.to_byte_array())
+	_compute.buffer_copy(prev.vel,   w.vel,   0, 0, n * 3 * 4)
+	_compute.buffer_copy(prev.C,     w.C,     0, 0, n * 9 * 4)
+	_compute.buffer_copy(prev.J,     w.J,     0, 0, n * 4)
+	_compute.buffer_copy(prev.mat,   w.mat,   0, 0, n * 4)
+	_compute.buffer_copy(prev.mass,  w.mass,  0, 0, n * 4)
+	_compute.buffer_copy(prev.alive, w.alive, 0, 0, n * 4)
+	_compute.buffer_copy(prev.F,     w.F,     0, 0, n * 9 * 4)
+	w.n_particles = n
+	w.groups_particles = int(ceil(float(n) / 64.0))
+	_upload_region_params(w)
 
 
 func _destroy_region() -> void:
 	var w := _region
 	_region = null
-	if not w:
-		return
+	if w:
+		_free_region_buffers(w)
+
+
+func _free_region_buffers(w: ChunkRegion) -> void:
 	for rid in [w.params_buf, w.pos, w.vel, w.C, w.J, w.mat, w.mass, w.alive, w.F,
 		w.g_mom, w.g_mass, w.g_vel, w.g_mass_mat,
 		w.voxel_params_buf, w.dirty_chunks_buf]:
@@ -538,6 +614,7 @@ func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> 
 			continue
 		new_chunks.append(cp)
 
+	var had_region := _region != null
 	var grew := false
 	for cp in new_chunks:
 		if _active_chunks.size() >= max_active_chunks:
@@ -553,12 +630,14 @@ func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> 
 		_active_chunks[cp] = true
 		grew = true
 	if grew:
-		_ensure_region()  # exactly ONE rebuild + reseed for the whole edit
+		_ensure_region()  # exactly ONE resize for the whole edit; live particles are preserved
 
-	# PASS 2 — append only voxels in chunks that were ALREADY active. A voxel in a chunk that
-	# just activated is already covered by promote_existing_voxels() (edit_apply.comp writes
-	# _voxel_buf_a before this signal fires), so appending it again would duplicate it.
-	if _region == null:
+	# PASS 2 — append the placed voxels. If the region was just CREATED from nothing, its
+	# _build_region() promoted every voxel already in these chunks (edit_apply.comp writes
+	# _voxel_buf_a before this signal fires), including the ones just placed — appending on top
+	# would duplicate them. A RESIZE instead preserves the existing particle set and promotes
+	# nothing, so the new voxels do need appending.
+	if _region == null or not had_region:
 		return
 	var add_pos: Array[Vector3] = []
 	var add_mat: Array[int] = []
@@ -569,13 +648,28 @@ func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> 
 			continue
 		var wp: Vector3i = positions[idx]
 		var cp := _chunk_of(wp)
-		if new_chunks.has(cp) or not _region.chunks.has(cp):
+		# "Inside the grid" is the right test, not "in the active set": the region's bounding
+		# box can cover a chunk that was never explicitly activated, and readout already writes
+		# into those (world_to_flat only needs the chunk to be loaded).
+		if not _region_covers(cp):
 			continue
 		var def := _material_db.get_def(mat_id)
 		add_pos.append(_region_local(wp))
 		add_mat.append(mat_id)
 		add_mass.append(def.mpm_density * p_vol)
 	_append_particles(_region, add_pos, add_mat, add_mass)
+
+
+# Is this chunk inside the region's bounding box (chunk coordinates)?
+func _region_covers(cp: Vector3i) -> bool:
+	if _region == null:
+		return false
+	var bmin := Vector3i(_region.origin.x / n_grid, _region.origin.y / n_grid, _region.origin.z / n_grid)
+	var span := Vector3i(_region.dims.x / n_grid, _region.dims.y / n_grid, _region.dims.z / n_grid)
+	var bmax := bmin + span - Vector3i.ONE
+	return (cp.x >= bmin.x and cp.x <= bmax.x
+		and cp.y >= bmin.y and cp.y <= bmax.y
+		and cp.z >= bmin.z and cp.z <= bmax.z)
 
 
 # Bulk append — one buffer_update per ATTRIBUTE for the whole batch, instead of the 8 per
@@ -709,13 +803,12 @@ func tick_all(substeps_per_tick: int) -> void:
 	_run_region_substeps(w, substeps_per_tick)
 	var changed := _readout_region(w)
 
-	# FOLLOW FALLING MATERIAL DOWNWARD — added after a real run showed a region at chunk y 0..1
-	# with NO chunk below y=0 active. Chunks only ever activated from edits, chunk loads and the
-	# boot scan, so nothing grew the region to follow a falling stream: water fell to the bottom
-	# of the grid, g2p clamped it, and it piled up against the region's floor — the vertical
-	# version of "climbs up that wall".
-	if _grow_region_down_if_needed(w, changed):
-		return  # the region was rebuilt; `w` is stale from here on
+	# FOLLOW THE MATERIAL OUTWARD — if anything changed on a face of the region's bounding box,
+	# grow in that direction. The first version of this only grew downward, which is exactly why
+	# water hit a side wall, flowed the one way a chunk happened to already be active, and not
+	# the other. See _grow_region_if_needed().
+	if _grow_region_if_needed(w, changed):
+		return  # the region was resized; `w` is stale from here on
 
 	# IDLE DETECTION — cheap signal first. An empty readout dirty-set means the grid wrote
 	# nothing back this tick, which needs no extra GPU→CPU round trip because the bitmask was
@@ -747,58 +840,76 @@ func tick_all(substeps_per_tick: int) -> void:
 		w.idle_ticks = 0
 
 
-# If the region's BOTTOM-MOST active chunk produced readout changes this tick, material is
-# active at the floor of the simulated domain — add the chunk below so it has somewhere to go.
+# GROW IN EVERY DIRECTION the material is actually pushing against.
+#
+# 2026-08-13, second pass. The first version only grew DOWNWARD (-Y), which produced the reported
+# asymmetry exactly: water spreading sideways reached the side of the region's bounding box, hit
+# a wall (g2p clamps to the region, grid_op damps a BOUND band at its faces), and could only
+# escape if a neighbouring chunk happened to already be active — so it flowed one way and not the
+# other. Sideways growth simply was not implemented. Now any changed chunk sitting on a bbox FACE
+# proposes the chunk just outside that face, for all six faces at once.
+#
 # Returns true if the region was rebuilt (caller must not touch its ChunkRegion afterwards).
 #
-# Self-limiting by construction: after the rebuild the origin has dropped a chunk, so the
-# material that triggered this is no longer in the bottom chunk. Resting material produces NO
-# readout change (readout early-outs when new_voxel == cur_voxel), so a settled pool cannot
-# ratchet the region downward one chunk per tick.
-#
-# KNOWN LIMITATION, and it is a visible one: _ensure_region() rebuilds by re-seeding particles
-# from voxels, so a falling stream LOSES ITS VELOCITY each time it crosses a chunk boundary
-# downward. Fixing that means preserving particle buffers across a resize (allocate new, copy
-# the old contents with a position offset, promote only the newly added chunks) instead of
-# re-seeding. Tracked in docs/MIGRATION_MPM.md §7 as the next S3 item.
-func _grow_region_down_if_needed(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
-	# RATE LIMIT. "Bottom chunk changed this tick" is a proxy for "material is active at the
-	# floor", but a settling pool jitters its fill value, which readout reports as a change every
-	# tick — without this it would ratchet one chunk downward per tick until the budget died.
+# RATE LIMIT: "on a face and changed" is a proxy, and a settling pool jitters its fill value so
+# readout reports a change every tick. Without a cooldown an idle pool would ratchet outward one
+# chunk at a time until the budget died. 15 ticks also gives the spread time to actually reach
+# the new chunk before we judge the next face.
+func _grow_region_if_needed(w: ChunkRegion, changed: Array[Vector3i]) -> bool:
 	if _grow_cooldown > 0:
 		_grow_cooldown -= 1
 		return false
-
 	if changed.is_empty() or w.chunks.is_empty():
 		return false
 
-	var bottom := 2147483647
-	for cp in w.chunks:
-		bottom = mini(bottom, cp.y)
+	var bmin := Vector3i(w.origin.x / n_grid, w.origin.y / n_grid, w.origin.z / n_grid)
+	var span := Vector3i(w.dims.x / n_grid, w.dims.y / n_grid, w.dims.z / n_grid)
+	var bmax := bmin + span - Vector3i.ONE
 
-	var at_floor := false
+	var proposals: Array[Vector3i] = []
+	var proposed: Dictionary = {}
 	for cp in changed:
-		if cp.y == bottom:
-			at_floor = true
-			break
-	if not at_floor:
+		if cp.x == bmin.x: _propose(proposals, proposed, cp + Vector3i(-1, 0, 0))
+		if cp.x == bmax.x: _propose(proposals, proposed, cp + Vector3i( 1, 0, 0))
+		if cp.y == bmin.y: _propose(proposals, proposed, cp + Vector3i(0, -1, 0))
+		if cp.y == bmax.y: _propose(proposals, proposed, cp + Vector3i(0,  1, 0))
+		if cp.z == bmin.z: _propose(proposals, proposed, cp + Vector3i(0, 0, -1))
+		if cp.z == bmax.z: _propose(proposals, proposed, cp + Vector3i(0, 0,  1))
+	if proposals.is_empty():
 		return false
 
-	# One chunk directly below any bottom chunk — it does not need to span the whole footprint,
-	# it only needs to give the falling material somewhere to exist.
-	var below := Vector3i(0, 0, 0)
-	var found := false
-	for cp in w.chunks:
-		if cp.y == bottom:
-			below = Vector3i(cp.x, bottom - 1, cp.z)
-			found = true
+	# Commit every viable proposal BEFORE rebuilding, so one growth step covers all directions
+	# simultaneously instead of one direction per cooldown period.
+	var added := false
+	for cp in proposals:
+		if _active_chunks.has(cp):
+			continue
+		if not _chunk_manager.chunks.has(cp):
+			continue  # not streamed in — a genuine edge of the world
+		if _active_chunks.size() >= max_active_chunks:
+			if not _warned_budget:
+				push_warning("MPMSimulation: max_active_chunks=%d reached — material can no longer leave the current region edges." % max_active_chunks)
+				_warned_budget = true
 			break
-	if not found or _active_chunks.has(below):
+		if not _would_fit(cp):
+			if not _warned_region_cap:
+				push_warning("MPMSimulation: region grid would exceed MAX_REGION_NODES=%d including %s — refusing to grow." % [MAX_REGION_NODES, cp])
+				_warned_region_cap = true
+			break
+		_active_chunks[cp] = true
+		added = true
+	if not added:
 		return false
-	if not _chunk_manager.chunks.has(below):
-		return false  # not streamed in — a genuine edge of the world
+
 	_grow_cooldown = 15
-	return _try_add_chunk(below)
+	return _ensure_region()
+
+
+func _propose(out: Array[Vector3i], seen: Dictionary, cp: Vector3i) -> void:
+	if seen.has(cp):
+		return
+	seen[cp] = true
+	out.append(cp)
 
 
 func _run_region_substeps(w: ChunkRegion, substeps: int) -> void:
