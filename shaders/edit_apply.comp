@@ -12,12 +12,12 @@ layout(set = 0, binding = 3, std430) readonly buffer EditParamsBuf { int data[];
 
 // Voxels are packed 4 per u32 (1 byte each = material id). Writing one byte clears and sets
 // only that byte's bits; two threads touching DIFFERENT bytes of the same word commute.
-uint voxel_read(uint flat) {
-    return (voxels_a.data[flat >> 2u] >> ((flat & 3u) << 3u)) & 0xFFu;
+uint voxel_read(uint vox_idx) {
+    return (voxels_a.data[vox_idx >> 2u] >> ((vox_idx & 3u) << 3u)) & 0xFFu;
 }
-void voxel_write(uint flat, uint mat) {
-    uint wi = flat >> 2u;
-    uint sh = (flat & 3u) << 3u;
+void voxel_write(uint vox_idx, uint mat) {
+    uint wi = vox_idx >> 2u;
+    uint sh = (vox_idx & 3u) << 3u;
     atomicAnd(voxels_a.data[wi], ~(0xFFu << sh));
     atomicOr(voxels_a.data[wi], (mat & 0xFFu) << sh);
 }

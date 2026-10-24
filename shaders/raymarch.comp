@@ -109,8 +109,8 @@ uint sample_mat(ivec3 wp, int chunk_size, float chunk_size_f) {
 
 // Voxels are packed 4 per u32 (1 byte each = material id); little-endian storage means the
 // CPU's byte-per-voxel block_data uploads pre-packed.
-uint voxel_read(uint flat) {
-    return (voxels.data[flat >> 2u] >> ((flat & 3u) << 3u)) & 0xFFu;
+uint voxel_read(uint vox_idx) {
+    return (voxels.data[vox_idx >> 2u] >> ((vox_idx & 3u) << 3u)) & 0xFFu;
 }
 
 void main() {

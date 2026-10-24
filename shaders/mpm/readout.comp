@@ -73,8 +73,8 @@ const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGEL
 uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
 
 // Voxels are packed 4 per u32 (1 byte each = material id).
-uint voxel_read(uint flat) {
-	return (voxels_a.data[flat >> 2u] >> ((flat & 3u) << 3u)) & 0xFFu;
+uint voxel_read(uint vox_idx) {
+	return (voxels_a.data[vox_idx >> 2u] >> ((vox_idx & 3u) << 3u)) & 0xFFu;
 }
 
 // Chunk-table world-to-flat addressing (same scheme as the voxel buffer) —

@@ -21,10 +21,10 @@ layout(set = 0, binding = 1, std430) readonly buffer Changelog {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= changelog.count) return;
-    uint flat = changelog.entries[i * 2u];
+    uint vox_idx = changelog.entries[i * 2u];
     uint mat  = changelog.entries[i * 2u + 1u] & 0xFFu;
-    uint wi = flat >> 2u;
-    uint sh = (flat & 3u) << 3u;
+    uint wi = vox_idx >> 2u;
+    uint sh = (vox_idx & 3u) << 3u;
     atomicAnd(voxels_a.data[wi], ~(0xFFu << sh));
     atomicOr(voxels_a.data[wi], mat << sh);
 }

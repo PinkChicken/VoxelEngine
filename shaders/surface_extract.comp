@@ -25,8 +25,8 @@ layout(set = 0, binding = 3, std430) readonly buffer SlotList     { int  data[];
 
 // Voxels are packed 4 per u32 (1 byte each = material id); little-endian storage means the
 // CPU's byte-per-voxel block_data uploads pre-packed.
-uint voxel_read(uint flat) {
-    return (voxels.data[flat >> 2u] >> ((flat & 3u) << 3u)) & 0xFFu;
+uint voxel_read(uint vox_idx) {
+    return (voxels.data[vox_idx >> 2u] >> ((vox_idx & 3u) << 3u)) & 0xFFu;
 }
 
 void main() {
