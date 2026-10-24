@@ -183,11 +183,7 @@ func ensure_grid() -> void:
 		_init_grid()
 
 func get_voxel_buf() -> RID: return _voxel_buf_a
-func get_voxel_buf_b() -> RID: return _voxel_buf_b
-func get_sim_active_buf() -> RID: return _sim_active_buf
 func get_chunk_table() -> RID: return _chunk_table
-# Read-only capacity accessor — lets FluidSimulation size its privately-owned
-# flux buffer without WorldOrchestrator knowing flux exists (Phase 7e Step 1).
 func get_voxel_buf_capacity() -> int: return _voxel_buf_capacity
 func is_grid_valid() -> bool:
 	return _voxel_buf_a.is_valid() and _chunk_table.is_valid() and _material_sim_buf.is_valid()
@@ -293,47 +289,7 @@ func debug_dump_fluid_stats() -> void:
 		print("[FluidDebug]   mat=%d (%s): total_fill=%d  voxels=%d  avg_fill=%.1f  min_y=%d  max_y=%d  fill-weighted avg_y=%.2f" \
 			% [mat_id, mat_name, m["fill"], m["count"], avg_fill, m["min_y"], m["max_y"], avg_y])
 
-# --- Debug rewind snapshot (2026-07-07) --- a CPU-side copy of the canonical voxel buffer
-# (_voxel_buf_a), so a hand-built or scripted test scenario can be captured ONCE and replayed
-# repeatedly -- run forward, watch one voxel, restore, watch a different voxel, without having
-# to reproduce a fiddly multi-tick scenario from scratch each time. World.gd binds Down Arrow
-# to save, Up Arrow to load. Deliberately only snapshots _voxel_buf_a (the single source of
-# truth per CLAUDE.md) -- _voxel_buf_b is scratch and _sim_active_buf/_changelog_buf are
-# zeroed at the start of every dispatch, so none of those need to be captured for a restore to
-# reproduce the exact same simulation trajectory going forward.
-var _debug_voxel_snapshot: PackedByteArray = PackedByteArray()
-
-func debug_save_voxel_snapshot() -> void:
-	if not _voxel_buf_a.is_valid():
-		print("[DebugSnapshot] voxel buffer not ready")
-		return
-	var cs := _chunk_manager.chunk_size
-	var vpc := cs * cs * cs
-	var total_bytes := _voxel_buf_capacity * vpc * 4
-	_debug_voxel_snapshot = _compute.download_range(_voxel_buf_a, 0, total_bytes)
-	print("[DebugSnapshot] saved %d bytes (%d slots)" % [_debug_voxel_snapshot.size(), _voxel_buf_capacity])
-
-func debug_load_voxel_snapshot() -> void:
-	if _debug_voxel_snapshot.is_empty():
-		print("[DebugSnapshot] no snapshot saved yet")
-		return
-	if not _voxel_buf_a.is_valid():
-		print("[DebugSnapshot] voxel buffer not ready")
-		return
-	_compute.buffer_update(_voxel_buf_a, 0, _debug_voxel_snapshot)
-	# Re-run the same chunk-committed discovery a normal edit would trigger, so simulations
-	# pick the restored content back up -- without this, chunks whose _active_chunks entry
-	# already idled out (see fluid_simulation.gd's idle-guard) would sit quiet forever even
-	# though the buffer now has fresh, un-settled content again.
-	var positions: Array[Vector3i] = []
-	for pos in _slot_to_chunk.values():
-		positions.append(pos)
-	chunks_committed.emit(positions)
-	print("[DebugSnapshot] restored %d bytes to %d chunk(s)" % [_debug_voxel_snapshot.size(), positions.size()])
-
 # Downloads the changelog count, dispatches patch_apply.comp to sync _voxel_buf_a.
-# Changed-chunk discovery is now done by GranularSimulation via the dirty-chunk bitmask —
-# this function no longer calls _extract_changed_chunks (was O(131k) GDScript loop).
 func apply_changelog() -> void:
 	if not _changelog_buf.is_valid():
 		return

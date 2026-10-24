@@ -27,8 +27,7 @@ layout(set = 0, binding = 1, std430) buffer Params {
     float slab_max_z;
     int debug_pixel_x;
     int debug_pixel_y;
-    int debug_chunk_flags; // bit 0 = chunk borders, bit 1 = active chunk tint, bit 2 =
-                            // collision tint, bit 3 = density-trigger touch tint
+    int debug_chunk_flags; // bit 0 = chunk borders, bit 1 = active chunk tint, bit 2 = collision tint
     // Debug material hide (2026-07-16, world.gd KEY_X): a BITMASK, one bit per material id
     // (bit N = material N is hidden) — widened from a single material id (2026-07-16) so
     // multiple materials can be hidden at once, e.g. rock AND oil together to see straight
@@ -87,12 +86,6 @@ layout(set = 0, binding = 10, std430) readonly buffer CollisionChunksBuf {
     int count;
     int positions[];
 } collision_chunks_buf;
-// Density-trigger debug tint (bit 3 / value 8 of debug_chunk_flags, 2026-07-12,
-// docs/BUG_LOG.md "SOLVED IN BENCH (2026-07-11)") — one uint per full flat voxel index
-// (same indexing as VoxelBuffer itself: cached_buffer_offset + local_buffer_index),
-// written only by fluid_flux.comp's pass 5 (DensityTouchDebug). Non-zero = this exact
-// voxel was flagged by the trigger check THIS TICK.
-layout(set = 0, binding = 11, std430) readonly buffer DensityTouchBuffer { uint data[]; } density_touch;
 
 // General-purpose "material at an arbitrary world voxel position" lookup, used by the
 // glass edge test below to check a hit voxel's 6 face-neighbours (which may be outside
@@ -344,19 +337,6 @@ void main() {
                                 lit_r = lit_r / 4u;
                                 lit_g = lit_g / 4u;
                                 lit_b = min(255u, lit_b / 2u + 80u);
-                            }
-                        }
-                        if ((params.debug_chunk_flags & 8) != 0) {
-                            // Density-trigger touch tint (2026-07-12) — unconditional
-                            // bright magenta override (not blended, unlike the tints
-                            // above) so a single touched voxel is unmistakable even
-                            // against oil's own near-black colour. Per-VOXEL, not
-                            // per-chunk, unlike every other bit here.
-                            uint touched = density_touch.data[cached_buffer_offset + local_buffer_index];
-                            if (touched != 0u) {
-                                lit_r = 255u;
-                                lit_g = 0u;
-                                lit_b = 255u;
                             }
                         }
                         if ((params.debug_chunk_flags & 1) != 0) {

@@ -17,32 +17,24 @@ func _ready() -> void:
 	# debug flag. Revised same day: MPM used to bind ONE fixed window centered on the player's
 	# spawn position — rejected by the user ("the simulation shouldn't be player-dependent; a
 	# waterfall behind the player shouldn't stop just because we're not looking at it"). Now
-	# uses the SAME active-chunk model GranularSimulation/FluidSimulation already have: setup()
+	# uses the active-chunk model: setup()
 	# itself scans all loaded chunks for existing MPM-eligible material and connects to
 	# voxels_placed/chunk_loaded for ongoing, chunk-keyed activation — nothing here reads
 	# player.global_position at all.
 	await get_tree().create_timer(3.0).timeout  # chunks stream in over several frames, not
 	# synchronously at boot — WorldOrchestrator.is_grid_valid() isn't meaningful before this.
-	# Solver selection (2026-08-13): only the selected solver runs. In CA mode MPM is not
-	# merely idle, it is never bound — no buffers allocated, no 24-substep tick per frame,
-	# nothing on disk to fight the CA solvers over the voxel buffer. See
-	# SimulationRuntime.SolverMode; force with `-- mpm` / `-- ca`.
-	if simulation_runtime.is_mpm_mode():
-		if not mpm_simulation.setup():
-			print("[MPM] setup() failed — see error above")
-	else:
-		print("[MPM] not started — solver mode is CA (pass `-- mpm` to exercise MPM)")
+	if not mpm_simulation.setup():
+		print("[MPM] setup() failed — see error above")
 
 	if OS.get_cmdline_user_args().has("mpm_stress"):
 		_mpm_stress()
 
 
 # STRESS HARNESS — one deliberately oversized water body, dropped above the player, so the cost
-# curve can be read while the region grows under it. KEY_B in-game, or `-- mpm_stress` from a
-# terminal (that form also forces MPM mode + perf logging; see
-# SimulationRuntime._resolve_solver_mode). How ms/tick tracks `nodes` (grid size) vs `particles`
-# is what decides whether `promote_stride` (fewer, bigger particles) is worth spending surface
-# fidelity on, or whether the grid itself is the cost and the answer is a smaller region.
+# curve can be read while the region grows under it. KEY_B in-game. How ms/tick tracks `nodes`
+# (grid size) vs `particles` is what decides whether `promote_stride` (fewer, bigger particles)
+# is worth spending surface fidelity on, or whether the grid itself is the cost and the answer
+# is a smaller region.
 func _mpm_stress() -> void:
 	var vs: float = chunk_manager.voxel_scale
 	var center := Vector3i(player.global_position / vs) + Vector3i(0, 20, 0)
@@ -181,11 +173,10 @@ func _unhandled_input(event: InputEvent) -> void:
 # scan_loaded_chunks_for_existing_material()/_on_voxels_placed()).
 func _mpm_status_dump() -> void:
 	if not mpm_simulation.is_bound():
-		var mode_name := "MPM" if simulation_runtime.is_mpm_mode() else "CA"
 		if mpm_simulation.setup_error != "":
 			print("[MPM] NOT RUNNING — setup() failed: %s" % mpm_simulation.setup_error)
 		else:
-			print("[MPM] not bound — solver mode is %s, so MPM is not running" % mode_name)
+			print("[MPM] not bound")
 		return
 	# Regions are shared across chunks now (2026-08-13), so there is one grid, not one per
 	# chunk. Report the region, then the chunks it covers.

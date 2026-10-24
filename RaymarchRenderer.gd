@@ -12,12 +12,6 @@ var _voxel_scale: float
 
 @export var debug_chunk_borders: bool = false
 @export var debug_active_chunks: bool = false
-# Density-trigger debug tint (2026-07-12, see FluidSimulation.debug_density_trigger_tint
-# and docs/BUG_LOG.md "SOLVED IN BENCH (2026-07-11)") — independent toggle from the
-# simulation-side one; both must be on to see anything (sim writes the buffer, renderer
-# reads it). Split so the buffer can stay allocated/bound (see get_density_touch_buf())
-# without forcing the tint to render, and vice versa.
-@export var debug_density_touch_tint: bool = false
 # Debug material hide (2026-07-16, world.gd KEY_X) — a BITMASK, one bit per material id
 # (bit N set = material N is hidden), so multiple materials can be hidden at once (e.g.
 # rock AND oil, to see straight through a test rig's walls to whatever's submerged inside).
@@ -29,18 +23,12 @@ var _voxel_scale: float
 
 var _out_buf: RID
 var _debug_buf: RID
-# Always-valid placeholder for binding 11 (density_touch) before FluidSimulation has
-# allocated its real buffer, or if it's ever unavailable — keeps the render uniform
-# set's binding count fixed regardless of the other node's readiness (2026-07-12).
-var _density_touch_fallback_buf: RID
 var _cursor_buf: RID
 var _active_chunks_buf: RID
 var _collision_chunks_buf: RID
 var _cursor_data: PackedByteArray
 var _pixel_count: int
 
-var _granular_sim      # lazily resolved
-var _fluid_sim          # lazily resolved (2026-07-12, density-trigger debug tint)
 var _mpm_sim            # lazily resolved (2026-08-13, active-chunk overlay on the MPM path)
 
 # Pre-allocated per-frame uniform buffers — updated in place each frame instead of alloc/free
@@ -55,10 +43,6 @@ var _orchestrator: WorldOrchestrator
 var _render_uniform_set: RID
 var _cached_voxel_rid: RID
 var _cached_chunk_table_rid: RID
-# _density_touch_buf's own RID changes on every capacity grow (free+realloc, same as
-# _flux_buf/_demand_accum_buf) — must be tracked alongside voxel_buf/chunk_table so the
-# uniform set rebuilds whenever it does, not just on voxel-buffer growth.
-var _cached_density_touch_rid: RID
 
 var _quad: MeshInstance3D
 var _color_tex: ImageTexture
@@ -220,10 +204,6 @@ func _resize_out(size: Vector2i) -> void:
 		var cur := PackedByteArray(); cur.resize(32); cur.fill(0)
 		_cursor_buf = _compute.buffer_upload(cur)
 
-	if not _density_touch_fallback_buf.is_valid():
-		var dt := PackedByteArray(); dt.resize(4); dt.fill(0)
-		_density_touch_fallback_buf = _compute.buffer_upload(dt)
-
 	_init_textures()
 
 
@@ -300,16 +280,6 @@ func _render() -> void:
 	if not voxel_buf.is_valid() or not chunk_table.is_valid():
 		return
 
-	if not _fluid_sim:
-		_fluid_sim = get_node_or_null(
-			"/root/world/WorldOrchestrator/SimulationRuntime/FluidSimulation")
-	var density_touch_buf: RID = _fluid_sim.get_density_touch_buf() if _fluid_sim else RID()
-	if not density_touch_buf.is_valid():
-		# FluidSimulation hasn't allocated its buffer yet (e.g. this frame runs before
-		# its _ready(), or no compute device) — fall back to the always-valid dummy so
-		# the uniform set's binding count never depends on another node's readiness.
-		density_touch_buf = _density_touch_fallback_buf
-
 	if _orchestrator.get_chunks_loaded() == 0:
 		return
 
@@ -342,8 +312,7 @@ func _render() -> void:
 	params_data.encode_float(64, slab_max.z)
 	params_data.encode_s32(68, int(mouse_pos.x))
 	params_data.encode_s32(72, int(mouse_pos.y))
-	var chunk_flags := (1 if debug_chunk_borders else 0) | (2 if debug_active_chunks else 0) \
-		| (8 if debug_density_touch_tint else 0)
+	var chunk_flags := (1 if debug_chunk_borders else 0) | (2 if debug_active_chunks else 0)
 	params_data.encode_s32(76, chunk_flags)
 	params_data.encode_s32(80, debug_hide_mask)
 	_compute.buffer_update(_params_buf, 0, params_data)
@@ -355,18 +324,14 @@ func _render() -> void:
 	# Rebuild the uniform set only when a buffer RID has changed.
 	if not _render_uniform_set.is_valid() \
 			or voxel_buf != _cached_voxel_rid \
-			or chunk_table != _cached_chunk_table_rid \
-			or density_touch_buf != _cached_density_touch_rid:
+			or chunk_table != _cached_chunk_table_rid:
 		# Only manually free the old set when the underlying buffers haven't changed
 		# (e.g. window resize). When the voxel buffer was rebuilt by _init_grid,
 		# the RD auto-invalidates the set when the old buffer is freed — trying to
-		# free it again triggers "Attempted to free invalid ID". Same auto-invalidate
-		# applies to density_touch_buf's own free+realloc on capacity growth
-		# (_ensure_density_touch_capacity()).
+		# free it again triggers "Attempted to free invalid ID".
 		if _render_uniform_set.is_valid() \
 				and voxel_buf == _cached_voxel_rid \
-				and chunk_table == _cached_chunk_table_rid \
-				and density_touch_buf == _cached_density_touch_rid:
+				and chunk_table == _cached_chunk_table_rid:
 			_compute.free_rid(_render_uniform_set)
 		_render_uniform_set = RID()
 		var u0 = RDUniform.new(); u0.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER; u0.binding = 0; u0.add_id(voxel_buf)
@@ -380,11 +345,9 @@ func _render() -> void:
 		var u8 = RDUniform.new(); u8.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER; u8.binding = 8; u8.add_id(_cursor_buf)
 		var u9  = RDUniform.new(); u9.uniform_type  = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER; u9.binding  = 9;  u9.add_id(_active_chunks_buf)
 		var u10 = RDUniform.new(); u10.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER; u10.binding = 10; u10.add_id(_collision_chunks_buf)
-		var u11 = RDUniform.new(); u11.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER; u11.binding = 11; u11.add_id(density_touch_buf)
-		_render_uniform_set = _compute.create_uniform_set([u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10, u11], _pipeline.shader)
+		_render_uniform_set = _compute.create_uniform_set([u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10], _pipeline.shader)
 		_cached_voxel_rid          = voxel_buf
 		_cached_chunk_table_rid    = chunk_table
-		_cached_density_touch_rid  = density_touch_buf
 
 	var workgroups_x = (_output_res.x + 7) / 8
 	var workgroups_y = (_output_res.y + 7) / 8
@@ -450,24 +413,6 @@ func _upload_collision_chunks() -> void:
 func _upload_active_chunks() -> void:
 	var positions: Array[Vector3i] = []
 	if debug_active_chunks:
-		if not _granular_sim:
-			_granular_sim = get_node_or_null(
-				"/root/world/WorldOrchestrator/SimulationRuntime/GranularSimulation")
-		if _granular_sim:
-			positions.append_array(_granular_sim.get_active_chunk_positions())
-		# FluidSimulation's own active set (2026-07-16) — this overlay previously only
-		# reflected GranularSimulation (sand), silently useless for answering "is the fluid
-		# sim still dispatching to this chunk at all" while diagnosing a stuck submerged
-		# water body. Merged in, deduplicated below, so one overlay covers both sims.
-		if not _fluid_sim:
-			_fluid_sim = get_node_or_null(
-				"/root/world/WorldOrchestrator/SimulationRuntime/FluidSimulation")
-		if _fluid_sim:
-			positions.append_array(_fluid_sim.get_active_chunk_positions())
-		# MPMSimulation (2026-08-13) — the active overlay predated MPM and only ever asked the
-		# two CA sims, both of which are `enabled = false` in world.tscn. On the MPM path it
-		# therefore always drew NOTHING, which is exactly what "the active chunk tint doesn't
-		# work" looked like. MPM's activation is chunk-keyed the same way, so it merges in here.
 		if not _mpm_sim:
 			_mpm_sim = get_node_or_null(
 				"/root/world/WorldOrchestrator/SimulationRuntime/MPMSimulation")
@@ -566,6 +511,6 @@ func _shader_source() -> String:
 func _exit_tree() -> void:
 	if _render_uniform_set.is_valid():
 		_compute.free_rid(_render_uniform_set)
-	for buf in [_out_buf, _debug_buf, _cursor_buf, _active_chunks_buf, _collision_chunks_buf, _params_buf, _cam_buf, _vp_buf, _density_touch_fallback_buf]:
+	for buf in [_out_buf, _debug_buf, _cursor_buf, _active_chunks_buf, _collision_chunks_buf, _params_buf, _cam_buf, _vp_buf]:
 		if buf.is_valid():
 			_compute.free_rid(buf)

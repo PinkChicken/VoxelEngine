@@ -1,14 +1,9 @@
 class_name MPMSimulation extends Node
 
-# Production MLS-MPM node (tools/fluid_prototypes/MPM_EVALUATION_BRIEF.md §35-37). Deliberately
-# NOT a VoxelSimulation: that base class's add_candidates(chunk_positions)/has_work() contract
-# assumes chunk-granularity CA dispatch woken by a per-chunk material-class bitmask, which is
-# ALMOST the right shape — see below — but its dispatch model (one shared shader invocation
-# over a chunk_list, reading the sparse world buffer directly) doesn't fit MPM's need for a
-# contiguous per-region background grid (P2G/G2P scatter/gather needs real float accumulator
-# arrays, not just per-voxel material IDs). SimulationRuntime ticks this directly (tick_all()),
-# not via register_simulation()/get_simulation_class() — that path assumes one sim instance per
-# SimulationClass bit, and MPM owns several materials across GRANULAR+LIQUID at once.
+# Production MLS-MPM node (tools/fluid_prototypes/MPM_EVALUATION_BRIEF.md §35-37). MPM needs a
+# contiguous per-region background grid (P2G/G2P scatter/gather reads/writes real float
+# accumulator arrays, not just per-voxel material IDs), so it owns its own grid buffers and is
+# ticked directly by SimulationRuntime (tick_all()).
 #
 # CROSS-CHUNK CONTINUITY (2026-08-13 — this replaces the per-chunk-window model).
 # The original design gave EVERY active chunk its own independent 32³ grid, and its own header
@@ -190,7 +185,7 @@ const MAX_REGION_NODES := 1048576
 # while still stopping material from leaving.
 @export var bound: int = 1
 const NMAT := 8  # must match clear_grid.comp/p2g.comp's NMAT — the render mass-breakdown slot count
-const DIRTY_BUF_BYTES := 64  # matches GranularSimulation's own constant/convention
+const DIRTY_BUF_BYTES := 64  # dirty-chunk bitmask buffer (u32 words)
 # Region-grid chunk occupancy bitmask: 512 chunks' worth, far more than a bounding box under
 # MAX_REGION_NODES can hold. Must be a multiple of 4 (u32 words).
 const OCCUPANCY_BYTES := 64
@@ -1129,11 +1124,9 @@ func _run_region_substeps(w: ChunkRegion, substeps: int) -> void:
 
 
 # Writes the region's current grid mass/material state into the REAL voxel world (shared
-# changelog + WorldOrchestrator.apply_changelog() — same safe path GranularSimulation/
-# FluidSimulation use). readout.comp maps each grid node through origin + local index and then
-# through world_to_flat(), so nodes in any chunk of the region land in the right chunk slot.
-# Does NOT emit WorldOrchestrator.chunks_committed (see the note in _on_voxels_placed's
-# counterpart discussion in MIGRATION_MPM.md §2 — CA is off, nothing else consumes it yet).
+# changelog + WorldOrchestrator.apply_changelog()). readout.comp maps each grid node through
+# origin + local index and then through world_to_flat(), so nodes in any chunk of the region
+# land in the right chunk slot. Does NOT emit WorldOrchestrator.chunks_committed.
 func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
 	# CAPACITY INTERLOCK — the cause of "I can no longer add or modify those chunks".
 	# readout writes AIR into any node whose grid mass is below threshold. A water voxel the
@@ -1254,7 +1247,7 @@ func _rebuild_block_set(w: ChunkRegion) -> void:
 	_upload_region_params(w)  # re-upload num_blocks
 
 
-# Ported from GranularSimulation._decode_dirty_bitmask() — same bit layout, same reach into
+# Decodes the dirty-chunk bitmask — same bit layout, same reach into
 # WorldOrchestrator's private _slot_to_chunk (GDScript doesn't enforce real privacy; matches
 # the existing convention rather than inventing a public accessor unprompted).
 func _decode_dirty_bitmask(bitmask: PackedByteArray) -> Array[Vector3i]:
