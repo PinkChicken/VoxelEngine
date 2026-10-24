@@ -139,8 +139,13 @@ var _timescale_index: int = 0
 # BOUNDED by max_axis_chunks and MAX_REGION_NODES. That ceiling is what the original growth
 # implementation lacked, and its absence (not growth itself) produced the runaway.
 @export var grow_window: bool = true
-# Ceiling per axis. 2 = up to 64^3 (262,144 nodes, ~2.4 ms); 3 = up to 96^3 (884,736, ~5 ms).
-@export var max_axis_chunks: int = 2
+# Ceiling per axis. 3 = up to 96^3 (884,736 nodes, ~5 ms).
+#
+# TEST-HARNESS UNBLOCK, not an architectural change: raised 2 -> 3 so large bodies can be
+# exercised while S1 (sparse grid) is built. The cubic bbox cost this buys is exactly what S1
+# removes; do not read the larger window as "solved". MAX_REGION_NODES (1M) already covers
+# 96^3 = 884,736, so it stays — raising it further only opens the 128^3 = 17 ms cliff.
+@export var max_axis_chunks: int = 3
 
 @export_group("Water physics (live)")
 # LIVE overrides for WATER (id 3). Edit these in the REMOTE Inspector while the game runs —
