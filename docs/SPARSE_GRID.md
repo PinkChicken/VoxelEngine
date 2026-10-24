@@ -162,19 +162,35 @@ divmod path (`nb_y = 3`). If the encode/decode had not been exact inverses, the 
 have been written to wrong voxels or mis-sliped against terrain — none appeared. This is a
 pure refactor that isolates the addressing risk from the sparsity risk.
 
-### Phase 2 — drop empty blocks
+### Phase 2 — drop empty blocks ✅ DONE (correctness; memory deferred)
 
-Make the grid-construction pass emit only blocks touched by particles (+halo). Shrink the
-buffers to `num_blocks × 32³` nodes.
+IMPLEMENTATION DEVIATED from the "grid-construction mark pass" plan: instead of a new per-tick
+mark shader, it reuses the occupancy mask the readout ALREADY produces (`occupied ∪ 1-block
+halo`, compacted on the CPU). Fewer moving parts, no new shader. The active set is built from
+LAST tick's occupancy (dense on the first tick after a build), which is safe because a particle
+moves ≤ ~3.3 voxels/tick while a block is 32.
 
-**Gate 2:** on the SAME particle set, particle trajectories/velocities match dense MPM, while
-grid cost follows occupied blocks, not bbox. The S0 regression oracle is the comparison
-target:
+**Gate 2 (correctness): PASSED.** Exact mass conservation on every run (1487→1487.00,
+15634→15634.00, 28974→28974.00, 54466→54466.00) — a halo/indexing leak would have shown up as
+mass loss, and none appeared. Water pools/spreads/settles identically.
 
-```
-density 1.0, stiffness 3000, viscosity 3.0
-sphere → basin → compact body → max_speed ≈ 0 → exact mass
-```
+**NOT done — the memory resize was deferred.** The grid buffers are still sized to the DENSE
+bbox; only the dispatch bound (num_blocks) shrank. That captures the COMPUTE win but not the
+MEMORY win. Shrinking the buffers to `num_blocks × 32³` is a separate follow-up.
+
+### What S1 does and does NOT deliver (honest status)
+
+S1 delivers: one region whose EMPTY blocks inside the bbox cost no compute. It does NOT deliver:
+
+1. **Multiple regions** — placing water in a separate location still can't activate a second
+   region; the request goes into `_active_chunks` but the single region ignores it.
+2. **Growth toward far edits** — `_growth_for` only reacts to occupancy INSIDE the window, so
+   water placed outside the window is never seen and never simulated.
+3. **Sparse memory** — buffers remain dense-sized.
+
+So "place water anywhere in a dynamic world" needs, beyond S1: the memory resize, region
+expansion toward far edits (or a world-spanning region with raised bounds), and/or multiple
+regions. That is the next architectural decision, not more of S1.
 
 ### The clean debugging ladder (user-agreed)
 
