@@ -41,14 +41,15 @@ uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u
 // result is bit-identical to Phase 1. `node` is in-bounds by the caller's region-bounds check.
 layout(set = 0, binding = 22, std430) readonly buffer BlockMap { int data[]; } block_map;
 
-uint node_index(ivec3 node) {
+int node_index(ivec3 node) {
 	ivec3 b = node >> 5;                 // block coordinate within the region
 	ivec3 l = node & 31;                 // local cell within the block
 	int nb_x = P.dim_x >> 5;
 	int nb_y = P.dim_y >> 5;
 	int dense = b.x + nb_x * (b.y + nb_y * b.z);
 	int slot = block_map.data[dense];
-	return uint(slot) * 32768u + (uint(l.z) * 32u + uint(l.y)) * 32u + uint(l.x);
+	if (slot < 0) return -1;             // unallocated block — caller drops this gather
+	return slot * 32768 + (l.z * 32 + l.y) * 32 + l.x;
 }
 
 void main() {
@@ -82,8 +83,10 @@ void main() {
 			node.x >= P.dim_x || node.y >= P.dim_y || node.z >= P.dim_z) continue;
 		vec3 dpos = (vec3(i, j, k) - fx) * P.dx;
 		float weight = w[i].x * w[j].y * w[k].z;
-		uint ni = node_index(node);
-		vec3 gv = vec3(g_vel.data[3u*ni], g_vel.data[3u*ni+1u], g_vel.data[3u*ni+2u]);
+		int ni = node_index(node);
+		if (ni < 0) continue;
+		uint u = uint(ni);
+		vec3 gv = vec3(g_vel.data[3u*u], g_vel.data[3u*u+1u], g_vel.data[3u*u+2u]);
 		new_vel += weight * gv;
 		// new_C += 4 * weight * outer(gv, dpos) / dx^2
 		float coef = 4.0 * weight * P.inv_dx * P.inv_dx;

@@ -10,7 +10,7 @@ layout(set = 0, binding = 0, std430) readonly buffer Params {
 	// MPMSimulation._upload_region_params() byte for byte.
 	int dim_x; int dim_y; int dim_z; int n_particles;
 	float dt; float dx; float inv_dx; float gravity;
-	float p_vol; float fp_scale; int bound; int pad0;
+	float p_vol; float fp_scale; int bound; int num_blocks;
 } P;
 layout(set = 0, binding = 8, std430)  buffer GMom     { int data[]; } g_mom;
 layout(set = 0, binding = 9, std430)  buffer GMass    { int data[]; } g_mass;
@@ -23,7 +23,7 @@ const uint NMAT = 8u;
 
 void main() {
 	uint idx = gl_GlobalInvocationID.x;
-	uint G = uint(P.dim_x) * uint(P.dim_y) * uint(P.dim_z);
+	uint G = uint(P.num_blocks) * 32768u;
 	if (idx >= G) return;
 
 	g_mass.data[idx] = 0;

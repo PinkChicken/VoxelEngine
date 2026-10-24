@@ -245,9 +245,13 @@ class ChunkRegion:
 	var pos: RID; var vel: RID; var C: RID; var J: RID
 	var mat: RID; var mass: RID; var alive: RID; var F: RID
 	var g_mom: RID; var g_mass: RID; var g_vel: RID; var g_mass_mat: RID
-	# S1 Phase 2a: block_coord(dense) -> slot table. Identity for now (block_map[i] = i) so it is
-	# a pure indirection, bit-identical to Phase 1. Phase 2b makes it sparse (empty blocks absent).
+	# S1 Phase 2b: block_coord(dense) -> slot (sparse; -1 when absent) and slot -> dense_block
+	# (inverse, for grid_op/readout to recover node coords). The grid buffers stay sized to
+	# total_blocks (dense) — only the DISPATCH is bounded by num_blocks, which is where the cost is.
 	var block_map: RID
+	var block_list: RID
+	var num_blocks: int = 0
+	var total_blocks: int = 0
 	var voxel_params_buf: RID; var voxel_buf_a: RID; var chunk_table: RID; var dirty_chunks_buf: RID
 	# 6-bit "material touched this face plane" mask written by readout.comp, downloaded each tick
 	# and consumed by _growth_for(). Reset per readout.
@@ -723,15 +727,19 @@ func _build_region(origin: Vector3i, dims: Vector3i, chunks: Array[Vector3i], pr
 	w.g_mass     = _new_zero_buf(nodes * 4)
 	w.g_vel      = _new_zero_buf(nodes * 3 * 4)
 	w.g_mass_mat = _new_zero_buf(nodes * NMAT * 4)
-	# S1 Phase 2a: IDENTITY block map — every block allocated, block_map[i] = i, so the lookup in
-	# p2g/g2p's node_index() is a no-op relative to Phase 1's dense formula (bit-identical).
-	# Phase 2b replaces this fill with the sparse map built from the mark/compact pass.
-	var n_blocks := int(dims.x / n_grid) * int(dims.y / n_grid) * int(dims.z / n_grid)
-	w.block_map = _new_zero_buf(n_blocks * 4)
-	var bm := PackedInt32Array(); bm.resize(n_blocks)
-	for i in n_blocks:
+	# S1 Phase 2b: DENSE initial block set (identity block_map/block_list, num_blocks = total).
+	# The first readout then rebuilds it sparse; until then, dispatch over the full bbox.
+	w.total_blocks = int(dims.x / n_grid) * int(dims.y / n_grid) * int(dims.z / n_grid)
+	w.num_blocks = w.total_blocks
+	w.block_map = _new_zero_buf(w.total_blocks * 4)
+	w.block_list = _new_zero_buf(w.total_blocks * 4)
+	var bm := PackedInt32Array(); bm.resize(w.total_blocks)
+	var bl := PackedInt32Array(); bl.resize(w.total_blocks)
+	for i in w.total_blocks:
 		bm[i] = i
+		bl[i] = i
 	_compute.buffer_update(w.block_map, 0, bm.to_byte_array())
+	_compute.buffer_update(w.block_list, 0, bl.to_byte_array())
 	w.params_buf = _new_zero_buf(48)
 	w.dirty_chunks_buf = _new_zero_buf(DIRTY_BUF_BYTES)
 	w.face_mask_buf = _new_zero_buf(4)
@@ -835,7 +843,7 @@ func _destroy_region() -> void:
 
 func _free_region_buffers(w: ChunkRegion) -> void:
 	for rid in [w.params_buf, w.pos, w.vel, w.C, w.J, w.mat, w.mass, w.alive, w.F,
-		w.g_mom, w.g_mass, w.g_vel, w.g_mass_mat, w.block_map,
+		w.g_mom, w.g_mass, w.g_vel, w.g_mass_mat, w.block_map, w.block_list,
 		w.voxel_params_buf, w.dirty_chunks_buf, w.face_mask_buf, w.occupancy_buf]:
 		if rid.is_valid():
 			_compute.free_rid(rid)
@@ -1103,7 +1111,7 @@ func _upload_region_params(w: ChunkRegion) -> void:
 	b.encode_float(32, p_vol)
 	b.encode_float(36, fp_scale)
 	b.encode_s32(40, bound)
-	b.encode_s32(44, 0)
+	b.encode_s32(44, w.num_blocks)
 	_compute.buffer_update(w.params_buf, 0, b)
 
 
@@ -1127,7 +1135,7 @@ func _build_region_sets(w: ChunkRegion) -> void:
 	w.set_grid_op = _compute.create_uniform_set([
 		_u(0, w.params_buf), _u(8, w.g_mom), _u(9, w.g_mass), _u(10, w.g_vel),
 		_u(13, _material_db.mpm_buffer_rid), _u(14, w.voxel_params_buf),
-		_u(15, w.voxel_buf_a), _u(16, w.chunk_table), _u(21, w.face_mask_buf)
+		_u(15, w.voxel_buf_a), _u(16, w.chunk_table), _u(21, w.face_mask_buf), _u(23, w.block_list)
 	], _grid_op.shader)
 	w.set_g2p = _compute.create_uniform_set([
 		_u(0, w.params_buf), _u(1, w.pos), _u(2, w.vel), _u(3, w.C), _u(4, w.J), _u(5, w.mat),
@@ -1137,7 +1145,7 @@ func _build_region_sets(w: ChunkRegion) -> void:
 		_u(0, w.params_buf), _u(9, w.g_mass), _u(12, w.g_mass_mat),
 		_u(13, _material_db.mpm_buffer_rid), _u(14, w.voxel_params_buf),
 		_u(15, w.voxel_buf_a), _u(16, w.chunk_table), _u(17, _orchestrator.get_changelog_buf()),
-		_u(18, w.dirty_chunks_buf), _u(19, w.face_mask_buf), _u(20, w.occupancy_buf)
+		_u(18, w.dirty_chunks_buf), _u(19, w.face_mask_buf), _u(20, w.occupancy_buf), _u(23, w.block_list)
 	], _readout.shader)
 
 
@@ -1183,6 +1191,9 @@ func tick_all(substeps_per_tick: int) -> void:
 
 	_run_region_substeps(w, substeps_per_tick)
 	var changed := _readout_region(w)
+	# S1 Phase 2b: the readout just refreshed occupancy, so rebuild the sparse block set from it
+	# for the NEXT tick (this tick's substeps already ran on the previous set; dense on build).
+	_rebuild_block_set(w)
 
 	# REGION GEOMETRY UPDATE — the whole "which chunks are active" decision, once per tick.
 	# _ensure_region() either GROWS the window toward material touching a face (grow_window) or
@@ -1309,6 +1320,52 @@ func _decode_occupancy(w: ChunkRegion, raw: PackedByteArray) -> Dictionary:
 	return out
 
 
+# S1 Phase 2b — build the sparse active-block set from the occupancy mask the readout just
+# produced, and upload block_map (dense -> slot, -1 when absent), block_list (slot -> dense) and
+# num_blocks for the NEXT tick's substeps. The grid buffers stay sized to total_blocks (dense);
+# only the dispatch bound (groups_grid = num_blocks*32768/64) shrinks, which is where the cost is.
+#
+# Correctness: the active set is occupied_chunks UNION their 26 neighbours (1-block halo),
+# clamped to the region. A particle moves at most ~3.3 voxels/tick (max_speed 200 * dt * 24
+# substeps), far under a 32-block, and its B-spline kernel reaches 1.5 cells — so "last tick's
+# occupancy plus one halo" covers every node this tick's scatter can touch. Kernel tails below
+# the 1e-6 occupancy threshold that reach unallocated blocks are dropped, which is negligible by
+# definition. Empty occupancy (first tick after a build/rebuild) falls back to dense.
+func _rebuild_block_set(w: ChunkRegion) -> void:
+	var nb_x := int(w.dims.x) / n_grid
+	var nb_y := int(w.dims.y) / n_grid
+	var nb_z := int(w.dims.z) / n_grid
+	var bmin := Vector3i(w.origin.x / n_grid, w.origin.y / n_grid, w.origin.z / n_grid)
+	var dense_set := {}
+	if w.occupied.is_empty():
+		for i in w.total_blocks:
+			dense_set[i] = true
+	else:
+		for cp in w.occupied:
+			var c: Vector3i = cp
+			var l := c - bmin
+			for ox in [-1, 0, 1]:
+				for oy in [-1, 0, 1]:
+					for oz in [-1, 0, 1]:
+						var n := l + Vector3i(ox, oy, oz)
+						if n.x < 0 or n.y < 0 or n.z < 0 or n.x >= nb_x or n.y >= nb_y or n.z >= nb_z:
+							continue
+						dense_set[n.x + nb_x * (n.y + nb_y * n.z)] = true
+	var dense: Array = dense_set.keys()
+	dense.sort()
+	w.num_blocks = dense.size()
+	var bm := PackedInt32Array(); bm.resize(w.total_blocks); bm.fill(-1)
+	var bl := PackedInt32Array(); bl.resize(w.num_blocks)
+	for s in dense.size():
+		var d: int = dense[s]
+		bm[d] = s
+		bl[s] = d
+	_compute.buffer_update(w.block_map, 0, bm.to_byte_array())
+	_compute.buffer_update(w.block_list, 0, bl.to_byte_array())
+	w.groups_grid = int(ceil(float(w.num_blocks * 32768) / 64.0))
+	_upload_region_params(w)  # re-upload num_blocks
+
+
 # Ported from GranularSimulation._decode_dirty_bitmask() — same bit layout, same reach into
 # WorldOrchestrator's private _slot_to_chunk (GDScript doesn't enforce real privacy; matches
 # the existing convention rather than inventing a public accessor unprompted).
@@ -1371,6 +1428,10 @@ func region_grid_info() -> Dictionary:
 		"origin": _region.origin,
 		"dims": _region.dims,
 		"nodes": _region.dims.x * _region.dims.y * _region.dims.z,
+		# S1 Phase 2b: how sparse the grid actually is — num_blocks is what the dispatch costs,
+		# total_blocks is the dense bbox count it would have cost.
+		"num_blocks": _region.num_blocks,
+		"total_blocks": _region.total_blocks,
 		"chunks": _region.chunks.size(),
 		"requested": _active_chunks.size(),
 		"particles": _region.n_particles,

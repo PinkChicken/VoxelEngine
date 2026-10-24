@@ -23,7 +23,7 @@ layout(set = 0, binding = 0, std430) readonly buffer Params {
 	// MPMSimulation._upload_region_params() byte for byte.
 	int dim_x; int dim_y; int dim_z; int n_particles;
 	float dt; float dx; float inv_dx; float gravity;
-	float p_vol; float fp_scale; int bound; int pad0;
+	float p_vol; float fp_scale; int bound; int num_blocks;
 } P;
 layout(set = 0, binding = 9, std430) readonly buffer GMass { int data[]; } g_mass;
 layout(set = 0, binding = 12, std430) readonly buffer GMassMat { int data[]; } g_mass_mat;
@@ -63,6 +63,7 @@ layout(set = 0, binding = 19, std430) buffer FaceMask { uint data[]; } face_mask
 // freezing the water in place: an intact sphere hanging in mid-air, and a stretched column where
 // only part of the body survived. That is the reported "it just isn't going down".
 layout(set = 0, binding = 20, std430) buffer Occupancy { uint data[]; } occupancy;
+layout(set = 0, binding = 23, std430) readonly buffer BlockList { int data[]; } block_list;
 
 const uint NMAT = 8u;
 const uint MODEL_STATIC = 1u;
@@ -98,7 +99,7 @@ void mark_dirty(int flat_idx, int vpc) {
 void main() {
 	if (VP.voxel_world_valid == 0) return;
 	uint idx = gl_GlobalInvocationID.x;
-	uint G = uint(P.dim_x) * uint(P.dim_y) * uint(P.dim_z);
+	uint G = uint(P.num_blocks) * 32768u;
 	if (idx >= G) return;
 
 	// S1 Phase 1 — block-major decode: recover the node's region-local coordinate from the flat
@@ -110,9 +111,10 @@ void main() {
 	int slot = int(idx >> 15u);
 	int nb_x = P.dim_x >> 5;
 	int nb_y = P.dim_y >> 5;
-	int bx = slot % nb_x;
-	int by = (slot / nb_x) % nb_y;
-	int bz = slot / (nb_x * nb_y);
+	int dense = block_list.data[slot];
+	int bx = dense % nb_x;
+	int by = (dense / nb_x) % nb_y;
+	int bz = dense / (nb_x * nb_y);
 	int ix = bx * 32 + lx;
 	int iy = by * 32 + ly;
 	int iz = bz * 32 + lz;

@@ -109,14 +109,15 @@ void svd3(float F[9], out float U[9], out float sig[3], out float V[9]) {
 // result is bit-identical to Phase 1. `node` is in-bounds by the caller's region-bounds check.
 layout(set = 0, binding = 22, std430) readonly buffer BlockMap { int data[]; } block_map;
 
-uint node_index(ivec3 node) {
+int node_index(ivec3 node) {
 	ivec3 b = node >> 5;                 // block coordinate within the region
 	ivec3 l = node & 31;                 // local cell within the block
 	int nb_x = P.dim_x >> 5;
 	int nb_y = P.dim_y >> 5;
 	int dense = b.x + nb_x * (b.y + nb_y * b.z);
 	int slot = block_map.data[dense];
-	return uint(slot) * 32768u + (uint(l.z) * 32u + uint(l.y)) * 32u + uint(l.x);
+	if (slot < 0) return -1;             // unallocated block — caller drops this scatter
+	return slot * 32768 + (l.z * 32 + l.y) * 32 + l.x;
 }
 
 void main() {
@@ -239,11 +240,13 @@ void main() {
 		ad.z = (st6*dpos.x + st7*dpos.y + st8*dpos.z) + mass*(C6*dpos.x + C7*dpos.y + C8*dpos.z);
 		vec3 mom = weight * (mass * vel + ad);
 		float mc = weight * mass;
-		uint ni = node_index(node);
-		atomicAdd(g_mass.data[ni],        int(round(mc * scale)));
-		atomicAdd(g_mom.data[3u*ni],      int(round(mom.x * scale)));
-		atomicAdd(g_mom.data[3u*ni + 1u], int(round(mom.y * scale)));
-		atomicAdd(g_mom.data[3u*ni + 2u], int(round(mom.z * scale)));
-		atomicAdd(g_mass_mat.data[ni * NMAT + matId], int(round(mc * scale)));
+		int ni = node_index(node);
+		if (ni < 0) continue;
+		uint u = uint(ni);
+		atomicAdd(g_mass.data[u],        int(round(mc * scale)));
+		atomicAdd(g_mom.data[3u*u],      int(round(mom.x * scale)));
+		atomicAdd(g_mom.data[3u*u + 1u], int(round(mom.y * scale)));
+		atomicAdd(g_mom.data[3u*u + 2u], int(round(mom.z * scale)));
+		atomicAdd(g_mass_mat.data[u * NMAT + matId], int(round(mc * scale)));
 	}
 }
