@@ -4,7 +4,8 @@ The plan for replacing the dense bounding-box grid with a globally-indexed spars
 the MPM background grid. Written after S0 validated the dense solver (see
 `docs/MPM_SOLVER_DESIGN.md` §15), which is the reference implementation this work must match.
 
-Status: **design / planning**. No code has been written.
+Status: **Phase 1 DONE (commit 63b61a0), verified by hand-test.** Phase 2 (drop empty blocks)
+is next.
 
 ---
 
@@ -149,14 +150,17 @@ mechanical addressing rewrites.
 
 This mirrors the debugging ladder agreed for S1. **Each phase has a hard gate before the next.**
 
-### Phase 1 — block-indexed addressing, ALL blocks allocated
+### Phase 1 — block-indexed addressing, ALL blocks allocated ✅ DONE
 
 Refactor the five passes to address nodes via `(block_coord → slot) → local`, but keep every
 block in the region bbox allocated, in lexicographic order.
 
-**Gate 1:** bit-identical to the current dense solver on the S0 regression config
-(1.0/3000/3.0, sphere→basin). No physics change is acceptable here; this is a pure refactor
-that isolates the addressing risk from the sparsity risk.
+**Gate 1: PASSED.** No new artifact on the regression config; exact mass conservation held;
+the same blob→puddle trajectory and compactness decay reproduced. Notably it ran in a
+NON-UNIFORM region (64×96×64 = 2×3×2 blocks), which exercises the non-power-of-2 block-count
+divmod path (`nb_y = 3`). If the encode/decode had not been exact inverses, the water would
+have been written to wrong voxels or mis-sliped against terrain — none appeared. This is a
+pure refactor that isolates the addressing risk from the sparsity risk.
 
 ### Phase 2 — drop empty blocks
 
