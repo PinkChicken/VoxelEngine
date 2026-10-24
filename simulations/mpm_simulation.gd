@@ -1024,6 +1024,24 @@ func _build_region_sets(w: ChunkRegion) -> void:
 	], _readout.shader)
 
 
+# The orchestrator can REALLOCATE _voxel_buf_a under a live region: _add_chunk_to_grid() calls
+# buffer_grow() when streaming exhausts the slot pool, which returns a NEW RID and frees the old
+# one. The region's uniform sets bind w.voxel_buf_a directly, so they would keep pointing at a
+# freed handle — the failure mode is "Uniforms were never supplied for set (0)" on the next
+# dispatch, or a null uniform set. Rebind whenever the handle changes. (The other reallocation
+# path, _init_grid from slab_invalidated, tears the region down instead — see setup().)
+func _rebind_voxel_world(w: ChunkRegion) -> void:
+	var vb := _orchestrator.get_voxel_buf()
+	var ct := _orchestrator.get_chunk_table()
+	if vb == w.voxel_buf_a and ct == w.chunk_table:
+		return
+	w.voxel_buf_a = vb
+	w.chunk_table = ct
+	# Do NOT free the old sets: the RD auto-invalidates a uniform set when a buffer it binds is
+	# freed, and freeing an already-invalidated set errors ("Attempted to free invalid ID").
+	_build_region_sets(w)
+
+
 # Below this max speed (voxel-units/simulated-second), a particle counts as "at rest" for
 # idle-detection purposes. Found empirically (2026-08-12): readout()'s voxel-level changed/
 # unchanged signal was tried first and is TOO COARSE — a particle early in a gravity fall
@@ -1050,6 +1068,9 @@ func tick_all(substeps_per_tick: int) -> void:
 	var w := _region
 	if w == null or w.n_particles == 0:
 		return
+
+	# Guard against the orchestrator reallocating the voxel buffer under us (see the function).
+	_rebind_voxel_world(w)
 
 	# Derive the substep dt from the single pacing knob (see sim_seconds_per_tick).
 	var want_dt := sim_seconds_per_tick / maxf(float(substeps_per_tick), 1.0)
