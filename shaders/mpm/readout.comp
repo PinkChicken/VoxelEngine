@@ -44,8 +44,7 @@ layout(set = 0, binding = 17, std430) buffer Changelog {
 } changelog;
 // 1 bit per chunk SLOT (matches GranularSimulation's DIRTY_BUF_BYTES=64 convention — 512
 // slots' worth is far more than one MPM window's local footprint ever touches). Cleared by
-// MPMSimulation.readout() before this dispatch, downloaded after for diagnostics/future
-// chunks_committed wiring — NOT emitted yet, see mpm_simulation.gd's readout() for why.
+// MPMSimulation.readout() before this dispatch, downloaded after for diagnostics.
 layout(set = 0, binding = 18, std430) buffer DirtyChunks { uint data[]; } dirty_chunks;
 // FACE TOUCH mask (2026-08-13) — 6 bits, one per region face. Set when a node lying ON that face
 // plane produced an actual change, i.e. material is genuinely at the edge of the simulated domain

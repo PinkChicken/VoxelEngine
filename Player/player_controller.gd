@@ -1,9 +1,7 @@
 extends Node
 
 @export var mouse_sensitivity: float = 0.005
-@export var walk_speed: float = 5.0
 @export var sprint_modifier: float = 1.5
-@export var jump_velocity: float = 4.5
 @export var fly_speed: float = 10.0
 @export var sphere_radius: int = 15
 @export var show_sphere_indicator: bool = true
@@ -19,19 +17,13 @@ const HOTBAR_KEYS := [KEY_1, KEY_2, KEY_3, KEY_4, KEY_5]
 # Hotbar slot count/id mapping is NOT duplicated here — read from HotBar.MATERIAL_IDS
 # (HUD/hot_bar.gd) so there is exactly one place that defines "slot N = material id X".
 
-var gravity: float = ProjectSettings.get_setting("physics/3d/default_gravity")
-var fly_mode: bool = true
-
 const VS := 0.5  # voxel scale - must match ChunkManager.voxel_scale
 
-@onready var body: CharacterBody3D = get_parent()
+@onready var body: Node3D = get_parent()
 @onready var pivot: Node3D = body.get_node("Pivot")
 @onready var camera: Camera3D = body.get_node("Pivot/Camera3D")
 @onready var _renderer = get_node("/root/world/RaymarchRenderer")
 @onready var _chunk_manager: ChunkManager = get_node("/root/world/ChunkManager")
-@onready var _mover: VoxelMover = body.get_node("VoxelMover")
-
-var _on_floor := false
 
 var _indicator: MeshInstance3D
 var _cursor_indicator: MeshInstance3D
@@ -43,10 +35,7 @@ func _ready() -> void:
 
 
 func _physics_process(delta: float) -> void:
-	if fly_mode:
-		fly_movement(delta)
-	else:
-		ground_movement(delta)
+	fly_movement(delta)
 
 
 func _ray_hit_distance() -> float:
@@ -121,11 +110,6 @@ func _unhandled_input(event: InputEvent) -> void:
 
 	if event.is_action_pressed("ui_cancel"):
 		Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
-
-	if event.is_action_pressed("toggle_fly"):
-		fly_mode = not fly_mode
-		body.velocity = Vector3.ZERO
-		get_viewport().set_input_as_handled()
 
 	if event is InputEventKey and event.pressed and not event.echo \
 			and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
@@ -227,35 +211,7 @@ func fly_movement(delta: float) -> void:
 	var direction  := (forward * input_dir.y + right * input_dir.x).normalized()
 	direction.y = Input.get_axis("ctrl", "space")
 	var speed := fly_speed * (sprint_modifier if Input.is_key_pressed(KEY_SHIFT) else 1.0)
-	body.velocity = direction * speed
-	body.global_position += body.velocity * delta
-
-
-func ground_movement(delta: float) -> void:
-	var vel := body.velocity
-
-	if not _on_floor:
-		vel.y -= gravity * delta
-
-	if Input.is_action_just_pressed("jump") and _on_floor:
-		vel.y   = jump_velocity
-		_on_floor = false
-
-	var input_dir := Input.get_vector("left", "right", "down", "up")
-	var direction := (pivot.transform.basis * Vector3(input_dir.x, 0, -input_dir.y)).normalized()
-	var speed     := walk_speed * (sprint_modifier if Input.is_key_pressed(KEY_SHIFT) else 1.0)
-
-	if direction != Vector3.ZERO:
-		vel.x = direction.x * speed
-		vel.z = direction.z * speed
-	else:
-		vel.x = move_toward(vel.x, 0, walk_speed)
-		vel.z = move_toward(vel.z, 0, walk_speed)
-
-	var result := _mover.move(body.global_position, vel, delta)
-	body.global_position = result.pos
-	body.velocity        = result.vel
-	_on_floor            = result.on_floor
+	body.global_position += direction * speed * delta
 
 
 func _update_indicator_size() -> void:

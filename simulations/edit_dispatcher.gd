@@ -175,9 +175,9 @@ func _dispatch(req: EditRequest) -> void:
 	count = mini(count, MAX_EDIT_CHANGELOG)
 	var raw: PackedByteArray = _compute.download_range(_changelog_buf, 0, 4 + count * 8)
 
-	var positions := _orchestrator.extract_changed_chunks(raw, count)
-	if not positions.is_empty():
-		_orchestrator.chunks_committed.emit(positions)
+	# Updates simulation masks (MPM chunk discovery). The returned chunk list's only consumer
+	# was the collision surface cache, which no longer exists.
+	_orchestrator.extract_changed_chunks(raw, count)
 
 	# MLS-MPM migration (2026-08-12) — decode individual placed-voxel positions/materials
 	# (not just chunk positions) so MPMSimulation can promote newly-placed sand/water into

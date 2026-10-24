@@ -1,11 +1,10 @@
 class_name WorldOrchestrator extends Node
 
-signal chunks_committed(chunk_positions: Array[Vector3i])
 signal chunk_loaded(chunk_pos: Vector3i)
 # MLS-MPM migration (2026-08-12) — individual placed-voxel positions/materials (not just
-# chunk positions), emitted by EditDispatcher._dispatch() alongside chunks_committed, same
-# pattern as that signal (declared here, emitted by the writer that has _orchestrator).
-# MPMSimulation listens for this to promote newly-placed sand/water into particles.
+# chunk positions), emitted by EditDispatcher._dispatch() (declared here, emitted by the
+# writer that has _orchestrator). MPMSimulation listens for this to promote newly-placed
+# sand/water into particles.
 signal voxels_placed(positions: Array[Vector3i], material_ids: Array[int])
 
 var _chunk_manager: ChunkManager
@@ -25,13 +24,6 @@ const MAX_CHANGELOG_ENTRIES := 524288  # 4 MB at 8 bytes/entry
 var _compute           # ComputeHelper
 var _edit_dispatcher   # EditDispatcher — untyped to avoid circular class_name dependency
 var _patch_pipeline: Dictionary = {}           # patch_apply.comp — applies changelog to _voxel_buf_a on GPU
-var _surface_extract_pipeline: Dictionary = {} # surface_extract.comp — emits exposed voxels for collision
-var _surface_out_buf: RID                      # persistent output buffer for surface extraction
-var _surface_params_buf: RID                   # persistent params buffer for surface extraction
-
-const SURFACE_OUT_MAX_PER_CHUNK  := 16384  # max surface entries per chunk (generous ceiling)
-const SURFACE_EXTRACT_MAX_BATCH  := 8      # max chunks per batch dispatch
-var _surface_slot_list_buf: RID            # int[SURFACE_EXTRACT_MAX_BATCH] — slot per chunk
 var _voxel_buf_a: RID  # canonical: renderer reads this, simulation reads this
 var _chunk_table: RID
 var _changelog_buf: RID      # layout: [u32 count | (flat_idx u32, new_value u32) × count]
@@ -69,7 +61,6 @@ func _ready() -> void:
 		_patch_pipeline = _compute.compile_shader(_load_patch_shader(), 4)
 		if _patch_pipeline.is_empty():
 			push_error("WorldOrchestrator: patch_apply.comp compile failed")
-		_init_surface_extract()
 		_init_grid()  # empty grid immediately; chunks stream in via _add_chunk_to_grid
 	_chunk_manager.slab_invalidated.connect(_init_grid)  # R-key regenerate: reset grid immediately
 
@@ -85,12 +76,6 @@ func _ready() -> void:
 
 func _exit_tree() -> void:
 	_free_voxel_buffers()
-	if _surface_out_buf.is_valid():
-		_compute.free_rid(_surface_out_buf)
-	if _surface_params_buf.is_valid():
-		_compute.free_rid(_surface_params_buf)
-	if _surface_slot_list_buf.is_valid():
-		_compute.free_rid(_surface_slot_list_buf)
 	Performance.remove_custom_monitor("Voxel/changelog_per_tick")
 	Performance.remove_custom_monitor("Voxel/slot_count")
 	Performance.remove_custom_monitor("Voxel/slot_capacity")
@@ -220,98 +205,6 @@ func _load_patch_shader() -> String:
 		push_error("WorldOrchestrator: cannot open patch_apply.comp")
 		return ""
 	return f.get_as_text()
-
-
-func _init_surface_extract() -> void:
-	if not _compute.has_device():
-		return
-	var src := _load_surface_extract_shader()
-	if src.is_empty():
-		push_error("WorldOrchestrator: cannot open surface_extract.comp")
-		return
-	_surface_extract_pipeline = _compute.compile_shader(src, 4)
-	if _surface_extract_pipeline.is_empty():
-		push_error("WorldOrchestrator: surface_extract.comp compile failed")
-		return
-	# Output: SURFACE_EXTRACT_MAX_BATCH chunks, each occupying (1 + SURFACE_OUT_MAX_PER_CHUNK) u32 words.
-	var stride   := 1 + SURFACE_OUT_MAX_PER_CHUNK
-	var out_size := SURFACE_EXTRACT_MAX_BATCH * stride * 4
-	var init_data := PackedByteArray(); init_data.resize(out_size); init_data.fill(0)
-	_surface_out_buf = _compute.buffer_upload(init_data)
-	var param_data := PackedByteArray(); param_data.resize(16); param_data.fill(0)
-	_surface_params_buf = _compute.buffer_upload(param_data)
-	var slot_data := PackedByteArray(); slot_data.resize(SURFACE_EXTRACT_MAX_BATCH * 4); slot_data.fill(0xFF)
-	_surface_slot_list_buf = _compute.buffer_upload(slot_data)
-
-
-func _load_surface_extract_shader() -> String:
-	var f := FileAccess.open("res://shaders/surface_extract.comp", FileAccess.READ)
-	if not f:
-		return ""
-	return f.get_as_text()
-
-
-# Batch surface extraction: one GPU dispatch + sync covers all N chunks.
-# Returns {chunk_pos: PackedByteArray} where each value is u32 entries
-# packed as bits[15:0]=local_flat_idx, bits[23:16]=mat_id.
-func extract_surface_voxels_batch(positions: Array[Vector3i]) -> Dictionary:
-	var n := positions.size()
-	if n == 0 or _surface_extract_pipeline.is_empty():
-		return {}
-	if not _voxel_buf_a.is_valid() or not _surface_out_buf.is_valid() \
-			or not _surface_slot_list_buf.is_valid():
-		return {}
-
-	n = min(n, SURFACE_EXTRACT_MAX_BATCH)
-	var cs     := _chunk_manager.chunk_size
-	var stride := 1 + SURFACE_OUT_MAX_PER_CHUNK  # u32 words per chunk in output buffer
-
-	# Upload slot list and zero per-chunk count fields.
-	var slot_data := PackedByteArray(); slot_data.resize(n * 4)
-	var zero4 := PackedByteArray([0, 0, 0, 0])
-	for i in n:
-		var slot = _chunk_to_slot.get(positions[i], -1)
-		slot_data.encode_s32(i * 4, slot)
-		_compute.buffer_update(_surface_out_buf, i * stride * 4, zero4)
-	_compute.buffer_update(_surface_slot_list_buf, 0, slot_data)
-
-	# Upload params: chunk_size, max_per_chunk, chunk_count, pad.
-	var param_data := PackedByteArray(); param_data.resize(16)
-	param_data.encode_s32(0, cs)
-	param_data.encode_s32(4, SURFACE_OUT_MAX_PER_CHUNK)
-	param_data.encode_s32(8, n)
-	param_data.encode_s32(12, 0)
-	_compute.buffer_update(_surface_params_buf, 0, param_data)
-
-	var u0 := RDUniform.new()
-	u0.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	u0.binding = 0; u0.add_id(_voxel_buf_a)
-	var u1 := RDUniform.new()
-	u1.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	u1.binding = 1; u1.add_id(_surface_out_buf)
-	var u2 := RDUniform.new()
-	u2.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	u2.binding = 2; u2.add_id(_surface_params_buf)
-	var u3 := RDUniform.new()
-	u3.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	u3.binding = 3; u3.add_id(_surface_slot_list_buf)
-
-	_compute.run(_surface_extract_pipeline, [u0, u1, u2, u3], n * 4, 4, 4)
-	_compute.submit()
-	_compute.sync()
-
-	# One download covers the entire output for all N chunks.
-	var raw = _compute.download_range(_surface_out_buf, 0, n * stride * 4)
-
-	var result: Dictionary = {}
-	for i in n:
-		var base_bytes := i * stride * 4
-		var count := int(raw.decode_u32(base_bytes))
-		if count == 0:
-			continue
-		count = min(count, SURFACE_OUT_MAX_PER_CHUNK)
-		result[positions[i]] = raw.slice(base_bytes + 4, base_bytes + 4 + count * 4)
-	return result
 
 
 # --- Edit convenience wrappers (used by ChunkManager — avoids circular class_name dep) ---

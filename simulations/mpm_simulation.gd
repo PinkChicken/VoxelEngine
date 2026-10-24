@@ -1126,7 +1126,7 @@ func _run_region_substeps(w: ChunkRegion, substeps: int) -> void:
 # Writes the region's current grid mass/material state into the REAL voxel world (shared
 # changelog + WorldOrchestrator.apply_changelog()). readout.comp maps each grid node through
 # origin + local index and then through world_to_flat(), so nodes in any chunk of the region
-# land in the right chunk slot. Does NOT emit WorldOrchestrator.chunks_committed.
+# land in the right chunk slot.
 func _readout_region(w: ChunkRegion) -> Array[Vector3i]:
 	# CAPACITY INTERLOCK — the cause of "I can no longer add or modify those chunks".
 	# readout writes AIR into any node whose grid mass is below threshold. A water voxel the

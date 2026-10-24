@@ -1,4 +1,4 @@
-extends CharacterBody3D
+extends Node3D
 
 signal add_sphere(center: Vector3i, radius: int, material: int)
 signal remove_sphere(center: Vector3i, radius: int)

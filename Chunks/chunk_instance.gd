@@ -1,5 +1,5 @@
 @tool
-class_name Chunk extends StaticBody3D
+class_name Chunk extends Node3D
 
 enum Mat { AIR = 0, ROCK = 1, SAND = 2, WATER = 3, GLASS = 4, FIRE = 5, SMOKE = 6, OIL = 7 }
 # 1 byte per voxel: just the material id (AIR == 0). The GPU buffer holds these same bytes,

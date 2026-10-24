@@ -25,7 +25,6 @@ var _out_buf: RID
 var _debug_buf: RID
 var _cursor_buf: RID
 var _active_chunks_buf: RID
-var _collision_chunks_buf: RID
 var _cursor_data: PackedByteArray
 var _pixel_count: int
 
@@ -120,8 +119,6 @@ func _alloc_frame_buffers() -> void:
 	# 4 bytes count + 256 chunks × 3 ints × 4 bytes = 3076; round up to 3080
 	var ac := PackedByteArray(); ac.resize(3080); ac.fill(0)
 	_active_chunks_buf = _compute.buffer_upload(ac)
-	var cc := PackedByteArray(); cc.resize(3080); cc.fill(0)
-	_collision_chunks_buf = _compute.buffer_upload(cc)
 
 
 func _ensure_quad() -> void:
@@ -317,7 +314,6 @@ func _render() -> void:
 	params_data.encode_s32(80, debug_hide_mask)
 	_compute.buffer_update(_params_buf, 0, params_data)
 	_upload_active_chunks()
-	_upload_collision_chunks()
 	_compute.buffer_update(_cam_buf, 0, _camera_data())
 	_compute.buffer_update(_vp_buf, 0, _vp_data())
 
@@ -344,8 +340,7 @@ func _render() -> void:
 		var u7 = RDUniform.new(); u7.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER; u7.binding = 7; u7.add_id(_debug_buf)
 		var u8 = RDUniform.new(); u8.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER; u8.binding = 8; u8.add_id(_cursor_buf)
 		var u9  = RDUniform.new(); u9.uniform_type  = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER; u9.binding  = 9;  u9.add_id(_active_chunks_buf)
-		var u10 = RDUniform.new(); u10.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER; u10.binding = 10; u10.add_id(_collision_chunks_buf)
-		_render_uniform_set = _compute.create_uniform_set([u0, u1, u2, u3, u4, u5, u6, u7, u8, u9, u10], _pipeline.shader)
+		_render_uniform_set = _compute.create_uniform_set([u0, u1, u2, u3, u4, u5, u6, u7, u8, u9], _pipeline.shader)
 		_cached_voxel_rid          = voxel_buf
 		_cached_chunk_table_rid    = chunk_table
 
@@ -393,18 +388,6 @@ func _update_debug_label(debug_raw: PackedByteArray) -> void:
 		debug_raw.decode_s32(0), debug_raw.decode_s32(4), debug_raw.decode_s32(8),
 		mat_name, mat_id, type_str
 	]
-
-
-func _upload_collision_chunks() -> void:
-	var positions: Array[Vector3i] = []
-	var count := mini(positions.size(), 256)
-	var buf := PackedByteArray(); buf.resize(4 + count * 12); buf.fill(0)
-	buf.encode_s32(0, count)
-	for i in range(count):
-		buf.encode_s32(4 + i * 12,     positions[i].x)
-		buf.encode_s32(4 + i * 12 + 4, positions[i].y)
-		buf.encode_s32(4 + i * 12 + 8, positions[i].z)
-	_compute.buffer_update(_collision_chunks_buf, 0, buf)
 
 
 func _upload_active_chunks() -> void:
@@ -508,6 +491,6 @@ func _shader_source() -> String:
 func _exit_tree() -> void:
 	if _render_uniform_set.is_valid():
 		_compute.free_rid(_render_uniform_set)
-	for buf in [_out_buf, _debug_buf, _cursor_buf, _active_chunks_buf, _collision_chunks_buf, _params_buf, _cam_buf, _vp_buf]:
+	for buf in [_out_buf, _debug_buf, _cursor_buf, _active_chunks_buf, _params_buf, _cam_buf, _vp_buf]:
 		if buf.is_valid():
 			_compute.free_rid(buf)

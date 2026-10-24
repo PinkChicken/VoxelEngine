@@ -81,11 +81,6 @@ layout(set = 0, binding = 9, std430) readonly buffer ActiveChunksBuf {
     int count;
     int positions[];
 } active_chunks_buf;
-// Collision chunks for debug overlay (bit 2 of debug_chunk_flags). Same format as active_chunks_buf.
-layout(set = 0, binding = 10, std430) readonly buffer CollisionChunksBuf {
-    int count;
-    int positions[];
-} collision_chunks_buf;
 
 // General-purpose "material at an arbitrary world voxel position" lookup, used by the
 // glass edge test below to check a hit voxel's 6 face-neighbours (which may be outside
@@ -307,28 +302,6 @@ void main() {
                                     lit_b = lit_b / 4u;
                                     break;
                                 }
-                            }
-                        }
-                        if ((params.debug_chunk_flags & 4) != 0) {
-                            // Green tint = has collision shapes. Dim blue = no shapes yet.
-                            bool has_col = false;
-                            int nc = min(collision_chunks_buf.count, 256);
-                            for (int ci = 0; ci < nc; ci++) {
-                                if (collision_chunks_buf.positions[ci*3]   == current_chunk.x &&
-                                    collision_chunks_buf.positions[ci*3+1] == current_chunk.y &&
-                                    collision_chunks_buf.positions[ci*3+2] == current_chunk.z) {
-                                    has_col = true;
-                                    break;
-                                }
-                            }
-                            if (has_col) {
-                                lit_r = lit_r / 4u;
-                                lit_g = min(255u, lit_g / 2u + 80u);
-                                lit_b = lit_b / 4u;
-                            } else {
-                                lit_r = lit_r / 4u;
-                                lit_g = lit_g / 4u;
-                                lit_b = min(255u, lit_b / 2u + 80u);
                             }
                         }
                         if ((params.debug_chunk_flags & 1) != 0) {

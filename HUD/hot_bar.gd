@@ -10,7 +10,7 @@ extends CanvasLayer
 const MATERIAL_IDS := [1, 2, 3, 4, 7]
 const MATERIAL_NAMES := ["ROCK", "SAND", "WATER", "GLASS", "OIL"]
 
-var _player: CharacterBody3D
+var _player: Node3D
 var _material_db: MaterialDB
 var _buttons: Array[Button] = []
 var _selected_index: int = 1

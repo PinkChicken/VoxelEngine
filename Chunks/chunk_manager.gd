@@ -70,7 +70,7 @@ func _process(_delta: float) -> void:
 			_orchestrator._add_chunk_to_grid(chunk_pos)
 
 	# Update streaming radius when player moves to a new column.
-	var player := get_node_or_null("/root/world/Player") as CharacterBody3D
+	var player := get_node_or_null("/root/world/CharacterBody3D") as Node3D
 	if player:
 		var vp  := Vector3i(player.global_position / voxel_scale)
 		var pc  := voxel_to_chunk_position(vp)
@@ -171,7 +171,7 @@ func regenerate_chunks() -> void:
 	slab_invalidated.emit()  # WorldOrchestrator re-inits empty grid
 	await terrain.populate()
 	var center := Vector2i.ZERO
-	var player := get_node_or_null("/root/world/Player") as CharacterBody3D
+	var player := get_node_or_null("/root/world/CharacterBody3D") as Node3D
 	if player:
 		var vp := Vector3i(player.global_position / voxel_scale)
 		var pc := voxel_to_chunk_position(vp)

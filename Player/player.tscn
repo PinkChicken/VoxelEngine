@@ -2,7 +2,6 @@
 
 [ext_resource type="Script" uid="uid://bffbojc28nbdh" path="res://Player/player.gd" id="1_v0iea"]
 [ext_resource type="Script" uid="uid://dakxr6omgb1im" path="res://Player/player_controller.gd" id="3_btcbx"]
-[ext_resource type="Script" path="res://Player/voxel_mover.gd" id="4_vmover"]
 
 [sub_resource type="CapsuleMesh" id="CapsuleMesh_f60y1"]
 radius = 1.5
@@ -11,7 +10,7 @@ height = 5.0
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_v0iea"]
 albedo_color = Color(0, 0.49411765, 1, 1)
 
-[node name="Player" type="CharacterBody3D" unique_id=1413443433]
+[node name="Player" type="Node3D" unique_id=1413443433]
 script = ExtResource("1_v0iea")
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=563955824]
@@ -25,6 +24,3 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.3, 0)
 
 [node name="PlayerController" type="Node" parent="." unique_id=1175073966]
 script = ExtResource("3_btcbx")
-
-[node name="VoxelMover" type="Node" parent="." unique_id=1175073967]
-script = ExtResource("4_vmover")

@@ -28,10 +28,10 @@ under the same rules, debris is real material, and the world is not player-depen
 |---|---|---|
 | **Storage** (`Chunks/*`) | voxel data, chunk streaming, chunk table | physics, materials' behaviour |
 | **Simulation** (`simulations/mpm_simulation.gd`) | one MPM region, particles, grid | chunk streaming policy, rendering |
-| **Presentation** (`RaymarchRenderer.gd`, `Player/*`) | pixels, input, collision queries | how material got there |
+| **Presentation** (`RaymarchRenderer.gd`, `Player/*`) | pixels, input, camera | how material got there |
 
 The persistent voxel world (`_voxel_buf_a`) is the seam. Simulation writes into it (through the
-changelog); rendering and collision read from it. Nothing else is shared.
+changelog); rendering reads from it. Nothing else is shared.
 
 ---
 
@@ -69,12 +69,12 @@ Player edits are the only external writer besides the simulation. `EditDispatche
 
 1. validates the request,
 2. dispatches `edit_apply.comp` (writes `_voxel_buf_a` directly),
-3. emits `voxels_placed(positions, materials)` for MPM and `chunks_committed` for the collision
-   surface cache.
+3. emits `voxels_placed(positions, materials)` so MPM can promote the new material into particles,
+   and updates the per-chunk simulation masks.
 
-`chunk_loaded` / `chunks_committed` are the two signals the rest of the engine listens to.
-**`chunks_committed` is consumed by `Player/voxel_mover.gd`** (it invalidates the surface cache) —
-it is not a simulation signal and must not be deleted with simulation code.
+`chunk_loaded` / `voxels_placed` are the signals the rest of the engine listens to. (A
+`chunks_committed` signal used to exist; it was removed with the collision surface cache it fed —
+see §5.)
 
 ### 2.4 Simulation runtime (`simulations/simulation_runtime.gd`)
 
@@ -90,10 +90,9 @@ plugin. There is no plug-in interface and no mode switch.
 
 | buffer | role |
 |---|---|
-| `_voxel_buf_a` | canonical voxels; renderer + collision read, MPM writes |
+| `_voxel_buf_a` | canonical voxels; renderer reads, MPM writes |
 | `_chunk_table` | `chunk_coord → slot` for the voxel array (persistent) |
 | `_changelog_buf` | `[u32 count \| (flat_idx, new_value) × count]`; simulation → voxels |
-| `_surface_*` | surface-extraction outputs for `VoxelMover` |
 
 **CA-era buffer subsystem removed (2026-08-13).** `_voxel_buf_b` (granular CAS scratch),
 `_sim_active_buf` (granular in-flight-grain flag), `_material_flow_buf` / `_material_density_buf`
@@ -101,8 +100,8 @@ plugin. There is no plug-in interface and no mode switch.
 read) are gone — each was allocated at full voxel-buffer size and never written. With them went
 `swap_voxel_bufs()`, `sync_block_data_from_buf()`, the `VoxelMutation`/`submit_mutation*`/
 `submit_batch`/`commit()` API (zero callers since `EditDispatcher`), `debug_dump_fluid_stats()`
-(an 82-line full-buffer readback), and `Chunk.has_simulation()`. `surface_extract.comp` also lost
-its "skip in-flight granular grains" filter (bindings 3/4), which had been permanently inert.
+(an 82-line full-buffer readback), and `Chunk.has_simulation()`. `surface_extract.comp` itself was
+deleted later, with the whole collision layer (§5).
 
 ### 3.2 The write path
 
@@ -425,23 +424,34 @@ the speed clamp (200 voxel/s).
 
 ---
 
-## 5. Collision & player movement (`Player/voxel_mover.gd`)
+## 5. Player movement — INTERIM: free-fly, no collision
 
-PhysicsServer3D shapes and the old `CollisionSystem` are gone. Movement is a CPU-side AABB mover over
-a GPU surface-extraction cache:
+**There is no collision system.** It was removed deliberately (2026-08-13) so the MPM solver could be
+made solid without a half-working physics layer in the way. What went:
 
-- `surface_extract.comp` / `extract_surface_voxels_batch` extracts up to 8 uncached chunks per frame
-  from the 3×3×3 neighborhood; each becomes a `PackedByteArray` bitmap (1 = solid surface).
-- `is_solid(world_pos)` is an O(1) bitmap lookup.
-- On `chunks_committed` or crossing a chunk boundary → `_pending_refresh = true`.
-- Movement is per-axis: Y (gravity/jump snap), then X with step-up, then Z with step-up.
-- Eviction beyond 2 chunk-steps from the player center.
+- `Player/voxel_mover.gd` — the CPU AABB mover + its per-chunk surface bitmap cache.
+- `shaders/surface_extract.comp` — the GPU surface extractor that fed that cache.
+- `WorldOrchestrator`: `_surface_*` buffers, `_init_surface_extract()`,
+  `extract_surface_voxels_batch()`, the `SURFACE_*` constants.
+- The `chunks_committed` signal (its only consumer was the surface cache; it had a known gap
+  anyway — MPM's own voxel writes never fired it, so rising water was invisible to collision).
+- `RaymarchRenderer`'s `_collision_chunks_buf` + `raymarch.comp`'s collision-tint debug block
+  (which was already dead — no flag bit ever enabled it).
+- `Chunk` is now a plain `Node3D` (was `StaticBody3D`); `chunk.tscn`'s empty `CollisionShape3D` is
+  gone. The `jump` / `toggle_fly` input actions are gone with the ground-movement path.
 
-**Why surface voxels suffice:** the player can never touch an interior voxel without passing through
-a surface voxel first.
+**What remains:** `player_controller.gd` free-flies — WASD in the pivot plane, Space/Ctrl for
+vertical, Shift to sprint, mouse to look. It is a debug camera, not a game character: it passes
+through everything.
 
-**Buffer sizing:** `SURFACE_OUT_MAX_PER_CHUNK = 16384`, `SURFACE_EXTRACT_MAX_BATCH = 8`, output
-~512 KB.
+**What this does NOT mean:** the world is still fully simulated and the player still edits it (the
+cursor raycast, sphere placement, remove are all live). Only *the player's own motion* stopped
+interacting with the world.
+
+**The open design question** — how the player interacts with the simulation — is deliberately
+deferred until MPM is solid. The expected direction is collision/resolution driven by MPM state
+rather than a separately-extracted surface bitmap, which is why this was cut now rather than patched:
+a direct-MPM query needs the region addressing that dynamic region building will build.
 
 ---
 
@@ -450,7 +460,7 @@ a surface voxel first.
 - Compute raymarcher: one dispatch per frame into an output buffer, downloaded and blitted.
 - Binds `_voxel_buf_a`, `_chunk_table`, the material color table, cursor/debug/active-chunk buffers.
 - Uniform set cached; rebuilt only when a bound RID changes.
-- Debug overlays: chunk borders, active-chunk tint, material hide (bitmask), collision tint.
+- Debug overlays: chunk borders, active-chunk tint, material hide (bitmask).
 - The CA punch "density_touch" tint (binding 11) was removed with the CA solvers.
 
 ---
@@ -493,8 +503,9 @@ separate simple paths. Both are unbuilt today, so nothing was lost.
 `GranularSimulation`/`FluidSimulation` nodes in `world.tscn`; the CA-only debug keys.
 
 **Kept deliberately:** `docs/BUG_LOG.md` (institutional memory — the asset the rewrite is for),
-`edit_apply.comp`, `surface_extract.comp`, `patch_apply.comp`, the raymarcher, `ChunkManager`,
-`WorldOrchestrator`, `VoxelMover`, and all solver-agnostic infrastructure.
+`edit_apply.comp`, `patch_apply.comp`, the raymarcher, `ChunkManager`, `WorldOrchestrator`, and all
+solver-agnostic infrastructure. (`surface_extract.comp` and `VoxelMover` were kept at S5 but have
+since been deleted with the collision layer — §5.)
 
 ---
 
@@ -652,8 +663,7 @@ hide-material tool that cleared voxels to air was rejected for exactly that reas
 | `shaders/raymarch.comp` | the render shader |
 | `shaders/edit_apply.comp` | player-edit writes |
 | `shaders/patch_apply.comp` | changelog → canonical buffer |
-| `shaders/surface_extract.comp` | collision surface extraction |
-| `Player/voxel_mover.gd` | CPU AABB player movement over the surface cache |
+| `Player/player_controller.gd` | free-fly camera + edit input |
 | `world.gd` | test hotkeys, region dump |
 | `world.tscn` | the running scene |
 
