@@ -104,6 +104,22 @@ var _timescale_index: int = 0
 # see whether particles or grid nodes dominate before spending fidelity here.
 @export var promote_stride: int = 1
 
+@export_group("Particle density")
+# PARTICLES PER VOXEL, per axis. 1 = one particle per voxel per axis (the current default, and
+# MPM's minimum — the reference implementation this port follows uses 2, i.e. EIGHT particles per
+# cell). Total mass and volume are conserved: each sub^3 group shares the voxel's mass.
+#
+# Why this exists as an experiment: with one particle per cell, a particle at a free surface has
+# only part of its 3x3x3 gathering stencil populated. Pressure is scattered into nodes weighted by
+# mass, so the empty half of the stencil contributes gravity but no pressure — the surface
+# particle's velocity is diluted toward "no pressure", and the body spreads into a film instead of
+# holding depth. That is the leading explanation for the pancake, and this knob tests it directly:
+# if subdiv 2 stops the filming, the container/window was never the problem.
+#
+# COST: sub^3 times the particles (2 = 8x). Particle work is the cheaper half of the loop — the
+# grid passes are unchanged — but max_particles must be raised to match, or seeding truncates.
+@export_range(1, 3, 1) var particle_subdiv: int = 1
+
 # MINIMUM region size, in chunks. This is a FLOOR, not the size: the region starts at the extent
 # of the edit that created it (never smaller than this) and then grows on evidence.
 #
@@ -785,11 +801,14 @@ func _free_region_buffers(w: ChunkRegion) -> void:
 # pre-existing pond is picked up too, including ponds in the NEIGHBOURING chunks that share
 # this grid (which is the point: they're one body of water now).
 func promote_existing_voxels(w: ChunkRegion, chunks: Array[Vector3i]) -> int:
-	var found_pos: Array[Vector3i] = []
-	var found_mat: Array[int] = []
 	var st := maxi(promote_stride, 1)
+	var sub := maxi(particle_subdiv, 1)
+	var pos: Array[Vector3] = []
+	var mats: Array[int] = []
+	var mss: Array[float] = []
 	var st_v := float(st)
-	var st_mass := float(st * st * st)
+	var st_vol := float(st * st * st)
+	var sub_vol := float(sub * sub * sub)
 	for cp in chunks:
 		var origin := cp * n_grid
 		_orchestrator.sync_chunk_to_cpu(cp)  # block_data is stale-by-design (CLAUDE.md)
@@ -798,20 +817,25 @@ func promote_existing_voxels(w: ChunkRegion, chunks: Array[Vector3i]) -> int:
 				for lx in range(0, n_grid, st):
 					var wp := origin + Vector3i(lx, ly, lz)
 					var mat := _orchestrator.query_voxel_material(wp)
-					if _is_mpm_material(mat):
-						found_pos.append(wp)
-						found_mat.append(mat)
+					if not _is_mpm_material(mat):
+						continue
+					var def := _material_db.get_def(mat)
+					# Split the sampled block's mass across sub^3 particles, so total mass and total
+					# volume are unchanged. See particle_subdiv's declaration.
+					var mass_each := def.mpm_density * p_vol * st_vol / sub_vol
+					for sz in sub:
+						for sy in sub:
+							for sx in sub:
+								var off := (Vector3(sx, sy, sz) + Vector3(0.5, 0.5, 0.5)) * (st_v / float(sub))
+								pos.append(Vector3(wp - w.origin) + off)
+								mats.append(mat)
+								mss.append(mass_each)
 
-	var n := found_pos.size()
+	var n := pos.size()
 	if n == 0:
 		return 0
 	seed_particles(w, n, func(i: int) -> Dictionary:
-		var wp := found_pos[i]
-		var mat_id := found_mat[i]
-		var def := _material_db.get_def(mat_id)
-		# Block CENTRE when sampling above one voxel per particle, region-local.
-		var local := Vector3(wp - w.origin) + Vector3(0.5, 0.5, 0.5) * st_v
-		return {"pos": local, "mat": mat_id, "mass": def.mpm_density * p_vol * st_mass}
+		return {"pos": pos[i], "mat": mats[i], "mass": mss[i]}
 	)
 	return n
 
@@ -940,6 +964,8 @@ func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> 
 	var add_pos: Array[Vector3] = []
 	var add_mat: Array[int] = []
 	var add_mass: Array[float] = []
+	var sub := maxi(particle_subdiv, 1)
+	var sub_vol := float(sub * sub * sub)
 	for idx in positions.size():
 		var mat_id: int = material_ids[idx]
 		if not _is_mpm_material(mat_id):
@@ -952,9 +978,14 @@ func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> 
 		if not _region_covers(cp):
 			continue
 		var def := _material_db.get_def(mat_id)
-		add_pos.append(_region_local(wp))
-		add_mat.append(mat_id)
-		add_mass.append(def.mpm_density * p_vol)
+		var local := _region_local(wp) - Vector3(0.5, 0.5, 0.5)  # voxel corner, for subdivision
+		var mass_each := def.mpm_density * p_vol / sub_vol
+		for sz in sub:
+			for sy in sub:
+				for sx in sub:
+					add_pos.append(local + (Vector3(sx, sy, sz) + Vector3(0.5, 0.5, 0.5)) / float(sub))
+					add_mat.append(mat_id)
+					add_mass.append(mass_each)
 	_append_particles(_region, add_pos, add_mat, add_mass)
 
 

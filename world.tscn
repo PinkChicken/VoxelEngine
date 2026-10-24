@@ -113,7 +113,6 @@ enabled = false
 
 [node name="MPMSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=918273645]
 script = ExtResource("13_mpm")
-region_chunks = Vector3i(2, 2, 4)
 water_stiffness = 50.0
 
 [node name="MaterialDB" type="Node" parent="." unique_id=1815152731]
