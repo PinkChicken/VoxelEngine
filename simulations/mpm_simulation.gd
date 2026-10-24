@@ -423,7 +423,7 @@ func _is_mpm_material(mat_id: int) -> bool:
 # --- activation (intent only; geometry follows) ---------------------------------------
 
 # Player-independent discovery: checks EVERY currently loaded chunk's cheap, already-maintained
-# active_simulation_mask() (Chunk.rebuild_counts_and_mask(), zero per-voxel scanning) for
+# active_simulation_mask() (Chunk.rebuild_simulation_mask(), one pass at chunk load) for
 # GRANULAR/LIQUID material and requests those chunks. Called once from setup() and again from
 # _on_chunk_loaded() as new chunks stream in — so a persistent lake somewhere the player has
 # never looked still gets discovered and simulated, matching "not player-dependent."

@@ -59,12 +59,12 @@ layout(set = 0, binding = 5, std430) buffer ViewProjBuffer {
 // [8]=transparent flag (0/1).
 layout(set = 0, binding = 6, std430) buffer MaterialBuffer { uint data[]; } materials;
 // Debug output: 32 bytes (8 uint32s) written by the pixel matching debug_pixel_x/y.
-// [0-2]=voxel_xyz, [3]=packed voxel (mat_id|fill|temp|flags), [4]=material_type, [5]=density floatBits, [6]=friction floatBits, [7]=ignition_temp floatBits
+// [0-2]=voxel_xyz, [3]=material id, [4]=material_type, [5]=density floatBits, [6]=friction floatBits, [7]=ignition_temp floatBits
 layout(set = 0, binding = 7, std430) buffer DebugOutput {
     uint debug_x;
     uint debug_y;
     uint debug_z;
-    uint debug_voxel;     // mat_id(0-7) | fill(8-15) | temp(16-23) | flags(24-31)
+    uint debug_voxel;     // material id (0-7)
     uint debug_type;      // material_type
     uint debug_density;   // floatBits
     uint debug_friction;  // floatBits
@@ -104,7 +104,13 @@ uint sample_mat(ivec3 wp, int chunk_size, float chunk_size_f) {
     ivec3 lp = wp - c * chunk_size;
     uint local = uint((lp.z * chunk_size + lp.y) * chunk_size + lp.x);
     uint offset = uint(idx) * uint(chunk_size * chunk_size * chunk_size);
-    return voxels.data[offset + local] & 0xFFu;
+    return voxel_read(offset + local);
+}
+
+// Voxels are packed 4 per u32 (1 byte each = material id); little-endian storage means the
+// CPU's byte-per-voxel block_data uploads pre-packed.
+uint voxel_read(uint flat) {
+    return (voxels.data[flat >> 2u] >> ((flat & 3u) << 3u)) & 0xFFu;
 }
 
 void main() {
@@ -187,7 +193,7 @@ void main() {
         // Front-to-back accumulator for glass: every glass voxel blends a tint into the
         // ray and lets it keep marching instead of terminating, so a wall of any
         // thickness (even a single voxel) still shows some see-through -- a hard opaque
-        // stop at the surface (this material's actual fill=255, no gaps) would otherwise
+        // stop at the surface would otherwise
         // make a thin shell look 100% solid, since there'd be nothing behind the first
         // voxel hit to reveal. Edge voxels (touching a different material, i.e. on the
         // body's real outer surface -- see sample_mat below) use a higher alpha than
@@ -226,12 +232,11 @@ void main() {
             if (cached_chunk_index >= 0) {
                 ivec3 local_voxel_pos = voxel_pos - current_chunk * chunk_size;
                 uint local_buffer_index = uint((local_voxel_pos.z * chunk_size + local_voxel_pos.y) * chunk_size + local_voxel_pos.x);
-                uint voxel_raw = voxels.data[cached_buffer_offset + local_buffer_index];
-                uint mat_id = voxel_raw & 0xFFu;
+                uint mat_id = voxel_read(cached_buffer_offset + local_buffer_index);
 
                 // Render-only hide (see debug_hide_mask above) — treat any material whose
                 // bit is set exactly like air for the rest of this iteration: no color, no
-                // opaque break, ray keeps marching. voxel_raw (used for the debug/cursor
+                // opaque break, ray keeps marching. mat_id (used for the debug/cursor
                 // panel below) is left untouched, but that whole block is itself gated on
                 // mat_id != 0u, so a hidden voxel simply never sets cursor/debug info either.
                 if (mat_id != 0u && ((uint(params.debug_hide_mask) >> mat_id) & 1u) != 0u) {
@@ -371,7 +376,7 @@ void main() {
                             debug.debug_x = uint(voxel_pos.x);
                             debug.debug_y = uint(voxel_pos.y);
                             debug.debug_z = uint(voxel_pos.z);
-                            debug.debug_voxel = voxel_raw;
+                            debug.debug_voxel = mat_id;
                             debug.debug_type = materials.data[mat_id * 9u + 4u];
                             debug.debug_density = materials.data[mat_id * 9u + 5u];
                             debug.debug_friction = materials.data[mat_id * 9u + 6u];

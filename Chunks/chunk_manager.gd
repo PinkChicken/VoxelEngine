@@ -64,7 +64,7 @@ func _process(_delta: float) -> void:
 			new_chunk.voxel_scale = voxel_scale
 			new_chunk.ensure_data(chunk_size)
 			new_chunk.block_data  = block_data
-			new_chunk.rebuild_counts_and_mask(_orchestrator._material_simulation)
+			new_chunk.rebuild_simulation_mask(_orchestrator._material_simulation)
 			chunks[chunk_pos] = new_chunk
 			add_child(new_chunk)
 			_orchestrator._add_chunk_to_grid(chunk_pos)
@@ -140,8 +140,7 @@ func _generate_column(col_x: int, col_z: int) -> Array:
 				for wy in range(fill_start, fill_end + 1):
 					var local_y := wy - offset_y
 					var idx     := (z * cs * cs + local_y * cs + x) * Chunk.VOXEL_STRIDE
-					block_data[idx]     = Chunk.Mat.ROCK
-					block_data[idx + 1] = 255
+					block_data[idx] = Chunk.Mat.ROCK
 
 				# Flat water layer directly on top of the rock surface at this column
 				# (2026-07-03) — starts exactly at `height` (the first air voxel above
@@ -154,8 +153,7 @@ func _generate_column(col_x: int, col_z: int) -> Array:
 						for wy in range(water_start, water_end + 1):
 							var local_y := wy - offset_y
 							var idx     := (z * cs * cs + local_y * cs + x) * Chunk.VOXEL_STRIDE
-							block_data[idx]     = Chunk.Mat.WATER
-							block_data[idx + 1] = 255
+							block_data[idx] = Chunk.Mat.WATER
 
 		results.append([chunk_pos, block_data])
 	return results

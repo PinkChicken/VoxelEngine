@@ -72,6 +72,11 @@ const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGEL
 
 uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
 
+// Voxels are packed 4 per u32 (1 byte each = material id).
+uint voxel_read(uint flat) {
+	return (voxels_a.data[flat >> 2u] >> ((flat & 3u) << 3u)) & 0xFFu;
+}
+
 // Chunk-table world-to-flat addressing (same scheme as the voxel buffer) —
 // duplicated here rather than shared across files, matching this project's existing
 // convention (grid_op.comp already duplicates it rather than using a #include, which GLSL
@@ -127,8 +132,7 @@ void main() {
 	int flat_idx = world_to_flat(world_voxel, vpc);
 	if (flat_idx < 0) return;
 
-	uint cur_voxel = voxels_a.data[flat_idx];
-	uint cur_mat = cur_voxel & 0xFFu;
+	uint cur_mat = voxel_read(uint(flat_idx));
 	if (cur_mat != 0u && mat_model(cur_mat) == MODEL_STATIC) return;  // never touch real terrain
 
 	float mass = float(g_mass.data[idx]) / P.fp_scale;
@@ -171,26 +175,14 @@ void main() {
 			if (mm > best_mass) { best_mass = mm; best_mat = m; }
 		}
 		if (best_mass == 0) return;  // shouldn't happen given mass>=threshold, but stay safe
-		// fill calibration is approximate (brief §37 — this step proves the mechanism writes
-		// correctly, not a tuned visual density; REFERENCE_MASS is a starting point, not a
-		// measured constant). 1..255, never 0 — an occupied cell must never render as air.
-		const float REFERENCE_MASS = 4.0;  // ~settled single-particle mass at this port's p_vol/density scale
-		float fill_f = clamp(mass / REFERENCE_MASS, 0.0, 1.0) * 255.0;
-		uint fill = uint(clamp(fill_f, 1.0, 255.0));
-		// FILL DEADBAND (2026-08-13). Particles jittering by a fraction of a voxel produce a
-		// slightly different mass, hence a slightly different quantised fill, EVERY tick. Each
-		// of those writes registers as a change, which is exactly the signal the region's idle
-		// timer uses — so a settled pool could sit there visibly motionless and still never
-		// sleep. Suppressing sub-threshold fill churn lets the timer actually reach zero.
-		// (Deliberately AFTER `fill` is computed — referencing it earlier is a GLSL parse error,
-		// which is exactly how this first shipped and why MPM refused to bind.)
-		const int FILL_DEADBAND = 2;
-		uint cur_fill = (cur_voxel >> 8u) & 0xFFu;
-		if (best_mat == cur_mat && abs(int(fill) - int(cur_fill)) <= FILL_DEADBAND) return;
-		new_voxel = best_mat | (fill << 8u);
+		// 1 byte per voxel: material id only. With no fill quantisation, a settled cell whose
+		// mass jitters by a fraction no longer registers a change — the region's idle timer
+		// can actually reach zero.
+		if (best_mat == cur_mat) return;
+		new_voxel = best_mat;
 	}
 
-	if (new_voxel == cur_voxel) return;
+	if (new_voxel == cur_mat) return;
 
 	uint log_slot = atomicAdd(changelog.count, 1u);
 	if (log_slot < MAX_CHANGELOG) {

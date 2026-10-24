@@ -49,6 +49,11 @@ const uint MODEL_STATIC = 1u;
 const uint MAT_STRIDE_U32 = 8u;
 uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
 
+// Voxels are packed 4 per u32 (1 byte each = material id).
+uint voxel_read(uint flat) {
+	return (voxels_a.data[flat >> 2u] >> ((flat & 3u) << 3u)) & 0xFFu;
+}
+
 // Chunk-table world-to-flat addressing (same scheme as the voxel buffer).
 int world_to_flat(ivec3 gpos) {
 	int cs = VP.chunk_size;
@@ -70,8 +75,7 @@ bool is_static_node(ivec3 local_node) {
 	ivec3 world_voxel = ivec3(VP.origin_x, VP.origin_y, VP.origin_z) + local_node;
 	int flat_idx = world_to_flat(world_voxel);
 	if (flat_idx < 0) return false;
-	uint voxel = voxels_a.data[flat_idx];
-	uint mat_id = voxel & 0xFFu;
+	uint mat_id = voxel_read(uint(flat_idx));
 	if (mat_id == 0u) return false;
 	return mat_model(mat_id) == MODEL_STATIC;
 }

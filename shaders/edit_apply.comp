@@ -10,6 +10,18 @@ layout(set = 0, binding = 1, std430) buffer EditChangelog  { uint count; uint en
 layout(set = 0, binding = 2, std430) readonly buffer ChunkTableBuf { int data[]; } chunk_table;
 layout(set = 0, binding = 3, std430) readonly buffer EditParamsBuf { int data[]; } ep;
 
+// Voxels are packed 4 per u32 (1 byte each = material id). Writing one byte clears and sets
+// only that byte's bits; two threads touching DIFFERENT bytes of the same word commute.
+uint voxel_read(uint flat) {
+    return (voxels_a.data[flat >> 2u] >> ((flat & 3u) << 3u)) & 0xFFu;
+}
+void voxel_write(uint flat, uint mat) {
+    uint wi = flat >> 2u;
+    uint sh = (flat & 3u) << 3u;
+    atomicAnd(voxels_a.data[wi], ~(0xFFu << sh));
+    atomicOr(voxels_a.data[wi], (mat & 0xFFu) << sh);
+}
+
 // ep layout (int-indexed, each = 4 bytes):
 // [0..2]   center.xyz
 // [3]      shape_type
@@ -82,16 +94,16 @@ void main() {
     int vidx = world_to_flat(gpos);
     if (vidx < 0) return;
 
-    uint current = voxels_a.data[vidx];
-    uint mat_id  = current & 0xFFu;
+    uint current = voxel_read(uint(vidx));
+    uint mat_id  = current;  // 1 byte per voxel: the value IS the material id
     int  op      = ep.data[8];
     uint new_mat = uint(ep.data[9]);
 
     uint new_voxel;
     if (op == OP_ADD) {
         if (mat_id == 0u) {
-            // Air → place new voxel at full fill.
-            new_voxel = new_mat | (255u << 8u);
+            // Air → place the new material.
+            new_voxel = new_mat;
         } else if (mat_id == new_mat) {
             return;  // Same material already here — nothing to do.
         } else {
@@ -101,10 +113,10 @@ void main() {
         if (mat_id == 0u) return;
         new_voxel = 0u;
     } else {
-        new_voxel = new_mat | (255u << 8u);
+        new_voxel = new_mat;
     }
 
-    voxels_a.data[vidx] = new_voxel;
+    voxel_write(uint(vidx), new_voxel);
     uint slot = atomicAdd(changelog.count, 1u);
     if (slot < MAX_CHANGELOG) {
         changelog.entries[slot * 2u]      = uint(vidx);

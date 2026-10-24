@@ -14,8 +14,17 @@ layout(set = 0, binding = 1, std430) readonly buffer Changelog {
     uint entries[];  // interleaved: flat_idx, new_value, flat_idx, new_value ...
 } changelog;
 
+// Voxels are packed 4 per u32 (1 byte each = material id): `flat >> 2` picks the word,
+// `(flat & 3) << 3` the byte within it. Writing one byte means clearing and setting only
+// that byte's bits — two threads touching DIFFERENT bytes of the same word commute, so the
+// two atomics are safe without a lock.
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= changelog.count) return;
-    voxels_a.data[changelog.entries[i * 2u]] = changelog.entries[i * 2u + 1u];
+    uint flat = changelog.entries[i * 2u];
+    uint mat  = changelog.entries[i * 2u + 1u] & 0xFFu;
+    uint wi = flat >> 2u;
+    uint sh = (flat & 3u) << 3u;
+    atomicAnd(voxels_a.data[wi], ~(0xFFu << sh));
+    atomicOr(voxels_a.data[wi], mat << sh);
 }

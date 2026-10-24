@@ -382,9 +382,6 @@ func _update_debug_label(debug_raw: PackedByteArray) -> void:
 		return
 
 	var mat_id = packed_info & 0xFF
-	var fill = (packed_info >> 8) & 0xFF
-	var temperature = (packed_info >> 16) & 0xFF
-	var flags_byte = (packed_info >> 24) & 0xFF
 	var mat_type = debug_raw.decode_s32(16)
 
 	var def = _material_db.get_def(mat_id)
@@ -392,9 +389,9 @@ func _update_debug_label(debug_raw: PackedByteArray) -> void:
 	var type_names := ["SOLID", "FLUID", "EFFECT"]
 	var type_str = type_names[mat_type] if mat_type < type_names.size() else str(mat_type)
 
-	_debug_label.text = "Pos: (%d, %d, %d)\nMaterial: %s (id=%d)\nType: %s\nFill: %d  Temp: %d  Flags: 0x%02X" % [
+	_debug_label.text = "Pos: (%d, %d, %d)\nMaterial: %s (id=%d)\nType: %s" % [
 		debug_raw.decode_s32(0), debug_raw.decode_s32(4), debug_raw.decode_s32(8),
-		mat_name, mat_id, type_str, fill, temperature - 128, flags_byte
+		mat_name, mat_id, type_str
 	]
 
 

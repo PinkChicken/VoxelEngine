@@ -2,7 +2,10 @@
 class_name Chunk extends StaticBody3D
 
 enum Mat { AIR = 0, ROCK = 1, SAND = 2, WATER = 3, GLASS = 4, FIRE = 5, SMOKE = 6, OIL = 7 }
-const VOXEL_STRIDE := 4
+# 1 byte per voxel: just the material id (AIR == 0). The GPU buffer holds these same bytes,
+# packed four to a u32 word — little-endian storage means uploading this array as-is lands
+# pre-packed, and the shaders index it via (flat >> 2) / (flat & 3).
+const VOXEL_STRIDE := 1
 
 
 @export var terrain: Node
@@ -10,64 +13,26 @@ const VOXEL_STRIDE := 4
 
 var block_data: PackedByteArray
 var chunk_size: int = 0
-var _simulation_counts := PackedInt32Array()
 var _simulation_mask: int = 0
 
 
 func active_simulation_mask() -> int:
 	return _simulation_mask
 
-# Set a simulation bit without touching ref counts (lazy path — tolerates false positives).
-# Use when the new material is known from a changelog but old material is not available.
+# Lazy set, tolerates false positives by design — MPM only uses the mask as a cheap
+# "might contain simulated material" pre-filter.
 func mark_simulation_active(sim_class: int) -> void:
 	_simulation_mask |= MaterialDef.SIM_BITS[sim_class]
 
-func _transition_simulation(old_sim: int, new_sim: int) -> void:
-	if old_sim == new_sim:
-		return
-	if old_sim != MaterialDef.SimulationClass.NONE:
-		var idx := old_sim - 1
-		_simulation_counts[idx] -= 1
-		if _simulation_counts[idx] == 0:
-			_simulation_mask &= ~MaterialDef.SIM_BITS[old_sim]
-	if new_sim != MaterialDef.SimulationClass.NONE:
-		var idx := new_sim - 1
-		_simulation_counts[idx] += 1
-		if _simulation_counts[idx] == 1:
-			_simulation_mask |= MaterialDef.SIM_BITS[new_sim]
-
-# Apply a mutation atomically: write voxel + update simulation counts.
-# old_sim / new_sim are SimulationClass values from the material cache.
-# Returns true if the voxel actually changed.
-func apply_mutation(local_idx: int, mat_id: int, fill: int, temp: int, flags: int,
-		old_sim: int, new_sim: int) -> bool:
-	if block_data[local_idx] == mat_id \
-			and block_data[local_idx + 1] == fill \
-			and block_data.decode_s8(local_idx + 2) == temp \
-			and block_data[local_idx + 3] == flags:
-		return false
-	_write_voxel(local_idx, mat_id, fill, temp, flags)
-	_transition_simulation(old_sim, new_sim)
-	return true
-
-func _write_voxel(local_idx: int, mat_id: int, fill: int, temp: int, flags: int) -> void:
-	block_data[local_idx + 0] = mat_id
-	block_data[local_idx + 1] = fill
-	block_data.encode_s8(local_idx + 2, temp)
-	block_data[local_idx + 3] = flags
-
 # One-time init after block_data is populated, and debug drift-check.
-func rebuild_counts_and_mask(material_simulation: PackedInt32Array) -> void:
+func rebuild_simulation_mask(material_simulation: PackedInt32Array) -> void:
 	_simulation_mask = 0
-	_simulation_counts.resize(MaterialDef.SIMULATION_COUNT)
-	_simulation_counts.fill(0)
 	var i := 0
 	while i < block_data.size():
 		var mat_id := block_data[i]
 		if mat_id != 0:
 			var sim := material_simulation[mat_id]
 			if sim != MaterialDef.SimulationClass.NONE:
-				_simulation_counts[sim - 1] += 1
 				_simulation_mask |= MaterialDef.SIM_BITS[sim]
 		i += VOXEL_STRIDE
 
@@ -77,19 +42,10 @@ func _voxel_index(local_x: int, local_y: int, local_z: int) -> int:
 
 
 func get_material_id(local_idx: int) -> int:
-	return block_data[local_idx + 0]
+	return block_data[local_idx]
 
-func get_fill(local_idx: int) -> int:
-	return block_data[local_idx + 1]
-
-func get_temperature(local_idx: int) -> int:
-	return block_data.decode_s8(local_idx + 2)
-
-func get_flags(local_idx: int) -> int:
-	return block_data[local_idx + 3]
-
-func set_voxel(local_idx: int, mat_id: int, fill: int = 255, temp: int = 0, flags: int = 0) -> void:
-	_write_voxel(local_idx, mat_id, fill, temp, flags)
+func set_voxel(local_idx: int, mat_id: int) -> void:
+	block_data[local_idx] = mat_id
 
 
 func ensure_data(cs: int) -> void:
@@ -98,8 +54,6 @@ func ensure_data(cs: int) -> void:
 	chunk_size = cs
 	block_data.resize(cs * cs * cs * VOXEL_STRIDE)
 	block_data.fill(0)
-	_simulation_counts.resize(MaterialDef.SIMULATION_COUNT)
-	_simulation_counts.fill(0)
 	_simulation_mask = 0
 
 
@@ -126,7 +80,7 @@ func generate_chunk(cs: int, world_size: Vector3) -> void:
 			if fill_start > fill_end:
 				continue
 			for wy in range(fill_start, fill_end + 1):
-				set_voxel(_voxel_index(x, wy - offset_y, z), Mat.ROCK, 255, 0, 0)
+				set_voxel(_voxel_index(x, wy - offset_y, z), Mat.ROCK)
 
 	if Engine.is_editor_hint():
 		build_editor_mesh()
@@ -219,7 +173,7 @@ func add_voxel(local_pos: Vector3, material: int = Mat.SAND) -> void:
 	var local_x = int(local_pos.x)
 	var local_y = int(local_pos.y)
 	var local_z = int(local_pos.z)
-	set_voxel(_voxel_index(local_x, local_y, local_z), material, 255, 0, 0)
+	set_voxel(_voxel_index(local_x, local_y, local_z), material)
 
 
 func remove_voxel(local_pos: Vector3) -> void:
@@ -229,4 +183,4 @@ func remove_voxel(local_pos: Vector3) -> void:
 func remove_voxels(local_positions: Array) -> void:
 	for pos in local_positions:
 		var idx = _voxel_index(int(pos.x), int(pos.y), int(pos.z))
-		set_voxel(idx, 0, 0, 0, 0)
+		set_voxel(idx, 0)

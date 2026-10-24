@@ -15,8 +15,6 @@ enum SimulationClass {
 	EFFECT   = 4,  # fire, sparks
 }
 
-const SIMULATION_COUNT := 5  # size of simulation_counts array in Chunk
-
 # Precomputed bitmask for each SimulationClass, indexed by value.
 # SIM_BITS[NONE]=0, SIM_BITS[GRANULAR]=1, SIM_BITS[LIQUID]=2, SIM_BITS[GAS]=4, SIM_BITS[EFFECT]=8
 const SIM_BITS: Array[int] = [0, 1, 2, 4, 8]

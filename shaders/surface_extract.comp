@@ -23,6 +23,12 @@ layout(set = 0, binding = 2, std430) readonly buffer ExtractParams {
 } params;
 layout(set = 0, binding = 3, std430) readonly buffer SlotList     { int  data[]; } slot_list;
 
+// Voxels are packed 4 per u32 (1 byte each = material id); little-endian storage means the
+// CPU's byte-per-voxel block_data uploads pre-packed.
+uint voxel_read(uint flat) {
+    return (voxels.data[flat >> 2u] >> ((flat & 3u) << 3u)) & 0xFFu;
+}
+
 void main() {
     int chunk_idx  = int(gl_WorkGroupID.x) / 4;
     int wg_x_local = int(gl_WorkGroupID.x) % 4;
@@ -41,8 +47,7 @@ void main() {
 
     int vpc        = cs * cs * cs;
     int local_flat = local_pos.z * cs * cs + local_pos.y * cs + local_pos.x;
-    uint voxel     = voxels.data[slot * vpc + local_flat];
-    uint mat_id    = voxel & 0xFFu;
+    uint mat_id    = voxel_read(uint(slot * vpc + local_flat));
     if (mat_id == 0u) return;
 
     bool exposed = false;
@@ -57,7 +62,7 @@ void main() {
             exposed = true;
         } else {
             int nflat = nz * cs * cs + ny * cs + nx;
-            if ((voxels.data[slot * vpc + nflat] & 0xFFu) == 0u)
+            if (voxel_read(uint(slot * vpc + nflat)) == 0u)
                 exposed = true;
         }
     }

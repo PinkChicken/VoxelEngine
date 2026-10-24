@@ -39,15 +39,14 @@ changelog); rendering and collision read from it. Nothing else is shared.
 
 ### 2.1 Voxel storage (`Chunks/chunk_instance.gd`, `chunk_manager.gd`)
 
-- 32³ chunks, `VOXEL_STRIDE = 4`: `[material_id, fill, temperature, flags]`.
-- **AIR is exactly `0u` in all four bytes** — the empty-voxel invariant (a 32-bit zero test).
-- **Effective usage is 1 of 4 bytes.** `material_id` is the only field the engine needs. `fill` is
-  written by `readout.comp` (mass → quantised fill) but is now **read by nothing** — the LIQUID
-  fill tint was removed 2026-08-13, along with `edit_apply.comp`'s "top up fill" behaviour.
-  `temperature` and `flags` are **unused** — only the generic edit path passes them through, and
-  `readout.comp` zeroes both.
-  Retiring the write side (and `VOXEL_STRIDE` 4 → 1) is the next step: a 4× reduction in the
-  raymarcher's per-sample bandwidth, the biggest per-frame cost (`§9.2`).
+- 32³ chunks, **`VOXEL_STRIDE = 1`: one byte per voxel — the material id.** AIR is `0`.
+- The GPU buffer holds the same bytes, **packed four to a u32**. Little-endian storage means the
+  CPU's byte-per-voxel `block_data` uploads pre-packed, with no CPU pack/unpack step. Shaders index
+  it as `data[flat >> 2] >> ((flat & 3) << 3)`; writes are `atomicAnd` + `atomicOr` on one byte,
+  which is safe because two threads touching *different* bytes of a word commute.
+- This replaced the old 4-byte word `[material_id, fill, temperature, flags]`. `fill` lost its last
+  reader (the LIQUID depth tint) and `temperature`/`flags` were never read, so all three were
+  retired — voxel-buffer memory and raymarcher bandwidth are both **4× smaller** (`§9.2`).
 - `_voxel_buf_a` is the persistent world: the renderer binds it, collision extracts from it, MPM
   writes to it (see §10.2 for what "persistent" means versus particles).
 - Per-chunk `_simulation_mask` (a bitmask of which material *classes* are present) and
@@ -57,7 +56,7 @@ changelog); rendering and collision read from it. Nothing else is shared.
 
 ### 2.2 Materials (`material_def.gd`, `material_db.gd`)
 
-Materials are identity only: phase, simulation class, gravity, color, flow, density, plus the MPM
+Materials are identity only: phase, simulation class, gravity, color, plus the MPM
 physics fields. No simulation state lives in a material. Mirrored to the GPU as two tables:
 
 - **`buffer_rid`** (32 B/material) — color + the CA-era render/sim fields the raymarcher still reads.
@@ -232,13 +231,14 @@ survives as voxels; a later edit re-activates it. There is no per-chunk deactiva
 Note: with `viscosity 3` and no surface tension, a residual ~0.14 voxel/s jitter floor means the
 region never fully sleeps in practice. This is known, not a bug.
 
-**Known limitation — the sleep/wake bridge is lossy, and that is where conservation can break.**
-`readout.comp` quantises mass into the `fill` byte. `promote_existing_voxels()` **never reads
-`fill`** — each MPM voxel becomes a full-mass particle set on wake (`mass_each = density · p_vol`).
-So "mass is conserved by construction" is a **particle-domain** claim: it holds within one region
-life, not across a destroy → re-promote cycle. The S0/S1 exact-mass results were all measured inside
-a single life and do not exercise this. Either make promotion fill-aware or measure/bound the drift
-before trusting a long-lived world.
+**Known limitation — the sleep/wake bridge loses velocity and re-quantises mass.**
+`readout` writes material identity per cell (no mass, no velocity, no `C`/`J`/`F`).
+`promote_existing_voxels()` seeds **one full-mass particle per occupied cell** on wake
+(`mass_each = density · p_vol`). So the bridge is *material-exact* but *mass-quantised*: a thin
+film spread over several cells becomes a full particle in each on wake. "Mass is conserved by
+construction" is therefore a **particle-domain** claim — it holds within one region life, not
+across a destroy → re-promote cycle. The S0/S1 exact-mass results were all measured inside a single
+life and do not exercise this.
 
 ### 4.6 The five passes
 
@@ -264,9 +264,10 @@ outward velocity.
 **`g2p.comp`** — gather velocity + APIC affine `C` from the 3×3×3 neighbourhood; `pos += dt·vel`
 clamped to `[0, dims)`; FLUID `J *= 1 + dt·trace(C)`; GRANULAR/ELASTIC `F ← (I + dt·C)F`.
 
-**`readout.comp`** — per node: argmax over `g_mass_mat` for the dominant material, mass → fill
-(1..255), write through the shared changelog. Guards: never overwrite STATIC voxels; `FILL_DEADBAND
-= 2` suppresses sub-threshold churn so a settled pool can reach idle; sets occupancy and face bits.
+**`readout.comp`** — per node: argmax over `g_mass_mat` for the dominant material, write the
+material id through the shared changelog. Guards: never overwrite STATIC voxels; a cell only writes
+when its *material* changes (no mass quantisation, so a settled pool's jitter registers nothing and
+the idle timer can reach zero); sets occupancy and face bits.
 Suspended entirely if `n_particles >= max_particles` (writing air over material the sim cannot
 represent would destroy it).
 
@@ -420,7 +421,7 @@ parentheses; `world.tscn` overrides several.
 
 Constants not exposed: `MAX_REGION_NODES` (1,048,576), `NODE_BUDGET` (1e6), `NMAT` (8),
 `DIRTY_BUF_BYTES`/`OCCUPANCY_BYTES` (64), `PUSH_SPEED` (0.5, grid_op), `MASS_THRESHOLD` (1e-6),
-`FILL_DEADBAND` (2), the speed clamp (200 voxel/s).
+the speed clamp (200 voxel/s).
 
 ---
 
@@ -516,10 +517,8 @@ in the order the pillars favour them:
 Also open:
 - **Sparse memory resize** — shrink grid buffers to `num_blocks × 32³` (captures the memory win S1
   phase 2 deferred).
-- **Fill-aware promotion** — §4.5's lossy sleep/wake bridge; either read `fill` in
-  `promote_existing_voxels()` or measure and bound the drift.
-- **Voxel word shrink (4 → 1 byte)** — `fill`'s last reader (the liquid tint) is gone; only the
-  write side and `VOXEL_STRIDE = 4` remain (§2.1). This is the 4× raymarcher bandwidth win.
+- **Mass-aware promotion** — §4.5's sleep/wake bridge re-quantises mass (one full particle per
+  occupied cell on wake). Measure the drift, or track per-cell mass to make wake exact.
 - **Sand repose validation** alongside water.
 - **Optimization pass** (§9) — re-derive; the CA-derived costs are gone.
 
@@ -585,10 +584,10 @@ never downloaded. But the per-tick active-block set *is* built on the CPU from t
 occupancy mask (64 B) and re-uploaded — a real per-tick GPU→CPU→GPU round trip. Bounded and
 intentional; it is "GPU simulates, CPU schedules", not "GPU-primary".
 
-**10.6 Materials are identity, not state; the voxel word is `material_id`.** A material holds
-properties; a voxel holds identity. `fill` is render-only (liquid tint) and `temperature`/`flags`
-are unused (§2.1) — they are not engine state and must not be written to or read as if they were.
-The MPM dispatch is table-driven (`mpm_buffer_rid`), nothing hardcoded by material id.
+**10.6 Materials are identity, not state; a voxel is one byte: `material_id`.** A material holds
+properties; a voxel holds identity. The old `fill`/`temperature`/`flags` bytes are gone (§2.1) —
+none of them were ever engine state. The MPM dispatch is table-driven (`mpm_buffer_rid`), nothing
+hardcoded by material id.
 
 **10.7 AIR = 0u as an empty-test invariant.** All air voxels are exactly zero. The original rationale
 (CAS) died with the CA solver; it survives because it makes "is this voxel empty" a 32-bit zero test
@@ -643,7 +642,7 @@ hide-material tool that cleared voxels to air was rejected for exactly that reas
 | `shaders/mpm/p2g.comp` | particle → grid scatter, all material stress models |
 | `shaders/mpm/grid_op.comp` | grid velocity, gravity, face push, boundary band |
 | `shaders/mpm/g2p.comp` | grid → particle gather, state advance |
-| `shaders/mpm/readout.comp` | grid → voxels, occupancy, fill deadband |
+| `shaders/mpm/readout.comp` | grid → voxels, occupancy, dirty chunks |
 | `simulations/simulation_runtime.gd` | tick scheduling, MPM perf timing |
 | `simulations/edit_dispatcher.gd` | player edits → `edit_apply.comp` + signals |
 | `material_db.gd` | the 32 B/material MPM + color tables |

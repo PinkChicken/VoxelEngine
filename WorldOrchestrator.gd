@@ -205,12 +205,13 @@ func sync_chunk_to_cpu(chunk_pos: Vector3i) -> void:
 	if not chunk:
 		return
 	var cs := _chunk_manager.chunk_size
-	var byte_offset = slot * cs * cs * cs * 4
-	var byte_count  := cs * cs * cs * 4
+	var byte_offset = slot * cs * cs * cs
+	var byte_count  := cs * cs * cs
 	var gpu_data: PackedByteArray = _compute.download_range(_voxel_buf_a, byte_offset, byte_count)
-	# Repack GPU u32 format into 4-byte block_data (same layout — direct copy).
+	# 1 byte per voxel — the GPU buffer holds the same bytes (packed 4 to a u32), so this is
+	# a direct copy back into block_data.
 	chunk.block_data = gpu_data
-	chunk.rebuild_counts_and_mask(_material_simulation)
+	chunk.rebuild_simulation_mask(_material_simulation)
 
 
 func _load_patch_shader() -> String:
@@ -320,14 +321,14 @@ func edit_add_voxel(pos: Vector3i, mat: int) -> void:
 	_edit_dispatcher.apply_immediate(
 		EditDispatcher.EditRequest.new(pos, EditDispatcher.EditShape.BOX,
 			Vector4(0, 0, 0, 0), EditDispatcher.EditOp.ADD, mat))
-	_write_voxel_block_data(pos, mat, 255)
+	_write_voxel_block_data(pos, mat)
 
 func edit_remove_voxel(pos: Vector3i) -> void:
 	if not _edit_dispatcher: return
 	_edit_dispatcher.apply_immediate(
 		EditDispatcher.EditRequest.new(pos, EditDispatcher.EditShape.BOX,
 			Vector4(0, 0, 0, 0), EditDispatcher.EditOp.REMOVE))
-	_write_voxel_block_data(pos, 0, 0)
+	_write_voxel_block_data(pos, 0)
 
 func edit_add_sphere(center: Vector3i, radius: float, mat: int) -> void:
 	if not _edit_dispatcher: return
@@ -380,7 +381,7 @@ func query_voxel_material(world_pos: Vector3i) -> int:
 
 # Write a material change directly into block_data for single-voxel player edits,
 # keeping the CPU mirror current so query_voxel_material sees the change immediately.
-func _write_voxel_block_data(world_pos: Vector3i, mat_id: int, fill: int) -> void:
+func _write_voxel_block_data(world_pos: Vector3i, mat_id: int) -> void:
 	var cs := _chunk_manager.chunk_size
 	var cp := Vector3i(
 		floori(float(world_pos.x) / cs),
@@ -391,9 +392,8 @@ func _write_voxel_block_data(world_pos: Vector3i, mat_id: int, fill: int) -> voi
 		return
 	var lp := world_pos - cp * cs
 	var byte_idx := (lp.z * cs * cs + lp.y * cs + lp.x) * Chunk.VOXEL_STRIDE
-	if byte_idx >= 0 and byte_idx + 1 < chunk.block_data.size():
-		chunk.block_data[byte_idx]     = mat_id
-		chunk.block_data[byte_idx + 1] = fill
+	if byte_idx >= 0 and byte_idx < chunk.block_data.size():
+		chunk.block_data[byte_idx] = mat_id
 
 
 # --- GPU buffer management ---
@@ -432,7 +432,7 @@ func _init_grid() -> void:
 	var capacity := 64
 	while capacity < expected:
 		capacity *= 2
-	var voxel_bytes := capacity * voxels_per_chunk * 4
+	var voxel_bytes := capacity * voxels_per_chunk
 	var voxel_data  := PackedByteArray(); voxel_data.resize(voxel_bytes); voxel_data.fill(0)
 	_voxel_buf_a    = _compute.buffer_upload(voxel_data)
 	_voxel_buf_capacity = capacity
@@ -478,9 +478,9 @@ func _add_chunk_to_grid(chunk_pos: Vector3i) -> void:
 	# Grow voxel buffer if the free pool is exhausted.
 	var cs := _chunk_manager.chunk_size
 	if _free_slots.is_empty():
-		var old_bytes := _voxel_buf_capacity * cs * cs * cs * 4
+		var old_bytes := _voxel_buf_capacity * cs * cs * cs
 		var new_capacity := _voxel_buf_capacity * 2
-		var new_bytes := new_capacity * cs * cs * cs * 4
+		var new_bytes := new_capacity * cs * cs * cs
 		_voxel_buf_a = _compute.buffer_grow(_voxel_buf_a, old_bytes, new_bytes)
 		for i in range(new_capacity - 1, _voxel_buf_capacity - 1, -1):
 			_free_slots.append(i)
@@ -502,7 +502,7 @@ func _add_chunk_to_grid(chunk_pos: Vector3i) -> void:
 	var slot_bytes := PackedByteArray(); slot_bytes.resize(4)
 	slot_bytes.encode_s32(0, slot)
 	_compute.buffer_update(_chunk_table, flat_idx * 4, slot_bytes)
-	_compute.buffer_update(_voxel_buf_a, slot * cs * cs * cs * 4, chunk.block_data)
+	_compute.buffer_update(_voxel_buf_a, slot * cs * cs * cs, chunk.block_data)
 	chunk_loaded.emit(chunk_pos)
 
 
@@ -518,7 +518,7 @@ func _update_chunk_in_grid(chunk_pos: Vector3i) -> void:
 	if not chunk:
 		return
 	var cs := _chunk_manager.chunk_size
-	_compute.buffer_update(_voxel_buf_a, slot * cs * cs * cs * 4, chunk.block_data)
+	_compute.buffer_update(_voxel_buf_a, slot * cs * cs * cs, chunk.block_data)
 
 
 func _remove_chunk_from_grid(chunk_pos: Vector3i) -> void:
@@ -537,8 +537,8 @@ func _remove_chunk_from_grid(chunk_pos: Vector3i) -> void:
 
 	# Zero and reclaim the voxel buffer slot.
 	var cs := _chunk_manager.chunk_size
-	var zero_data := PackedByteArray(); zero_data.resize(cs * cs * cs * 4); zero_data.fill(0)
-	_compute.buffer_update(_voxel_buf_a, slot * cs * cs * cs * 4, zero_data)
+	var zero_data := PackedByteArray(); zero_data.resize(cs * cs * cs); zero_data.fill(0)
+	_compute.buffer_update(_voxel_buf_a, slot * cs * cs * cs, zero_data)
 
 	_free_slots.append(slot)
 	_chunk_to_slot.erase(chunk_pos)
