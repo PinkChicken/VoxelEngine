@@ -1096,22 +1096,15 @@ func tick_all(substeps_per_tick: int) -> void:
 	_run_region_substeps(w, substeps_per_tick)
 	var changed := _readout_region(w)
 
-	# FOLLOW THE MATERIAL OUTWARD — if anything changed on a face of the region's bounding box,
-	# grow in that direction. The first version of this only grew downward, which is exactly why
-	# water hit a side wall, flowed the one way a chunk happened to already be active, and not
-	# the other. See _ensure_region().
-	#
-	# Release runs FIRST so a stream that has moved on frees its chunks before we consider growing
-	# into new ones — otherwise the box only ever inflates.
-	# FIXED WINDOW, TRANSLATING. No growth, no release — see _ensure_region()'s header for why no
-	# growth criterion can work (pressure on a wall is indistinguishable from pressure into
-	# space). Rate-limited so a centroid that hovers on a chunk boundary cannot reallocate every
-	# tick: a rebuild is state-preserving but it does reallocate every buffer.
+	# REGION GEOMETRY UPDATE — the whole "which chunks are active" decision, once per tick.
+	# _ensure_region() either GROWS the window toward material touching a face (grow_window) or
+	# SHIFTS it one chunk that way. Rate-limited because a rebuild reallocates every grid and
+	# particle buffer. If it returns true, `w` is stale.
 	if _recenter_cooldown > 0:
 		_recenter_cooldown -= 1
 	elif _ensure_region():
 		_recenter_cooldown = 10
-		return  # the window moved; `w` is stale from here on
+		return  # the region was rebuilt; `w` is stale from here on
 
 	# IDLE DETECTION — cheap signal first. An empty readout dirty-set means the grid wrote
 	# nothing back this tick, which needs no extra GPU→CPU round trip because the bitmask was
