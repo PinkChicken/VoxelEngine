@@ -1357,8 +1357,11 @@ func region_grid_info() -> Dictionary:
 		"occupied": _region.occupied.size(),
 		# Window extent in CHUNK coords, so the dump shows where the box actually is relative to
 		# wherever material was dropped.
+		# Extent in CHUNK coords, derived from the region's ACTUAL dims. It must not use the
+		# region_chunks export: that is only the floor, and once growth has run the real window is
+		# larger, which made the dump print a 1x1x1 range next to dims=(64,64,64).
 		"window_min": Vector3i(_region.origin.x / n_grid, _region.origin.y / n_grid, _region.origin.z / n_grid),
-		"window_max": Vector3i(_region.origin.x / n_grid, _region.origin.y / n_grid, _region.origin.z / n_grid) + region_chunks - Vector3i.ONE,
+		"window_max": Vector3i(_region.origin.x / n_grid, _region.origin.y / n_grid, _region.origin.z / n_grid) + (_region.dims / n_grid) - Vector3i.ONE,
 		"region_chunks": region_chunks,
 		"occupied_list": _region.occupied.keys(),
 	}

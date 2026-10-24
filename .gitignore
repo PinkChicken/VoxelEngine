@@ -28,6 +28,10 @@ CLAUDE.md
 # The MPM cutover plan is tracked alongside them (not local-only): it is the tracked
 # counterpart to the local MPM_EVALUATION_BRIEF.md, and the brief stays untracked.
 !docs/MIGRATION_MPM.md
+# Solver design reference — how the MPM pipeline works today plus every allocation
+# strategy already tried and why it failed. Tracked because losing it means re-trying
+# the same dead ends.
+!docs/MPM_SOLVER_DESIGN.md
 
 # Local-only: REA ("Reverse Engineer Anything") third-party MCP tool checkout —
 # ~58 MB / 4.7k files, MIT, unpacked without a .git. Analysis tooling, not
