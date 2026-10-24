@@ -82,6 +82,12 @@ layout(set = 0, binding = 9, std430) readonly buffer ActiveChunksBuf {
     int positions[];
 } active_chunks_buf;
 
+// Voxels are packed 4 per u32 (1 byte each = material id); little-endian storage means the
+// CPU's byte-per-voxel block_data uploads pre-packed.
+uint voxel_read(uint vox_idx) {
+    return (voxels.data[vox_idx >> 2u] >> ((vox_idx & 3u) << 3u)) & 0xFFu;
+}
+
 // General-purpose "material at an arbitrary world voxel position" lookup, used by the
 // glass edge test below to check a hit voxel's 6 face-neighbours (which may be outside
 // the chunk currently cached by the main DDA loop). Out-of-range positions (no chunk
@@ -100,12 +106,6 @@ uint sample_mat(ivec3 wp, int chunk_size, float chunk_size_f) {
     uint local = uint((lp.z * chunk_size + lp.y) * chunk_size + lp.x);
     uint offset = uint(idx) * uint(chunk_size * chunk_size * chunk_size);
     return voxel_read(offset + local);
-}
-
-// Voxels are packed 4 per u32 (1 byte each = material id); little-endian storage means the
-// CPU's byte-per-voxel block_data uploads pre-packed.
-uint voxel_read(uint vox_idx) {
-    return (voxels.data[vox_idx >> 2u] >> ((vox_idx & 3u) << 3u)) & 0xFFu;
 }
 
 void main() {
