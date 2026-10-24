@@ -609,3 +609,18 @@ water per tick" are, in order:
    "way more water" — particles dominate now. S1 matters when the node box is the cost, e.g.
    scattered small bodies, not one dense basin.
 
+### Next step is S1, not S3 — the cost split decides
+
+`promote_stride = 2` validated S3-in-embryo (8× water per particle, "looks really good"), so
+the coarse-resolution lever is already proven. The remaining pain is SPATIAL: one bounded
+region. The cost split says which fix that is:
+
+- **Sparse water** (1,740 particles in a mostly-empty 64³ region): ~2.5 ms, of which ~2.4 ms
+  is NODES — the empty bounding box. Node-bound → **S1 (sparse grid) is the fix.**
+- **Dense basin** (80k particles filling 64³): ~9.5 ms, ~75% particles. Particle-bound → LOD.
+
+The user's goal is a dynamic world of scattered material, i.e. the SPARSE case, so **S1 is the
+correct next step** and the earlier "S3 first" ordering was answering the dense-basin question.
+S1 must remain one shared sparse index (not per-block grids — §7.1), gated on "sparse ≈ dense
+on the same particle set".
+
