@@ -110,7 +110,6 @@ func _process(delta: float) -> void:
 		_edit_dispatcher.process_queue()
 	if _runtime:
 		_runtime.run(delta)
-	commit()
 
 
 # --- GPU buffer public API ---
