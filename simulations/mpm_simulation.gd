@@ -1031,14 +1031,22 @@ func _build_region_sets(w: ChunkRegion) -> void:
 # dispatch, or a null uniform set. Rebind whenever the handle changes. (The other reallocation
 # path, _init_grid from slab_invalidated, tears the region down instead — see setup().)
 func _rebind_voxel_world(w: ChunkRegion) -> void:
-	var vb := _orchestrator.get_voxel_buf()
-	var ct := _orchestrator.get_chunk_table()
-	if vb == w.voxel_buf_a and ct == w.chunk_table:
+	# A uniform set is auto-invalidated by the RD when ANY buffer it binds is freed, so checking
+	# the sets themselves is the general test — it catches the voxel buffer growing, the chunk
+	# table being rebuilt, and the material table being re-uploaded, not just the handles
+	# compared explicitly below. set_grid_op and set_readout are the two sets that bind
+	# orchestrator-owned buffers (voxel buffer, chunk table, material table, changelog).
+	var stale := not _compute.uniform_set_is_valid(w.set_grid_op) \
+			or not _compute.uniform_set_is_valid(w.set_readout)
+	if not stale:
+		stale = (w.voxel_buf_a != _orchestrator.get_voxel_buf()
+			or w.chunk_table != _orchestrator.get_chunk_table())
+	if not stale:
 		return
-	w.voxel_buf_a = vb
-	w.chunk_table = ct
-	# Do NOT free the old sets: the RD auto-invalidates a uniform set when a buffer it binds is
-	# freed, and freeing an already-invalidated set errors ("Attempted to free invalid ID").
+	w.voxel_buf_a = _orchestrator.get_voxel_buf()
+	w.chunk_table = _orchestrator.get_chunk_table()
+	# Do NOT free the old sets: the RD already invalidated them, and freeing an invalidated set
+	# errors ("Attempted to free invalid ID").
 	_build_region_sets(w)
 
 

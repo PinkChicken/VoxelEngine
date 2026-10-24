@@ -142,6 +142,14 @@ func free_rid(rid: RID) -> void:
 	rd.free_rid(rid)
 
 
+# A uniform set becomes INVALID when any buffer it binds is freed (the RD auto-invalidates it).
+# Callers use this to detect that a set must be rebuilt after a buffer was reallocated.
+func uniform_set_is_valid(set_rid: RID) -> bool:
+	if not set_rid.is_valid():
+		return false
+	return rd.uniform_set_is_valid(set_rid)
+
+
 func buffer_grow(old_rid: RID, old_size: int, new_size: int) -> RID:
 	var padded := rd.buffer_get_data(old_rid, 0, old_size)
 	padded.resize(new_size)  # resize() zero-fills the new tail — no per-byte copy needed.
