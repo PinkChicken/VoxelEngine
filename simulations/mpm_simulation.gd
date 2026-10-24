@@ -28,7 +28,7 @@ class_name MPMSimulation extends Node
 # Grids are no longer cubes (`dims: Vector3i`), which is the whole shader-side change.
 #
 # TRADEOFF, stated rather than hidden: a single region is the bounding box of ALL active chunks,
-# so two far-apart puddles waste grid between them. With max_active_chunks small and contiguous
+# so two far-apart puddles waste grid between them. With contiguous
 # material (a lake, a waterfall) this is nothing; MAX_REGION_NODES bounds the pathological case
 # by refusing to grow rather than allocating gigabytes. The refinement — one region per
 # CONNECTED component (union-find over face-adjacency) — is deliberately deferred: it multiplies
@@ -85,12 +85,6 @@ var _timescale_index: int = 0
 # promotion scan fills in ascending y, so overflow truncated the TOP of a poured sphere. 64K
 # holds two full chunks; raising it costs ~7 MB of particle buffers per region.
 @export var max_particles: int = 65536
-# Cap on how many chunks may be active at once (bounds the region's grid). 8 was too tight for
-# anything but an isolated puddle: water reaching the edge of an un-simulated chunk sees a hard
-# wall and piles up it, which is the "climbs up that wall" report. 16 doubles the reach without
-# letting the bounding box get big enough to tank the per-substep dispatch cost — the real
-# driver of cost is the BOX, not the chunk count, so this is a balance point, not a free win.
-@export var max_active_chunks: int = 16
 
 # PROMOTION SAMPLING STRIDE. 1 = one particle per voxel (full fidelity). N = one particle per
 # NxNxN voxel block: N^3 fewer particles, each carrying N^3 times the mass, on the SAME grid
@@ -129,16 +123,6 @@ var _timescale_index: int = 0
 @export var region_chunks: Vector3i = Vector3i(1, 1, 1)
 
 @export_group("Region growth")
-# Grow the window when material touches a face — a chunk the material has actually reached becomes
-# part of the simulated volume. This is the CA-style "add the chunk the material moved into",
-# expressed at region granularity because MPM needs one contiguous grid.
-#
-# GROWTH IS DRIVEN BY THE SIMULATION, not by the edit: readout.comp reports per-chunk occupancy
-# each tick, and _growth_for() grows toward whichever faces hold material.
-#
-# BOUNDED by max_axis_chunks and MAX_REGION_NODES. That ceiling is what the original growth
-# implementation lacked, and its absence (not growth itself) produced the runaway.
-@export var grow_window: bool = true
 # Ceiling per axis. 3 = up to 96^3 (884,736 nodes, ~5 ms).
 #
 # TEST-HARNESS UNBLOCK, not an architectural change: raised 2 -> 3 so large bodies can be
@@ -252,6 +236,7 @@ class ChunkRegion:
 	var block_list: RID
 	var num_blocks: int = 0
 	var total_blocks: int = 0
+	var block_set_sig: int = 0
 	var voxel_params_buf: RID; var voxel_buf_a: RID; var chunk_table: RID; var dirty_chunks_buf: RID
 	# 6-bit "material touched this face plane" mask written by readout.comp, downloaded each tick
 	# and consumed by _growth_for(). Reset per readout.
@@ -269,7 +254,6 @@ var _region: ChunkRegion = null
 # Chunks that currently WANT to be simulated. Region geometry is always derived from this set,
 # never edited directly — _ensure_region() is the only thing that builds grids.
 var _active_chunks: Dictionary = {}  # Vector3i -> true
-var _warned_budget := false
 var _warned_region_cap := false
 var _warned_capacity := false
 # Ticks to wait between window moves. A rebuild reallocates every grid and particle buffer, so a
@@ -416,7 +400,6 @@ func cycle_timescale(substeps: int) -> String:
 func reset() -> void:
 	_active_chunks.clear()
 	_destroy_region()
-	_warned_budget = false
 	_warned_region_cap = false
 	_warned_capacity = false
 	_recenter_cooldown = 0
@@ -487,14 +470,9 @@ func _would_fit(cp: Vector3i) -> bool:
 # Request a chunk be simulated. Returns true if it is now part of the active set. Adding a
 # chunk changes the region bounding box, so this rebuilds the region (and re-seeds particles
 # from the voxel world) whenever the geometry actually changes.
-func _try_add_chunk(cp: Vector3i, promote: bool = false) -> bool:
+func _try_add_chunk(cp: Vector3i) -> bool:
 	if _active_chunks.has(cp):
 		return true
-	if _active_chunks.size() >= max_active_chunks:
-		if not _warned_budget:
-			push_warning("MPMSimulation: max_active_chunks=%d exhausted, dropping request at %s" % [max_active_chunks, cp])
-			_warned_budget = true
-		return false
 	if not _would_fit(cp):
 		if not _warned_region_cap:
 			push_warning("MPMSimulation: region grid would exceed MAX_REGION_NODES=%d including %s — refusing to grow (far-apart active chunks are the cause; see class header's TRADEOFF)" % [MAX_REGION_NODES, cp])
@@ -511,47 +489,12 @@ func _try_add_chunk(cp: Vector3i, promote: bool = false) -> bool:
 	return true
 
 
-# Promote one chunk's pre-existing MPM material by APPENDING to the live region's particle set.
-func _promote_chunk_voxels(cp: Vector3i) -> void:
-	if _region == null:
-		return
-	var origin := cp * n_grid
-	_orchestrator.sync_chunk_to_cpu(cp)  # block_data is stale-by-design (CLAUDE.md)
-	var pos: Array[Vector3] = []
-	var mats: Array[int] = []
-	var mss: Array[float] = []
-	var st := maxi(promote_stride, 1)
-	var st_v := float(st)
-	var st_mass := float(st * st * st)
-	for ly in range(0, n_grid, st):
-		for lz in range(0, n_grid, st):
-			for lx in range(0, n_grid, st):
-				var wp := origin + Vector3i(lx, ly, lz)
-				var mat := _orchestrator.query_voxel_material(wp)
-				if not _is_mpm_material(mat):
-					continue
-				var def := _material_db.get_def(mat)
-				pos.append(Vector3(wp - _region.origin) + Vector3(0.5, 0.5, 0.5) * st_v)
-				mats.append(mat)
-				mss.append(def.mpm_density * p_vol * st_mass)
-	_append_particles(_region, pos, mats, mss)
-
-
-# FIXED-SIZE SLIDING WINDOW (2026-08-13). Replaces the growing bounding box entirely.
-#
-# Why the bbox had to go: growth had to be decided from contact with the region's own walls, and
-# there is no local measurement that distinguishes "this fluid would keep going if the wall
-# weren't there" from "this fluid is confined" — pressure against a wall IS pressure. Four
-# criteria were tried (chunk changed / mass at plane / mass in band / outward velocity) and every
-# one either never fired or ran away, because a pressurised fluid genuinely does reach every wall
-# at genuine speed. Giving it a bigger box just gave it more room to spread into, which lit the
-# next set of faces. That feedback loop is the "box of spaz", and it is not fixable by a better
-# growth rule — only by not growing.
-#
-# So the window has a FIXED size (region_chunks) and TRANSLATES instead. Cost is decided up front
-# and never changes; there is no growth policy, no release policy, and no resize-under-pressure.
-# Material that leaves the window is written to voxels and frozen, which is the same deal Noita
-# makes with unloaded chunks.
+# The region starts at the edit's extent (floor = region_chunks) and GROWS one chunk toward any
+# face its material touches, bounded by max_axis_chunks per axis and MAX_REGION_NODES overall.
+# Growth is driven by per-chunk occupancy from readout.comp, not wall-contact velocity: earlier
+# velocity/pressure criteria either never fired or ran away (a pressurised fluid genuinely reaches
+# every wall). Material that leaves the window is written to voxels and frozen, the same deal
+# Noita makes with unloaded chunks.
 func _ensure_region() -> bool:
 	if _active_chunks.is_empty():
 		_destroy_region()
@@ -580,26 +523,19 @@ func _ensure_region() -> bool:
 		origin = (bb[0] - pad) * n_grid
 		dims = start * n_grid
 	else:
-		# EXISTING REGION — either GROW toward material at a face, or SHIFT one chunk toward it.
+		# EXISTING REGION — grow toward material touching a face.
 		if _region.occupied.is_empty():
 			return false
-		if grow_window:
-			# Material is touching a face: that chunk becomes part of the window. BOUNDED —
-			# max_axis_chunks per axis and MAX_REGION_NODES overall — which is the guard that was
-			# missing from the original growth rules. Those ran away because they had no ceiling
-			# and kept granting the fluid more room; this one stops at a fixed budget.
-			var g := _growth_for(_region)
-			var gmin: Vector3i = g[0]
-			var gmax: Vector3i = g[1]
-			if gmin == Vector3i.ZERO and gmax == Vector3i.ZERO:
-				return false
-			origin = _region.origin - gmin * n_grid
-			dims = _region.dims + (gmin + gmax) * n_grid
-		else:
-			var shift := _edge_shift(_region)
-			if shift == Vector3i.ZERO:
-				return false
-			origin = _region.origin + shift * n_grid
+		# Material touching a face makes that chunk part of the window. BOUNDED by
+		# max_axis_chunks per axis and MAX_REGION_NODES overall — the guard the original growth
+		# rules lacked, and whose absence produced the "box of spaz".
+		var g := _growth_for(_region)
+		var gmin: Vector3i = g[0]
+		var gmax: Vector3i = g[1]
+		if gmin == Vector3i.ZERO and gmax == Vector3i.ZERO:
+			return false
+		origin = _region.origin - gmin * n_grid
+		dims = _region.dims + (gmin + gmax) * n_grid
 
 	if _region != null and _region.dims == dims and _region.origin == origin:
 		if _region.signature == sig:
@@ -659,31 +595,6 @@ func _growth_for(w: ChunkRegion) -> Array:
 	if int(d.x) * int(d.y) * int(d.z) > MAX_REGION_NODES:
 		return [none, none]
 	return [gmin, gmax]
-
-
-# ONE CHUNK toward whichever side has material at (or past) the window edge. A TRANSLATION, never
-# a re-centring, so it can strand at most one chunk's worth of material instead of the whole body.
-#
-# An axis is skipped when the material already spans the full window in it: the same water then
-# touches BOTH edges and shifting would ratchet the window back and forth forever.
-func _edge_shift(w: ChunkRegion) -> Vector3i:
-	var wmin := Vector3i(w.origin.x / n_grid, w.origin.y / n_grid, w.origin.z / n_grid)
-	var wmax := wmin + region_chunks - Vector3i.ONE
-	var bb := _bbox_chunks_from(w.occupied)
-	var omin := bb[0]
-	var omax := bb[1]
-	var span := omax - omin + Vector3i.ONE
-	var shift := Vector3i.ZERO
-	if span.x < region_chunks.x:
-		if omin.x <= wmin.x: shift.x = -1
-		elif omax.x >= wmax.x: shift.x = 1
-	if span.y < region_chunks.y:
-		if omin.y <= wmin.y: shift.y = -1
-		elif omax.y >= wmax.y: shift.y = 1
-	if span.z < region_chunks.z:
-		if omin.z <= wmin.z: shift.z = -1
-		elif omax.z >= wmax.z: shift.z = 1
-	return shift
 
 
 func _bbox_chunks_from(src: Dictionary) -> Array[Vector3i]:
@@ -941,35 +852,10 @@ func seed_particles(w: ChunkRegion, n: int, seed_fn: Callable) -> void:
 	_upload_region_params(w)
 
 
-# Continuous promotion: appends ONE particle into the region's unused tail capacity — a
-# buffer_update() write at index n_particles plus incrementing it, NOT a reseed. No pipeline/
-# uniform-set rebuild needed. Returns false if max_particles is exhausted.
-func add_particle(w: ChunkRegion, local_pos: Vector3, mat_id: int, mass: float) -> bool:
-	if w.n_particles >= max_particles:
-		push_warning("MPMSimulation.add_particle(): max_particles=%d exhausted" % max_particles)
-		return false
-	var i: int = w.n_particles
-
-	_compute.buffer_update(w.pos, i * 3 * 4, PackedFloat32Array([local_pos.x, local_pos.y, local_pos.z]).to_byte_array())
-	_compute.buffer_update(w.vel, i * 3 * 4, PackedFloat32Array([0.0, 0.0, 0.0]).to_byte_array())
-	_compute.buffer_update(w.C, i * 9 * 4, PackedFloat32Array([0.0,0.0,0.0, 0.0,0.0,0.0, 0.0,0.0,0.0]).to_byte_array())
-	_compute.buffer_update(w.J, i * 4, PackedFloat32Array([1.0]).to_byte_array())
-	_compute.buffer_update(w.mat, i * 4, PackedInt32Array([mat_id]).to_byte_array())
-	_compute.buffer_update(w.mass, i * 4, PackedFloat32Array([mass]).to_byte_array())
-	_compute.buffer_update(w.alive, i * 4, PackedInt32Array([1]).to_byte_array())
-	_compute.buffer_update(w.F, i * 9 * 4, PackedFloat32Array([1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0]).to_byte_array())
-
-	w.n_particles += 1
-	w.groups_particles = int(ceil(float(w.n_particles) / 64.0))
-	_upload_region_params(w)
-	return true
-
-
 # EditDispatcher/WorldOrchestrator.voxels_placed handler. edit_apply.comp writes straight into
-# _voxel_buf_a, so by the time this fires the placed voxels ARE in the voxel world — meaning a
-# chunk that has to (re)activate already gets them via promote_existing_voxels(), and calling
-# add_particle() on top of that would insert a duplicate. Only voxels landing in a chunk that
-# was ALREADY part of the region need the incremental append.
+# _voxel_buf_a, so by the time this fires the placed voxels ARE in the voxel world — a chunk
+# that has to (re)activate already gets them via promote_existing_voxels(). Only voxels landing
+# in a chunk that was ALREADY part of the region need the incremental append.
 func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> void:
 	if not is_setup:
 		return
@@ -990,11 +876,6 @@ func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> 
 	var had_region := _region != null
 	var grew := false
 	for cp in new_chunks:
-		if _active_chunks.size() >= max_active_chunks:
-			if not _warned_budget:
-				push_warning("MPMSimulation: max_active_chunks=%d exhausted — %d chunk(s) from this edit left unsimulated (they will act as walls until a slot frees)." % [max_active_chunks, new_chunks.size()])
-				_warned_budget = true
-			break
 		if not _would_fit(cp):
 			if not _warned_region_cap:
 				push_warning("MPMSimulation: region grid would exceed MAX_REGION_NODES=%d including %s — refusing to grow." % [MAX_REGION_NODES, cp])
@@ -1051,9 +932,8 @@ func _region_covers(cp: Vector3i) -> bool:
 		and cp.z >= bmin.z and cp.z <= bmax.z)
 
 
-# Bulk append — one buffer_update per ATTRIBUTE for the whole batch, instead of the 8 per
-# particle that add_particle() costs (a 500-voxel sphere was 4000 individual GPU uploads, the
-# other half of the placement stutter). add_particle() stays for single-voxel placement.
+# Bulk append — one buffer_update per ATTRIBUTE for the whole batch (the per-particle alternative
+# was 4000 individual GPU uploads for a 500-voxel sphere, the other half of the placement stutter).
 func _append_particles(w: ChunkRegion, local_pos: Array[Vector3], mats: Array[int], masses: Array[float]) -> int:
 	var count := local_pos.size()
 	if count == 0:
@@ -1196,8 +1076,8 @@ func tick_all(substeps_per_tick: int) -> void:
 	_rebuild_block_set(w)
 
 	# REGION GEOMETRY UPDATE — the whole "which chunks are active" decision, once per tick.
-	# _ensure_region() either GROWS the window toward material touching a face (grow_window) or
-	# SHIFTS it one chunk that way. Rate-limited because a rebuild reallocates every grid and
+	# _ensure_region() GROWS the window toward material touching a face. Rate-limited because a
+	# rebuild reallocates every grid and
 	# particle buffer. If it returns true, `w` is stale.
 	if _recenter_cooldown > 0:
 		_recenter_cooldown -= 1
@@ -1353,6 +1233,14 @@ func _rebuild_block_set(w: ChunkRegion) -> void:
 						dense_set[n.x + nb_x * (n.y + nb_y * n.z)] = true
 	var dense: Array = dense_set.keys()
 	dense.sort()
+	# Skip re-uploading block_map/block_list/params when the active set is unchanged — settled
+	# water would otherwise pay three GPU transfers every tick for nothing.
+	var sig := 0
+	for d in dense:
+		sig = (sig * 73856093) ^ int(d)
+	if sig == w.block_set_sig and w.num_blocks == dense.size():
+		return
+	w.block_set_sig = sig
 	w.num_blocks = dense.size()
 	var bm := PackedInt32Array(); bm.resize(w.total_blocks); bm.fill(-1)
 	var bl := PackedInt32Array(); bl.resize(w.num_blocks)
@@ -1391,12 +1279,6 @@ func _decode_dirty_bitmask(bitmask: PackedByteArray) -> Array[Vector3i]:
 # The region now spans multiple chunks, so this returns the region if `chunk_pos` is covered by
 # it, else null. Kept under the old name so existing callers keep working; n_particles on the
 # returned object is REGION-wide, not that chunk's share.
-func get_chunk_region(chunk_pos: Vector3i) -> ChunkRegion:
-	if _region == null:
-		return null
-	return _region if _region.chunks.has(chunk_pos) else null
-
-
 func active_chunk_positions() -> Array:
 	# Chunks the region's GRID actually covers — every chunk being simulated. This is NOT
 	# _active_chunks (the set that was explicitly requested): the grid is the BOUNDING BOX of
@@ -1462,10 +1344,6 @@ func read_positions(w: ChunkRegion) -> PackedFloat32Array:
 
 func read_velocities(w: ChunkRegion) -> PackedFloat32Array:
 	return _compute.download(w.vel).to_float32_array()
-
-
-func read_materials(w: ChunkRegion) -> PackedInt32Array:
-	return _compute.download(w.mat).to_int32_array()
 
 
 # --- S0 instrumentation: objective settle metrics ----------------------------------------
