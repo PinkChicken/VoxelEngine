@@ -353,6 +353,7 @@ func _mpm_status_dump() -> void:
 		mpm_simulation.water_density, mpm_simulation.water_stiffness, mpm_simulation.water_viscosity])
 	print("  timescale: %.4f s/tick  (T cycles the ladder: 1/60 1/120 1/240 1/480 1/30)" % (
 		mpm_simulation.sim_seconds_per_tick))
+	print("  %s" % mpm_simulation.s0_summary())
 	# Cost warning: grid buffers are ~60 bytes/node and are REALLOCATED on every window move, so
 	# an oversized window shows up as multi-frame hitches, not just a higher average.
 	var nodes := int(info["nodes"])

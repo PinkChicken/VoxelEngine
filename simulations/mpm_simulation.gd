@@ -1191,6 +1191,9 @@ func tick_all(substeps_per_tick: int) -> void:
 		max_speed = max(max_speed, spd)
 
 	if max_speed < rest_speed:
+		# S0 gate: print the objective settle metrics BEFORE the state is destroyed, so a clean
+		# single-sphere run reports its final depth/footprint/mass without any keypress.
+		print(s0_summary())
 		# Everything is at rest and already written back to voxels. Sleep the region and clear
 		# the intent set; a later edit or a streamed chunk re-activates from voxels.
 		_active_chunks.clear()
@@ -1377,3 +1380,62 @@ func read_velocities(w: ChunkRegion) -> PackedFloat32Array:
 
 func read_materials(w: ChunkRegion) -> PackedInt32Array:
 	return _compute.download(w.mat).to_int32_array()
+
+
+# --- S0 instrumentation: objective settle metrics ----------------------------------------
+#
+# S0 asks a binary question: can the current formulation represent a compact, RESTING 3D water
+# body at our resolution? "It looks deeper" is not an answer — these four numbers are. Downloaded
+# from the actual particle state (positions/velocities/mass/alive), not from the render.
+
+# The four measurements, computed over ALIVE particles only (dead ones are frozen voxels).
+func particle_stats() -> Dictionary:
+	var w := _region
+	if w == null:
+		return {}
+	var pos := read_positions(w)
+	var vel := read_velocities(w)
+	var mass := _compute.download(w.mass).to_float32_array()
+	var alive := _compute.download(w.alive).to_int32_array()
+
+	var n_alive := 0
+	var total_mass := 0.0
+	var bmin := Vector3(1e30, 1e30, 1e30)
+	var bmax := Vector3(-1e30, -1e30, -1e30)
+	var max_speed := 0.0
+	for i in w.n_particles:
+		if alive[i] == 0:
+			continue
+		n_alive += 1
+		total_mass += float(mass[i])
+		var p := Vector3(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2])
+		bmin = Vector3(minf(bmin.x, p.x), minf(bmin.y, p.y), minf(bmin.z, p.z))
+		bmax = Vector3(maxf(bmax.x, p.x), maxf(bmax.y, p.y), maxf(bmax.z, p.z))
+		var v := Vector3(vel[i * 3], vel[i * 3 + 1], vel[i * 3 + 2])
+		max_speed = maxf(max_speed, v.length())
+
+	var out: Dictionary = {
+		"alive": n_alive, "total": w.n_particles, "mass": total_mass, "max_speed": max_speed,
+		"depth": 0.0, "foot_x": 0.0, "foot_z": 0.0, "compact": 0.0,
+	}
+	if n_alive > 0:
+		var ext := bmax - bmin
+		out["depth"] = ext.y
+		out["foot_x"] = ext.x
+		out["foot_z"] = ext.z
+		var foot := maxf(ext.x, ext.z)
+		if foot > 0.0:
+			# compactness = depth / footprint. A pool is O(0.1-1.0); a film is O(0.001-0.05).
+			out["compact"] = ext.y / foot
+	return out
+
+
+# One log line, for printing at settle and from the Y dump.
+func s0_summary() -> String:
+	var s := particle_stats()
+	if s.is_empty():
+		return "[MPM-S0] no region"
+	return ("[MPM-S0] alive=%d/%d mass=%.2f depth=%.1f footprint=%.1fx%.1f max_speed=%.4f "
+		+ "compactness(depth/foot)=%.4f") % [
+		s["alive"], s["total"], s["mass"], s["depth"], s["foot_x"], s["foot_z"],
+		s["max_speed"], s["compact"]]
