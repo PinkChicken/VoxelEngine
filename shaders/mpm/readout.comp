@@ -101,9 +101,21 @@ void main() {
 	uint G = uint(P.dim_x) * uint(P.dim_y) * uint(P.dim_z);
 	if (idx >= G) return;
 
-	int ix = int(idx % uint(P.dim_x));
-	int iy = int((idx / uint(P.dim_x)) % uint(P.dim_y));
-	int iz = int(idx / (uint(P.dim_x) * uint(P.dim_y)));
+	// S1 Phase 1 — block-major decode: recover the node's region-local coordinate from the flat
+	// invocation index (inverse of node_index() in p2g/g2p). ALL blocks allocated → pure
+	// re-linearisation; Phase 2 makes the block slot a sparse-table lookup.
+	int lx = int(idx & 31u);
+	int ly = int((idx >> 5u) & 31u);
+	int lz = int((idx >> 10u) & 31u);
+	int slot = int(idx >> 15u);
+	int nb_x = P.dim_x >> 5;
+	int nb_y = P.dim_y >> 5;
+	int bx = slot % nb_x;
+	int by = (slot / nb_x) % nb_y;
+	int bz = slot / (nb_x * nb_y);
+	int ix = bx * 32 + lx;
+	int iy = by * 32 + ly;
+	int iz = bz * 32 + lz;
 	// Region origin + local node = world voxel. world_to_flat() below then resolves which
 	// CHUNK that voxel belongs to, so a node in chunk N+1 writes into chunk N+1's slot —
 	// the mapping across region-internal chunk boundaries is already generic.

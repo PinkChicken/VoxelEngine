@@ -35,6 +35,20 @@ const uint MAT_STRIDE_U32 = 8u;
 
 uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
 
+// S1 Phase 1 — block-major node index. The region grid is decomposed into 32^3 blocks laid
+// out block-by-block. ALL blocks are allocated in Phase 1, so this is a pure re-linearisation
+// of the same node set — bit-identical physics, only the memory order changed. Phase 2 replaces
+// the dense slot formula with a sparse block-table lookup. `node` is in-bounds by the caller's
+// region-bounds check, so the shifts are on non-negative values.
+uint node_index(ivec3 node) {
+	ivec3 b = node >> 5;                 // block coordinate within the region
+	ivec3 l = node & 31;                 // local cell within the block
+	uint nb_x = uint(P.dim_x >> 5);
+	uint nb_y = uint(P.dim_y >> 5);
+	uint slot = uint(b.x) + nb_x * (uint(b.y) + nb_y * uint(b.z));
+	return slot * 32768u + (uint(l.z) * 32u + uint(l.y)) * 32u + uint(l.x);
+}
+
 void main() {
 	uint p = gl_GlobalInvocationID.x;
 	if (p >= uint(P.n_particles)) return;
@@ -66,7 +80,7 @@ void main() {
 			node.x >= P.dim_x || node.y >= P.dim_y || node.z >= P.dim_z) continue;
 		vec3 dpos = (vec3(i, j, k) - fx) * P.dx;
 		float weight = w[i].x * w[j].y * w[k].z;
-		uint ni = (uint(node.z) * uint(P.dim_y) + uint(node.y)) * uint(P.dim_x) + uint(node.x);
+		uint ni = node_index(node);
 		vec3 gv = vec3(g_vel.data[3u*ni], g_vel.data[3u*ni+1u], g_vel.data[3u*ni+2u]);
 		new_vel += weight * gv;
 		// new_C += 4 * weight * outer(gv, dpos) / dx^2

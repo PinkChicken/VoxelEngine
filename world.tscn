@@ -114,7 +114,7 @@ enabled = false
 [node name="MPMSimulation" type="Node" parent="WorldOrchestrator/SimulationRuntime" unique_id=918273645]
 script = ExtResource("13_mpm")
 max_particles = 100000
-promote_stride = 3
+promote_stride = 2
 region_chunks = Vector3i(2, 2, 2)
 water_stiffness = 3000.0
 water_viscosity = 3.0

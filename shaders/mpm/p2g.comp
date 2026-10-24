@@ -103,6 +103,21 @@ void svd3(float F[9], out float U[9], out float sig[3], out float V[9]) {
 	}
 }
 
+// S1 Phase 1 — block-major node index. The region grid is decomposed into 32^3 blocks laid
+// out block-by-block (block 0's 32768 nodes, then block 1's, ...). ALL blocks are allocated in
+// Phase 1, so this is a pure re-linearisation of the same node set — the physics is
+// bit-identical, only the memory order changed. Phase 2 replaces the dense slot formula with a
+// sparse block-table lookup; nothing else changes. `node` is in-bounds by the caller's
+// region-bounds check, so the shifts are on non-negative values.
+uint node_index(ivec3 node) {
+	ivec3 b = node >> 5;                 // block coordinate within the region
+	ivec3 l = node & 31;                 // local cell within the block
+	uint nb_x = uint(P.dim_x >> 5);
+	uint nb_y = uint(P.dim_y >> 5);
+	uint slot = uint(b.x) + nb_x * (uint(b.y) + nb_y * uint(b.z));
+	return slot * 32768u + (uint(l.z) * 32u + uint(l.y)) * 32u + uint(l.x);
+}
+
 void main() {
 	uint p = gl_GlobalInvocationID.x;
 	if (p >= uint(P.n_particles)) return;
@@ -223,7 +238,7 @@ void main() {
 		ad.z = (st6*dpos.x + st7*dpos.y + st8*dpos.z) + mass*(C6*dpos.x + C7*dpos.y + C8*dpos.z);
 		vec3 mom = weight * (mass * vel + ad);
 		float mc = weight * mass;
-		uint ni = (uint(node.z) * uint(P.dim_y) + uint(node.y)) * uint(P.dim_x) + uint(node.x);
+		uint ni = node_index(node);
 		atomicAdd(g_mass.data[ni],        int(round(mc * scale)));
 		atomicAdd(g_mom.data[3u*ni],      int(round(mom.x * scale)));
 		atomicAdd(g_mom.data[3u*ni + 1u], int(round(mom.y * scale)));

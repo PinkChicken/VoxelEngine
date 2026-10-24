@@ -80,9 +80,21 @@ void main() {
 	uint G = uint(P.dim_x) * uint(P.dim_y) * uint(P.dim_z);
 	if (idx >= G) return;
 
-	int ix = int(idx % uint(P.dim_x));
-	int iy = int((idx / uint(P.dim_x)) % uint(P.dim_y));
-	int iz = int(idx / (uint(P.dim_x) * uint(P.dim_y)));
+	// S1 Phase 1 — block-major decode: recover the node's region-local coordinate from the flat
+	// invocation index (the inverse of node_index() in p2g/g2p). ALL blocks are allocated in
+	// Phase 1, so this is a pure re-linearisation; Phase 2 makes the block slot a sparse lookup.
+	int lx = int(idx & 31u);
+	int ly = int((idx >> 5u) & 31u);
+	int lz = int((idx >> 10u) & 31u);
+	int slot = int(idx >> 15u);
+	int nb_x = P.dim_x >> 5;
+	int nb_y = P.dim_y >> 5;
+	int bx = slot % nb_x;
+	int by = (slot / nb_x) % nb_y;
+	int bz = slot / (nb_x * nb_y);
+	int ix = bx * 32 + lx;
+	int iy = by * 32 + ly;
+	int iz = bz * 32 + lz;
 
 	if (is_static_node(ivec3(ix, iy, iz))) {
 		// No-slip: this node belongs to a real STATIC-material voxel — zero velocity
