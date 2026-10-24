@@ -471,3 +471,72 @@ Log prefixes: `[MPM]`, `[MPM perf]`, `[MPMStress]`, `[MPM params]`, `[SimRuntime
    §7.1.
 3. **Per-connected-component regions** would stop two separate puddles sharing one box. It
    does not help a single large body, and it does not change the cost curve.
+
+---
+
+## 14. Research direction — sparse scheduled MPM
+
+Research surfaced four families that attack the spatial-activation problem directly
+(citations below are pointers to follow up, not yet verified against the papers):
+
+1. **Sparse background grids / active-node MPM** — the grid exists only where particles need
+   it, not as a dense bounding box. (arXiv:2605.28525, "Unified sparse framework for
+   large-scale material point method simulations".)
+2. **Dynamic Background Domain** — detect active particles, restrict the update to the
+   affected domain. (Wiley, DOI 10.1155/2021/8854318.)
+3. **Regional time stepping** — schedule small blocks independently, respecting the
+   particle↔grid coupling. (Wiley, DOI 10.1111/cgf.13524, uses SPGrid.)
+4. **Adaptive grid extension/reduction** — open-source "Matter" solver (github
+   larsblatny/matter) explicitly lists this, with APIC/Drucker-Prager/μ(I), i.e. the same
+   mechanics family this port uses.
+
+### What this resolves and what it does not
+
+The correct framing, which supersedes "how do I add/remove chunks from one MPM sim":
+
+> **Chunks are storage and scheduling units, sitting on top of one sparse shared grid — not
+> the simulation units.** This keeps a single P2G/G2P continuum while restoring CA-like
+> "this block is asleep" behaviour.
+
+Concretely for our code: `clear_grid`/`p2g`/`grid_op`/`g2p`/`readout` all iterate the flat
+`dims.x*dims.y*dims.z` node space. The sparse version replaces that flat index with a global
+**active-node map** (one index space with holes). The dispatch count becomes "active nodes",
+not "bbox product". This is NOT the per-block grids of §7.1, which failed because each block
+had its own index space and produced walls; a sparse grid is one shared index space.
+
+### Two hard constraints the research also implies
+
+- **Spatial sparsity and temporal sleeping are separate.** A sparse grid fixes "I am paying
+  for empty bbox"; it does not fix "I am updating resting material". Both are needed, and they
+  must not be conflated.
+- **You cannot sleep half a pressure volume.** Hydrostatic equilibrium is global — the bottom
+  of a column feels the height above it. If the top of a water column is baked to voxels while
+  the bottom stays active, the active region must still be told "there are N voxels of water
+  above me". This is the same connected-vessel / pressure-projection problem the CA solver
+  spent weeks on (`ARCHITECTURE.md`, `docs/BUG_LOG.md`). The voxel field is already the
+  boundary representation (readout bakes particles to voxels on settle); the missing piece is
+  re-reading column height as a pressure boundary condition at wake.
+
+### Ordering — the one correction to the research
+
+Sparse grid and dispersion (§9.1) are **independent**: sparse grid fixes cost, dispersion
+fixes correctness. They are not alternatives. But they should not be built in parallel:
+
+1. **S0 — settle dispersion first.** A sparse grid's payoff is proportional to how compact
+   the material is; a body that films out into a sheet has less sparsity to exploit, and more
+   importantly, no visual judgement of the solver is valid while water doesn't pool. The
+   `particle_subdiv = 2` test is one clean run from conclusive (§9.2's arithmetic error is
+   fixed; §9.5's fixed-point headroom still unchecked).
+2. **S1 — sparse shared grid.** Replace the dense bbox with an active-node map. This is the
+   answer to the §8 cost curve.
+3. **S2 — block sleep/wake + wake propagation**, with a 1–2 block halo for the 3³ B-spline
+   support, and the hydrostatic boundary read from voxels.
+4. **S3 — resolution LOD** for bodies that must exceed one grid resolution.
+
+### Rejected (again, now with the research agreeing)
+
+- Independent per-chunk MPM grids — §7.1, falsified; the research's "don't make chunks the
+  simulation units" is the same conclusion.
+- Bounding-box growth and centroid tracking — §7.6/§7.8, falsified; both are "one dense
+  allocation trying to decide its own extent from wall contact", which is the root disease
+  the sparse grid removes.
