@@ -30,7 +30,7 @@ under the same rules, debris is real material, and the world is not player-depen
 | **Simulation** (`simulations/mpm_simulation.gd`) | one MPM region, particles, grid | chunk streaming policy, rendering |
 | **Presentation** (`RaymarchRenderer.gd`, `Player/*`) | pixels, input, collision queries | how material got there |
 
-The canonical voxel buffer (`_voxel_buf_a`) is the seam. Simulation writes into it (through the
+The persistent voxel world (`_voxel_buf_a`) is the seam. Simulation writes into it (through the
 changelog); rendering and collision read from it. Nothing else is shared.
 
 ---
@@ -40,11 +40,17 @@ changelog); rendering and collision read from it. Nothing else is shared.
 ### 2.1 Voxel storage (`Chunks/chunk_instance.gd`, `chunk_manager.gd`)
 
 - 32³ chunks, `VOXEL_STRIDE = 4`: `[material_id, fill, temperature, flags]`.
-- **AIR is exactly `0u` in all four bytes** — a hard constraint for CAS and for "is this voxel
-  empty" checks that touch raw bytes.
-- The *same* layout serves every phase; LIQUID reinterprets byte 1 as pressure **only in the
-  deleted CA path** (MPM does not use it).
-- `_voxel_buf_a` is canonical: the renderer binds it, collision extracts from it, MPM writes to it.
+- **AIR is exactly `0u` in all four bytes** — the empty-voxel invariant (a 32-bit zero test).
+- **Effective usage is 1 of 4 bytes.** `material_id` is the only field the engine needs. `fill` is
+  written by `readout.comp` (mass → quantised fill) and has exactly one remaining consumer: the
+  raymarcher's LIQUID tint (`raymarch.comp` — "partial fill = darker, reads as shallow").
+  `temperature` and `flags` are **unused** — only the generic edit path passes them through, and
+  `readout.comp` zeroes both.
+  Removing `fill` (and re-deciding the liquid tint) would let `VOXEL_STRIDE` drop to 1 byte — a 4×
+  reduction in the raymarcher's per-sample bandwidth, the biggest per-frame cost (§9.2). **Planned,
+  not done.**
+- `_voxel_buf_a` is the persistent world: the renderer binds it, collision extracts from it, MPM
+  writes to it (see §10.2 for what "persistent" means versus particles).
 - Per-chunk `_simulation_mask` (a bitmask of which material *classes* are present) and
   `_simulation_counts` are maintained by the edit path (`apply_mutation`,
   `rebuild_counts_and_mask`). This is material-category bookkeeping, **not** solver gating — MPM
@@ -223,6 +229,14 @@ survives as voxels; a later edit re-activates it. There is no per-chunk deactiva
 
 Note: with `viscosity 3` and no surface tension, a residual ~0.14 voxel/s jitter floor means the
 region never fully sleeps in practice. This is known, not a bug.
+
+**Known limitation — the sleep/wake bridge is lossy, and that is where conservation can break.**
+`readout.comp` quantises mass into the `fill` byte. `promote_existing_voxels()` **never reads
+`fill`** — each MPM voxel becomes a full-mass particle set on wake (`mass_each = density · p_vol`).
+So "mass is conserved by construction" is a **particle-domain** claim: it holds within one region
+life, not across a destroy → re-promote cycle. The S0/S1 exact-mass results were all measured inside
+a single life and do not exercise this. Either make promotion fill-aware or measure/bound the drift
+before trusting a long-lived world.
 
 ### 4.6 The five passes
 
@@ -486,19 +500,24 @@ separate simple paths. Both are unbuilt today, so nothing was lost.
 **Done:** CA deletion; S0 (solver validated, basin test); S1 phase 1 + phase 2 (sparse dispatch,
 correctness verified).
 
-**Open — the real blocker for "place water anywhere in a dynamic world":** the single-region
-limitation. Beyond S1, the options are:
+**Next major project: dynamic region building** (once this documentation is in order). The
+single-region limitation is the real blocker for "place water anywhere in a dynamic world". Options,
+in the order the pillars favour them:
 
 1. **Region expansion toward far edits** — grow the window to include a far edit (bounded by
    `MAX_REGION_NODES`), so water placed outside the window is at least discovered and simulated.
-2. **Multiple regions** — one sparse region per connected component. This is the same §4.8 seam
-   problem at a coarser scale (two touching regions need one index space), so it must be done
-   carefully.
+   Cheapest, and keeps ONE index space (§10.1).
+2. **Multiple regions** — one sparse region per connected component. This is §4.8's seam at a
+   coarser scale (two touching regions need one index space), so it needs a merge-on-contact rule.
 3. **World-spanning region with raised bounds** — simplest, most memory-hungry.
 
 Also open:
 - **Sparse memory resize** — shrink grid buffers to `num_blocks × 32³` (captures the memory win S1
   phase 2 deferred).
+- **Fill-aware promotion** — §4.5's lossy sleep/wake bridge; either read `fill` in
+  `promote_existing_voxels()` or measure and bound the drift.
+- **Voxel word shrink (4 → 1 byte)** — `fill` is render-only (liquid tint) and `temperature`/`flags`
+  are unused (§2.1). Removing the tint dependency buys a 4× raymarcher bandwidth cut (§9.2).
 - **Sand repose validation** alongside water.
 - **Dead CA buffers** in `WorldOrchestrator` (`_voxel_buf_b`, `_sim_active_buf`,
   `_material_flow_buf`, `_material_density_buf`, `swap_voxel_bufs()`) — remove the dead subsystem.
@@ -538,31 +557,52 @@ then LOD.
 
 ## 10. Design principles
 
-**10.1 Separation of concerns** — storage stores state and does not simulate; materials define
-properties and store no state; simulation reads state + properties and writes results; the renderer
-and collision read the canonical buffer.
+Eight invariants. These are not aspirations — each one either already constrained a decision or
+explains a documented dead end. Read §4.9 before violating one.
 
-**10.2 Minimal voxel state** — a voxel stores exactly what is unique to its location: material
-identity, fill, temperature, engine flags. Nothing else.
+**10.1 Chunks are storage; the region is simulation.** The two have different granularity and must
+never be conflated. A chunk is a streaming/allocation unit; the region is ONE contiguous grid + ONE
+particle set with ONE index space. Per-chunk scheduling *inside* a region is the §4.9 disease.
 
-**10.3 AIR = 0u** — all air voxels are exactly zero in GPU buffers. A hard constraint for any raw-byte
-CAS operation.
+**10.2 Voxels are the persistent world; particles are working state; the bridge is lossy and is
+accounted for.** `_voxel_buf_a` is the canonical *persistent* representation, not the truth while a
+region is awake — the particle set is. `readout` projects mass into voxels (quantised, deadbanded,
+carrying no velocity/`C`/`J`/`F`), and promotion seeds particles from voxels without reading the
+projection's own fields. Every sleep/wake or rebuild crosses this lossy bridge; conservation claims
+are particle-domain, not world-domain.
 
-**10.4 One canonical buffer** — `_voxel_buf_a` is the single source of truth for the world. Everything
-that reads the world reads it; everything that writes goes through the changelog/patch path.
+**10.3 The world is not player-dependent.** Activation is chunk/material-driven (`setup()` scans all
+loaded chunks; `chunk_loaded` keeps scanning). Nothing may centre a region on the player or pause
+simulation for being off-screen.
 
-**10.5 Incremental updates** — never rebuild what you can update. Chunk table slots are 4 bytes;
-voxel data from the simulation is patched per-voxel via `patch_apply.comp`. No full-buffer rebuilds.
+**10.4 Bounded by construction; refusal is a first-class outcome.** `max_axis_chunks` and
+`MAX_REGION_NODES` refuse rather than over-allocate. A refused edit means "that chunk silently does
+not simulate" — a deliberate correctness trade that must surface (warning + the `Y` dump), never a
+quiet stall.
 
-**10.6 GPU-primary** — simulation and edits run on the GPU; the changelog is never downloaded. CPU
-work is bookkeeping only.
+**10.5 GPU simulates, CPU schedules.** Simulation and edits are GPU passes, and the changelog is
+never downloaded. But the per-tick active-block set *is* built on the CPU from the downloaded
+occupancy mask (64 B) and re-uploaded — a real per-tick GPU→CPU→GPU round trip. Bounded and
+intentional; it is "GPU simulates, CPU schedules", not "GPU-primary".
 
-**10.7 MPM replaces solver seams with conservation** — mass is the sum of particle masses. When two
-materials interact, the result is a consequence of their physical properties, not dispatch order.
+**10.6 Materials are identity, not state; the voxel word is `material_id`.** A material holds
+properties; a voxel holds identity. `fill` is render-only (liquid tint) and `temperature`/`flags`
+are unused (§2.1) — they are not engine state and must not be written to or read as if they were.
+The MPM dispatch is table-driven (`mpm_buffer_rid`), nothing hardcoded by material id.
 
-**10.8 In-editor-first discipline** — the agent cannot load a Godot project (headless hangs), so every
-shader/script change is static-review-only until a human runs it. `docs/BUG_LOG.md` records what that
-cost when it was skipped (the 2026-07-10 "bench-validated fix shows no in-engine change" mystery).
+**10.7 AIR = 0u as an empty-test invariant.** All air voxels are exactly zero. The original rationale
+(CAS) died with the CA solver; it survives because it makes "is this voxel empty" a 32-bit zero test
+and lets zeroed memory mean air.
+
+**10.8 In-editor-first discipline.** The agent cannot load a Godot project (headless hangs), so every
+shader/script change is static-review-only until a human runs it. §4.9's dead ends and
+`docs/BUG_LOG.md` record what skipping this costs.
+
+**Scoping notes on the retired pillars.** "Incremental updates" still governs voxel *content*
+(`patch_apply.comp`, per-voxel) but **not** region *geometry*, which is a full rebuild by design and
+rate-limited (§4.5). "Single writer" is now "single *commit* path": edits and simulation both land
+through the changelog/patch step. "Conservation by construction" is particle-domain only (§10.2,
+§4.5).
 
 ---
 
