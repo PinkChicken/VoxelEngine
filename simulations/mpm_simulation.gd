@@ -104,20 +104,27 @@ var _timescale_index: int = 0
 # see whether particles or grid nodes dominate before spending fidelity here.
 @export var promote_stride: int = 1
 
-# FIXED window size, in chunks. The region is exactly this big, always, and TRANSLATES to follow
-# the material. 2x2x2 = 64^3 = 262,144 nodes ≈ 2.4 ms/tick on the measured hardware. Change this
-# to trade cost for reach — it is the only thing that decides either.
-@export var region_chunks: Vector3i = Vector3i(2, 2, 2)
+# MINIMUM region size, in chunks. This is a FLOOR, not the size: the region starts at the extent
+# of the edit that created it (never smaller than this) and then grows on evidence.
+#
+# 1x1x1 = 32^3 = 32,768 nodes ≈ 0.3 ms. A single sphere inside one chunk therefore costs ~0.3 ms
+# rather than the 2.4 ms that allocating a 2x2x2 window "in case it spreads" would cost. Raise
+# this only if you want a guaranteed margin around new material.
+@export var region_chunks: Vector3i = Vector3i(1, 1, 1)
 
 @export_group("Region growth")
-# Grow the window when material touches a face, instead of only translating. Dynamic local
-# allocation — a chunk the material has reached becomes part of the simulated window.
+# Grow the window when material touches a face — a chunk the material has actually reached becomes
+# part of the simulated volume. This is the CA-style "add the chunk the material moved into",
+# expressed at region granularity because MPM needs one contiguous grid.
 #
-# BOUNDED by max_axis_chunks and MAX_REGION_NODES. That ceiling is the thing the original growth
-# implementation lacked, and its absence (not growth itself) is what produced the runaway: with no
-# cap, every response to "the fluid is pressing this wall" was to hand it another chunk of room.
+# GROWTH IS DRIVEN BY THE SIMULATION, not by the edit: readout.comp reports per-chunk occupancy
+# each tick, and _growth_for() grows toward whichever faces hold material.
+#
+# BOUNDED by max_axis_chunks and MAX_REGION_NODES. That ceiling is what the original growth
+# implementation lacked, and its absence (not growth itself) produced the runaway.
 @export var grow_window: bool = true
-@export var max_axis_chunks: int = 3
+# Ceiling per axis. 2 = up to 64^3 (262,144 nodes, ~2.4 ms); 3 = up to 96^3 (884,736, ~5 ms).
+@export var max_axis_chunks: int = 2
 
 @export_group("Water physics (live)")
 # LIVE overrides for WATER (id 3). Edit these in the REMOTE Inspector while the game runs —
@@ -499,16 +506,24 @@ func _ensure_region() -> bool:
 		var c: Vector3i = key
 		chunks.append(c)
 
-	var dims := region_chunks * n_grid
 	var sig := _active_signature()
 
+	var dims := region_chunks * n_grid
 	var origin: Vector3i
 	if _region == null:
-		# FIRST BUILD — centre the window on the requested set.
+		# FIRST BUILD — allocate only what the edit actually touched. region_chunks is a FLOOR, not
+		# a fixed size: a single sphere inside one chunk used to allocate the whole 2x2x2 window
+		# (262,144 nodes, ~2.4 ms) regardless, "in case" the material later spread. It now starts
+		# at the edit's own extent and grows only on evidence (see _growth_for()).
 		var bb := _bbox_chunks(chunks)
 		var span := bb[1] - bb[0] + Vector3i.ONE
-		var pad := (region_chunks - span) / 2
+		var start := Vector3i(
+			clampi(maxi(region_chunks.x, span.x), 1, max_axis_chunks),
+			clampi(maxi(region_chunks.y, span.y), 1, max_axis_chunks),
+			clampi(maxi(region_chunks.z, span.z), 1, max_axis_chunks))
+		var pad := (start - span) / 2
 		origin = (bb[0] - pad) * n_grid
+		dims = start * n_grid
 	else:
 		# EXISTING REGION — either GROW toward material at a face, or SHIFT one chunk toward it.
 		if _region.occupied.is_empty():
