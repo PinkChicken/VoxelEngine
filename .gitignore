@@ -21,21 +21,13 @@ tools/fluid_prototypes/python/
 CLAUDE.md
 
 # Local-only: design notes / handoff markdown. ARCHITECTURE.md and
-# docs/BUG_LOG.md remain the single source of truth and stay tracked.
+# docs/BUG_LOG.md are the single sources of truth and stay tracked.
 *.md
 !ARCHITECTURE.md
 !docs/BUG_LOG.md
-# The MPM cutover plan is tracked alongside them (not local-only): it is the tracked
-# counterpart to the local MPM_EVALUATION_BRIEF.md, and the brief stays untracked.
-!docs/MIGRATION_MPM.md
-# Solver design reference — how the MPM pipeline works today plus every allocation
-# strategy already tried and why it failed. Tracked because losing it means re-trying
-# the same dead ends.
-!docs/MPM_SOLVER_DESIGN.md
-# S1 sparse-grid design — the plan for replacing the dense bbox grid. Tracked for the same
-# reason as MPM_SOLVER_DESIGN.md: losing it means re-deriving the addressing scheme and the
-# block-halo rules from scratch.
-!docs/SPARSE_GRID.md
+# ARCHITECTURE.md is the ONE design doc: the MPM solver design, sparse-grid (S1) design,
+# and CA→MPM cutover record are all folded into it. Do not re-add separate tracked design
+# docs; update ARCHITECTURE.md instead.
 
 # Local-only: REA ("Reverse Engineer Anything") third-party MCP tool checkout —
 # ~58 MB / 4.7k files, MIT, unpacked without a .git. Analysis tooling, not
