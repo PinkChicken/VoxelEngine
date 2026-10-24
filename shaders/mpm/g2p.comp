@@ -35,18 +35,20 @@ const uint MAT_STRIDE_U32 = 8u;
 
 uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
 
-// S1 Phase 1 — block-major node index. The region grid is decomposed into 32^3 blocks laid
-// out block-by-block. ALL blocks are allocated in Phase 1, so this is a pure re-linearisation
-// of the same node set — bit-identical physics, only the memory order changed. Phase 2 replaces
-// the dense slot formula with a sparse block-table lookup. `node` is in-bounds by the caller's
-// region-bounds check, so the shifts are on non-negative values.
+// S1 Phase 2a — block-major node index via the block map. Phase 1 computed the slot from a
+// dense formula; this reads it from block_map so Phase 2b can make it sparse without touching
+// the rest of the pipeline. block_map is the IDENTITY (block_map[i] = i) in this phase, so the
+// result is bit-identical to Phase 1. `node` is in-bounds by the caller's region-bounds check.
+layout(set = 0, binding = 22, std430) readonly buffer BlockMap { int data[]; } block_map;
+
 uint node_index(ivec3 node) {
 	ivec3 b = node >> 5;                 // block coordinate within the region
 	ivec3 l = node & 31;                 // local cell within the block
-	uint nb_x = uint(P.dim_x >> 5);
-	uint nb_y = uint(P.dim_y >> 5);
-	uint slot = uint(b.x) + nb_x * (uint(b.y) + nb_y * uint(b.z));
-	return slot * 32768u + (uint(l.z) * 32u + uint(l.y)) * 32u + uint(l.x);
+	int nb_x = P.dim_x >> 5;
+	int nb_y = P.dim_y >> 5;
+	int dense = b.x + nb_x * (b.y + nb_y * b.z);
+	int slot = block_map.data[dense];
+	return uint(slot) * 32768u + (uint(l.z) * 32u + uint(l.y)) * 32u + uint(l.x);
 }
 
 void main() {

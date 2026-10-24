@@ -245,6 +245,9 @@ class ChunkRegion:
 	var pos: RID; var vel: RID; var C: RID; var J: RID
 	var mat: RID; var mass: RID; var alive: RID; var F: RID
 	var g_mom: RID; var g_mass: RID; var g_vel: RID; var g_mass_mat: RID
+	# S1 Phase 2a: block_coord(dense) -> slot table. Identity for now (block_map[i] = i) so it is
+	# a pure indirection, bit-identical to Phase 1. Phase 2b makes it sparse (empty blocks absent).
+	var block_map: RID
 	var voxel_params_buf: RID; var voxel_buf_a: RID; var chunk_table: RID; var dirty_chunks_buf: RID
 	# 6-bit "material touched this face plane" mask written by readout.comp, downloaded each tick
 	# and consumed by _growth_for(). Reset per readout.
@@ -720,6 +723,15 @@ func _build_region(origin: Vector3i, dims: Vector3i, chunks: Array[Vector3i], pr
 	w.g_mass     = _new_zero_buf(nodes * 4)
 	w.g_vel      = _new_zero_buf(nodes * 3 * 4)
 	w.g_mass_mat = _new_zero_buf(nodes * NMAT * 4)
+	# S1 Phase 2a: IDENTITY block map — every block allocated, block_map[i] = i, so the lookup in
+	# p2g/g2p's node_index() is a no-op relative to Phase 1's dense formula (bit-identical).
+	# Phase 2b replaces this fill with the sparse map built from the mark/compact pass.
+	var n_blocks := int(dims.x / n_grid) * int(dims.y / n_grid) * int(dims.z / n_grid)
+	w.block_map = _new_zero_buf(n_blocks * 4)
+	var bm := PackedInt32Array(); bm.resize(n_blocks)
+	for i in n_blocks:
+		bm[i] = i
+	_compute.buffer_update(w.block_map, 0, bm.to_byte_array())
 	w.params_buf = _new_zero_buf(48)
 	w.dirty_chunks_buf = _new_zero_buf(DIRTY_BUF_BYTES)
 	w.face_mask_buf = _new_zero_buf(4)
@@ -823,7 +835,7 @@ func _destroy_region() -> void:
 
 func _free_region_buffers(w: ChunkRegion) -> void:
 	for rid in [w.params_buf, w.pos, w.vel, w.C, w.J, w.mat, w.mass, w.alive, w.F,
-		w.g_mom, w.g_mass, w.g_vel, w.g_mass_mat,
+		w.g_mom, w.g_mass, w.g_vel, w.g_mass_mat, w.block_map,
 		w.voxel_params_buf, w.dirty_chunks_buf, w.face_mask_buf, w.occupancy_buf]:
 		if rid.is_valid():
 			_compute.free_rid(rid)
@@ -1110,7 +1122,7 @@ func _build_region_sets(w: ChunkRegion) -> void:
 	w.set_p2g = _compute.create_uniform_set([
 		_u(0, w.params_buf), _u(1, w.pos), _u(2, w.vel), _u(3, w.C), _u(4, w.J), _u(5, w.mat),
 		_u(6, w.mass), _u(7, w.alive), _u(8, w.g_mom), _u(9, w.g_mass), _u(11, w.F),
-		_u(12, w.g_mass_mat), _u(13, _material_db.mpm_buffer_rid)
+		_u(12, w.g_mass_mat), _u(13, _material_db.mpm_buffer_rid), _u(22, w.block_map)
 	], _p2g.shader)
 	w.set_grid_op = _compute.create_uniform_set([
 		_u(0, w.params_buf), _u(8, w.g_mom), _u(9, w.g_mass), _u(10, w.g_vel),
@@ -1119,7 +1131,7 @@ func _build_region_sets(w: ChunkRegion) -> void:
 	], _grid_op.shader)
 	w.set_g2p = _compute.create_uniform_set([
 		_u(0, w.params_buf), _u(1, w.pos), _u(2, w.vel), _u(3, w.C), _u(4, w.J), _u(5, w.mat),
-		_u(7, w.alive), _u(10, w.g_vel), _u(11, w.F), _u(13, _material_db.mpm_buffer_rid)
+		_u(7, w.alive), _u(10, w.g_vel), _u(11, w.F), _u(13, _material_db.mpm_buffer_rid), _u(22, w.block_map)
 	], _g2p.shader)
 	w.set_readout = _compute.create_uniform_set([
 		_u(0, w.params_buf), _u(9, w.g_mass), _u(12, w.g_mass_mat),
