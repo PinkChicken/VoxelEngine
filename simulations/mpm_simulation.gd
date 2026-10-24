@@ -209,7 +209,15 @@ const OCCUPANCY_BYTES := 64
 # Target magnitude for a busy grid node's fixed-point accumulator (fp_scale is derived from
 # this, not hardcoded — §36.3 found a fixed magic constant silently rounds low-density
 # materials to zero at one dx and silently overflows int32 at another).
-const NODE_BUDGET := 1.0e7
+#
+# 1e6 (not 1e7): the MOMENTUM accumulator g_mom is int32, and each particle contributes
+# ~weight * density * |vel| * NODE_BUDGET. At 1e7 that wraps int32 above |vel| ~ 190 voxel/s,
+# and a wrapped momentum reads back as garbage velocity that overflows further — the
+# self-sustaining ~2400 voxel/s "spaz" measured by S0. At 1e6 the wrap point moves to ~1900
+# voxel/s, ten times past any physical velocity here (free fall over 64 voxels is ~35).
+# MASS resolution is unaffected: g_mass = density*weight*NODE_BUDGET, still 1e6 for water,
+# still vastly above the readout's mass threshold.
+const NODE_BUDGET := 1.0e6
 
 class ChunkRegion:
 	# Grid extent in CELLS and its world-cell origin. dims is a multiple of n_grid per axis and
@@ -1395,8 +1403,8 @@ func particle_stats() -> Dictionary:
 		return {}
 	var pos := read_positions(w)
 	var vel := read_velocities(w)
-	var mass := _compute.download(w.mass).to_float32_array()
-	var alive := _compute.download(w.alive).to_int32_array()
+	var mass = _compute.download(w.mass).to_float32_array()
+	var alive = _compute.download(w.alive).to_int32_array()
 
 	var n_alive := 0
 	var total_mass := 0.0

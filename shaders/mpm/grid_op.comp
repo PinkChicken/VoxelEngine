@@ -106,12 +106,16 @@ void main() {
 	}
 	vel.y -= P.dt * P.gravity;
 
-	// SAFETY CLAMP: a node moving more than a handful of cells in one substep is already
-	// outside the MPM kernel's valid support (a particle's B-spline weights only reach its
-	// 3x3x3 neighbourhood) — converts silent instability that reads as material vanishing at
-	// a violent impact into a clean, physically-inert cap. 8x dx/dt is loose enough to never
-	// engage in ordinary flow; it only clips genuine transient spikes.
-	float max_speed = (P.dx / max(P.dt, 1e-9)) * 8.0;
+	// SAFETY CLAMP, two jobs. (1) A node moving more than a handful of cells in one substep is
+	// outside the MPM kernel's valid support — converts silent instability into a clean,
+	// physically-inert cap. (2) CRITICAL: the momentum accumulator g_mom is int32, and each
+	// particle contributes ~weight*density*|vel|*NODE_BUDGET. With NODE_BUDGET = 1e6 that wraps
+	// int32 above ~1900 voxel/s; a wrapped momentum reads back as garbage velocity which
+	// overflows further — the ~2400 voxel/s "spaz" S0 measured. 200 voxel/s is ~5x terminal
+	// free-fall here (~35 over 64 voxels), so it never clips physical motion, but keeps each
+	// particle's momentum near 2e8 — safe even summed over a dense subdiv=2 node.
+	// (The old 8*dx/dt ≈ 11520 was ~60x above the wrap point: a clamp that cannot clamp.)
+	float max_speed = 200.0;
 	float spd = length(vel);
 	if (spd > max_speed) {
 		vel *= max_speed / spd;
