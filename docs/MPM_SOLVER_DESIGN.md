@@ -540,3 +540,31 @@ fixes correctness. They are not alternatives. But they should not be built in pa
 - Bounding-box growth and centroid tracking — §7.6/§7.8, falsified; both are "one dense
   allocation trying to decide its own extent from wall contact", which is the root disease
   the sparse grid removes.
+
+---
+
+## 15. S0 result (2026-08-13)
+
+Working parameters found by hand-tuning: **density 1.0, stiffness 3000, viscosity 3.0,
+subdiv 1**. Measured behaviour from the S0 instrumentation:
+
+- A single sphere forms a blob first (depth 14, footprint 32×32, compactness 0.44) and then
+  spreads into a puddle on the flat rock floor (depth ~3, footprint ~58×63, compactness 0.05).
+  Mass is exactly conserved throughout (928.50 = 7428 × 0.125; 1768.38 = 14147 × 0.125).
+- Two spheres slosh: max_speed oscillates 2–238 voxel/s, the body fills the 64³ region, and it
+  never reaches rest (idle_ticks stays 0). A "random ping" is one particle reaching 238 voxel/s.
+
+Two conclusions:
+
+1. **Spreading thin on a flat floor is CORRECT water**, not the pancake. The earlier "dispersion"
+   (§9.1) was most likely the momentum overflow (§9.5) masquerading as a free-surface defect —
+   once the accumulator was fixed and viscosity added, the body forms a coherent blob and levels
+   out as water should. The compactness collapse (0.44 → 0.05) is a puddle forming, not a bug.
+2. **The "random ping" is a residual velocity spike at 238 voxel/s**, which is ABOVE the 200
+   clamp added in e408c8d. A weighted gather of clamped node velocities cannot exceed 200, so
+   this is evidence the clamp is not in the running build — grid_op.comp is loaded once at setup,
+   and material-parameter sliders do not reload shaders. One full restart loads it.
+
+Remaining known gaps, none blocking: under-damped sloshing (viscosity 3 is low, no surface
+tension), and the momentum-clamp fix must actually be loaded before the "ping" is judged.
+
