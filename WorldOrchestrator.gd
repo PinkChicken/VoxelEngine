@@ -13,32 +13,14 @@ var _material_db: MaterialDB
 var _runtime: SimulationRuntime
 var _material_simulation: PackedInt32Array  # material_id → SimulationClass (flat cache)
 
-# --- Inner classes ---
-
-class VoxelMutation:
-	var world_pos: Vector3i
-	var chunk_pos: Vector3i
-	var local_idx: int
-	var material_id: int
-	var fill: int
-	var temp: int
-	var flags: int
-	var priority: int
-	# Linked move pair: place mutation stores source pos; clear mutation stores dest pos.
-	# Zero means "not part of a move pair" (standalone player edit, etc.).
-	# Commit drops a clear if its paired place mutation did not win the destination.
-	var move_partner: Vector3i = Vector3i.ZERO
-
-
 # --- GPU buffer state ---
 
 const MAX_CHANGELOG_ENTRIES := 524288  # 4 MB at 8 bytes/entry
 # Raised from 131072 (2026-07-02) — a falling sphere now legitimately activates far more
 # voxels per tick than any scenario this was originally sized for (a single droplet's
 # scale). Measured overflow: 259316 entries in one Transport dispatch, ~2x the old cap.
-# Must match MAX_CHANGELOG in every shader that writes this buffer (fluid_flux.comp,
-# granular_sim.comp, edit_apply.comp) — a mismatch either wastes allocated capacity or lets
-# a shader write past what's actually allocated here.
+# Must match MAX_CHANGELOG in mpm/readout.comp (the only shader that writes this buffer) —
+# a mismatch either wastes allocated capacity or lets a shader write past what's allocated.
 
 var _compute           # ComputeHelper
 var _edit_dispatcher   # EditDispatcher — untyped to avoid circular class_name dependency
@@ -51,14 +33,8 @@ const SURFACE_OUT_MAX_PER_CHUNK  := 16384  # max surface entries per chunk (gene
 const SURFACE_EXTRACT_MAX_BATCH  := 8      # max chunks per batch dispatch
 var _surface_slot_list_buf: RID            # int[SURFACE_EXTRACT_MAX_BATCH] — slot per chunk
 var _voxel_buf_a: RID  # canonical: renderer reads this, simulation reads this
-var _voxel_buf_b: RID  # scratch:   simulation writes here; swapped after each sim frame
-var _sim_active_buf: RID  # 1 u32 per voxel slot; zeroed before sim, set on grain move
 var _chunk_table: RID
 var _changelog_buf: RID      # layout: [u32 count | (flat_idx u32, new_value u32) × count]
-var _material_sim_buf: RID   # 256 u32s: material_id → SimulationClass (flat cache on GPU)
-var _material_flow_buf: RID  # 256 floats: material_id → MaterialDef.flow (fluid_flux.comp viscosity)
-var _material_density_buf: RID  # 256 floats: material_id → MaterialDef.density (density-ordered
-								 # liquid stacking, 2026-07-12) — 0.0 default = not density-sorted
 var _grid_min: Vector3i = Vector3i.ZERO
 var _grid_span: Vector3i = Vector3i.ZERO
 var _chunk_to_slot: Dictionary = {}   # Vector3i → slot index
@@ -72,7 +48,6 @@ var _free_slots: Array[int] = []  # pool of available voxel buffer slot indices
 
 # --- Simulation state ---
 
-var _pending_mutations: Array[VoxelMutation] = []
 var _last_changelog_count: int = 0
 
 
@@ -110,12 +85,6 @@ func _ready() -> void:
 
 func _exit_tree() -> void:
 	_free_voxel_buffers()
-	if _material_sim_buf.is_valid():
-		_compute.free_rid(_material_sim_buf)
-	if _material_flow_buf.is_valid():
-		_compute.free_rid(_material_flow_buf)
-	if _material_density_buf.is_valid():
-		_compute.free_rid(_material_density_buf)
 	if _surface_out_buf.is_valid():
 		_compute.free_rid(_surface_out_buf)
 	if _surface_params_buf.is_valid():
@@ -133,38 +102,6 @@ func _build_material_cache() -> void:
 	_material_simulation.fill(MaterialDef.SimulationClass.NONE)
 	for def in _material_db.materials:
 		_material_simulation[def.id] = def.simulation
-	# Upload flat cache to GPU for simulation shaders.
-	if _material_sim_buf.is_valid():
-		_compute.free_rid(_material_sim_buf)
-	var buf := PackedByteArray(); buf.resize(256 * 4)
-	for i in range(256):
-		buf.encode_s32(i * 4, _material_simulation[i])
-	_material_sim_buf = _compute.buffer_upload(buf)
-
-	# Per-material flow (viscosity) cache — fluid_flux.comp binding 13. Defaults to 1.0
-	# (thin/water) for every id, INCLUDING unregistered ones, so a material that somehow
-	# isn't in _material_db.materials never silently freezes (a 0.0 default would zero
-	# g_eff/cap_scale in the shader's viscosity formula and stop that liquid from flowing).
-	if _material_flow_buf.is_valid():
-		_compute.free_rid(_material_flow_buf)
-	var flow_buf := PackedByteArray(); flow_buf.resize(256 * 4)
-	for i in range(256):
-		flow_buf.encode_float(i * 4, 1.0)
-	for def in _material_db.materials:
-		flow_buf.encode_float(def.id * 4, def.flow)
-	_material_flow_buf = _compute.buffer_upload(flow_buf)
-
-	# Per-material density cache (2026-07-12) — fluid_flux.comp binding 21. Defaults to
-	# 0.0 (NOT density-sorted) for every id, including unregistered ones — unlike flow's
-	# "default to 1.0 so nothing silently freezes," the safe default here is EXCLUSION:
-	# a material nobody configured a density for should never accidentally participate
-	# in density-ordered stacking just because it happens to be SIM_LIQUID.
-	if _material_density_buf.is_valid():
-		_compute.free_rid(_material_density_buf)
-	var density_buf := PackedByteArray(); density_buf.resize(256 * 4)
-	for def in _material_db.materials:
-		density_buf.encode_float(def.id * 4, def.density)
-	_material_density_buf = _compute.buffer_upload(density_buf)
 
 
 func _process(delta: float) -> void:
@@ -186,108 +123,13 @@ func get_voxel_buf() -> RID: return _voxel_buf_a
 func get_chunk_table() -> RID: return _chunk_table
 func get_voxel_buf_capacity() -> int: return _voxel_buf_capacity
 func is_grid_valid() -> bool:
-	return _voxel_buf_a.is_valid() and _chunk_table.is_valid() and _material_sim_buf.is_valid()
-
-func swap_voxel_bufs() -> void:
-	var tmp := _voxel_buf_a
-	_voxel_buf_a = _voxel_buf_b
-	_voxel_buf_b = tmp
+	return _voxel_buf_a.is_valid() and _chunk_table.is_valid()
 
 func get_changelog_buf() -> RID: return _changelog_buf
-func get_material_sim_buf() -> RID: return _material_sim_buf
-func get_material_flow_buf() -> RID: return _material_flow_buf
-func get_material_density_buf() -> RID: return _material_density_buf
 
 func reset_changelog() -> void:
 	var zero := PackedByteArray(); zero.resize(4); zero.fill(0)
 	_compute.buffer_update(_changelog_buf, 0, zero)
-
-
-# Debug tool (world.gd binds F9): downloads the full voxel buffer once and prints total
-# fill + liquid-voxel count per chunk, plus a grand total, to the console. On-demand only
-# — never call this per-frame, it's a full GPU→CPU readback of every loaded chunk.
-# Intended for tracking down conservation bugs in the fluid pipeline: compare the total
-# before/after a single step_once() tick to see exactly how much fill a tick gained or lost.
-func debug_dump_fluid_stats() -> void:
-	if not _voxel_buf_a.is_valid():
-		print("[FluidDebug] voxel buffer not ready")
-		return
-	var cs := _chunk_manager.chunk_size
-	var vpc := cs * cs * cs
-	var total_bytes := _voxel_buf_capacity * vpc * 4
-	var data: PackedByteArray = _compute.download_range(_voxel_buf_a, 0, total_bytes)
-
-	var grand_total_fill := 0
-	var grand_total_voxels := 0
-	var per_chunk: Array = []  # [{pos, fill, count}]
-	# Per-material breakdown (2026-07-16, added while chasing the punch conservation leak —
-	# the combined per-chunk total above can't distinguish "water settling into the pool"
-	# from "oil actually vanishing," which is exactly the question that mattered). Keyed by
-	# mat_id: total fill, voxel count, fill-weighted Y sum (for an average "surface" height
-	# that isn't skewed by counting empty/low-fill cells the same as full ones), min/max Y.
-	var per_mat: Dictionary = {}  # mat_id -> {fill, count, y_fill_sum, min_y, max_y}
-
-	for slot in range(_voxel_buf_capacity):
-		var chunk_pos: Variant = _slot_to_chunk.get(slot, null)
-		if chunk_pos == null:
-			continue
-		var base := slot * vpc * 4
-		var chunk_fill := 0
-		var chunk_count := 0
-		for i in range(vpc):
-			var off := base + i * 4
-			var mat_id := data[off]
-			if mat_id == 0:
-				continue
-			if _material_simulation[mat_id] != MaterialDef.SimulationClass.LIQUID:
-				continue
-			var fill := data[off + 1]
-			chunk_fill += fill
-			chunk_count += 1
-
-			var local_y := (i / cs) % cs
-			var world_y: int = chunk_pos.y * cs + local_y
-			if not per_mat.has(mat_id):
-				per_mat[mat_id] = {"fill": 0, "count": 0, "y_fill_sum": 0, "min_y": world_y, "max_y": world_y}
-			var m: Dictionary = per_mat[mat_id]
-			m["fill"] += fill
-			m["count"] += 1
-			m["y_fill_sum"] += world_y * fill
-			if world_y < m["min_y"]: m["min_y"] = world_y
-			if world_y > m["max_y"]: m["max_y"] = world_y
-		if chunk_count > 0:
-			per_chunk.append({"pos": chunk_pos, "fill": chunk_fill, "count": chunk_count})
-			grand_total_fill += chunk_fill
-			grand_total_voxels += chunk_count
-
-	print("[FluidDebug] === snapshot: %d chunk(s) with liquid ===" % per_chunk.size())
-	for entry in per_chunk:
-		var avg: float = float(entry["fill"]) / entry["count"]
-		print("[FluidDebug]   chunk %s: total_fill=%d  liquid_voxels=%d  avg_fill=%.1f" % [entry["pos"], entry["fill"], entry["count"], avg])
-	var grand_avg: float = (float(grand_total_fill) / grand_total_voxels) if grand_total_voxels > 0 else 0.0
-	print("[FluidDebug] TOTAL fill=%d across %d liquid voxels (avg %.1f)" % [grand_total_fill, grand_total_voxels, grand_avg])
-
-	print("[FluidDebug] --- per-material breakdown ---")
-	var mat_ids: Array = per_mat.keys()
-	mat_ids.sort()
-	for mat_id in mat_ids:
-		var m: Dictionary = per_mat[mat_id]
-		# Chunk.Mat's own id->name mapping, kept local rather than depending on MaterialDB
-		# having an instance-bound lookup available from a static-style call here.
-		var mat_name: String
-		match mat_id:
-			Chunk.Mat.ROCK: mat_name = "ROCK"
-			Chunk.Mat.SAND: mat_name = "SAND"
-			Chunk.Mat.WATER: mat_name = "WATER"
-			Chunk.Mat.GLASS: mat_name = "GLASS"
-			Chunk.Mat.FIRE: mat_name = "FIRE"
-			Chunk.Mat.SMOKE: mat_name = "SMOKE"
-			Chunk.Mat.OIL: mat_name = "OIL"
-			_: mat_name = "mat%d" % mat_id
-		var avg_fill: float = float(m["fill"]) / m["count"]
-		var avg_y: float = (float(m["y_fill_sum"]) / m["fill"]) if m["fill"] > 0 else 0.0
-		print("[FluidDebug]   mat=%d (%s): total_fill=%d  voxels=%d  avg_fill=%.1f  min_y=%d  max_y=%d  fill-weighted avg_y=%.2f" \
-			% [mat_id, mat_name, m["fill"], m["count"], avg_fill, m["min_y"], m["max_y"], avg_y])
 
 # Downloads the changelog count, dispatches patch_apply.comp to sync _voxel_buf_a.
 func apply_changelog() -> void:
@@ -372,47 +214,6 @@ func sync_chunk_to_cpu(chunk_pos: Vector3i) -> void:
 	chunk.rebuild_counts_and_mask(_material_simulation)
 
 
-# Applies (flat_idx, new_value) pairs from buf to block_data (CPU mirror only).
-# Save-time path only — not called during normal gameplay.
-# Shared by apply_changelog() and EditDispatcher._drain_edit_changelog().
-# buf layout: u32 count at byte 0, then (flat_idx u32, new_value u32) pairs.
-func sync_block_data_from_buf(buf: PackedByteArray, count: int) -> Array[Vector3i]:
-	var cs := _chunk_manager.chunk_size
-	var voxels_per_chunk := cs * cs * cs
-	var affected: Dictionary = {}
-
-	for i in range(count):
-		var off := 4 + i * 8
-		var flat_idx  := int(buf.decode_u32(off))
-		var new_value := buf.decode_u32(off + 4)
-
-		var slot          := flat_idx / voxels_per_chunk
-		var local_byte_idx := (flat_idx % voxels_per_chunk) * Chunk.VOXEL_STRIDE
-
-		if not _slot_to_chunk.has(slot):
-			continue
-		var chunk_pos: Vector3i = _slot_to_chunk[slot]
-		var chunk: Chunk = _chunk_manager.chunks.get(chunk_pos)
-		if not chunk:
-			continue
-
-		var mat_id   := int(new_value & 0xFF)
-		var fill     := int((new_value >> 8) & 0xFF)
-		var raw_temp := int((new_value >> 16) & 0xFF)
-		var temp     := raw_temp if raw_temp < 128 else raw_temp - 256
-		var flags    := int((new_value >> 24) & 0xFF)
-
-		var old_sim := _material_simulation[chunk.block_data[local_byte_idx]]
-		var new_sim := _material_simulation[mat_id]
-		if chunk.apply_mutation(local_byte_idx, mat_id, fill, temp, flags, old_sim, new_sim):
-			affected[chunk_pos] = true
-
-	var positions: Array[Vector3i] = []
-	for pos in affected:
-		positions.append(pos)
-	return positions
-
-
 func _load_patch_shader() -> String:
 	var f := FileAccess.open("res://shaders/patch_apply.comp", FileAccess.READ)
 	if not f:
@@ -458,7 +259,6 @@ func extract_surface_voxels_batch(positions: Array[Vector3i]) -> Dictionary:
 	if n == 0 or _surface_extract_pipeline.is_empty():
 		return {}
 	if not _voxel_buf_a.is_valid() or not _surface_out_buf.is_valid() \
-			or not _material_sim_buf.is_valid() or not _sim_active_buf.is_valid() \
 			or not _surface_slot_list_buf.is_valid():
 		return {}
 
@@ -494,15 +294,9 @@ func extract_surface_voxels_batch(positions: Array[Vector3i]) -> Dictionary:
 	u2.binding = 2; u2.add_id(_surface_params_buf)
 	var u3 := RDUniform.new()
 	u3.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	u3.binding = 3; u3.add_id(_material_sim_buf)
-	var u4 := RDUniform.new()
-	u4.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	u4.binding = 4; u4.add_id(_sim_active_buf)
-	var u5 := RDUniform.new()
-	u5.uniform_type = RenderingDevice.UNIFORM_TYPE_STORAGE_BUFFER
-	u5.binding = 5; u5.add_id(_surface_slot_list_buf)
+	u3.binding = 3; u3.add_id(_surface_slot_list_buf)
 
-	_compute.run(_surface_extract_pipeline, [u0, u1, u2, u3, u4, u5], n * 4, 4, 4)
+	_compute.run(_surface_extract_pipeline, [u0, u1, u2, u3], n * 4, 4, 4)
 	_compute.submit()
 	_compute.sync()
 
@@ -609,12 +403,6 @@ func _free_voxel_buffers() -> void:
 	if _voxel_buf_a.is_valid():
 		_compute.free_rid(_voxel_buf_a)
 		_voxel_buf_a = RID()
-	if _voxel_buf_b.is_valid():
-		_compute.free_rid(_voxel_buf_b)
-		_voxel_buf_b = RID()
-	if _sim_active_buf.is_valid():
-		_compute.free_rid(_sim_active_buf)
-		_sim_active_buf = RID()
 	if _chunk_table.is_valid():
 		_compute.free_rid(_chunk_table)
 		_chunk_table = RID()
@@ -648,8 +436,6 @@ func _init_grid() -> void:
 	var voxel_bytes := capacity * voxels_per_chunk * 4
 	var voxel_data  := PackedByteArray(); voxel_data.resize(voxel_bytes); voxel_data.fill(0)
 	_voxel_buf_a    = _compute.buffer_upload(voxel_data)
-	_voxel_buf_b    = _compute.buffer_upload(voxel_data)
-	_sim_active_buf = _compute.buffer_upload(voxel_data)
 	_voxel_buf_capacity = capacity
 
 	# Seed free slot pool (pop_back gives lowest index first for cache locality).
@@ -697,8 +483,6 @@ func _add_chunk_to_grid(chunk_pos: Vector3i) -> void:
 		var new_capacity := _voxel_buf_capacity * 2
 		var new_bytes := new_capacity * cs * cs * cs * 4
 		_voxel_buf_a = _compute.buffer_grow(_voxel_buf_a, old_bytes, new_bytes)
-		_voxel_buf_b = _compute.buffer_grow(_voxel_buf_b, old_bytes, new_bytes)
-		_sim_active_buf = _compute.buffer_grow(_sim_active_buf, old_bytes, new_bytes)
 		for i in range(new_capacity - 1, _voxel_buf_capacity - 1, -1):
 			_free_slots.append(i)
 		_voxel_buf_capacity = new_capacity
@@ -762,91 +546,3 @@ func _remove_chunk_from_grid(chunk_pos: Vector3i) -> void:
 	_slot_to_chunk.erase(slot)
 	_voxel_buf_count -= 1
 	_chunks_loaded -= 1
-
-
-# --- Public API ---
-
-func submit_mutation_direct(chunk_pos: Vector3i, local_idx: int, world_pos: Vector3i,
-		mat_id: int, fill: int = 255, temp: int = 0, flags: int = 0, priority: int = 0) -> void:
-	var m := VoxelMutation.new()
-	m.world_pos = world_pos
-	m.chunk_pos = chunk_pos
-	m.local_idx = local_idx
-	m.material_id = mat_id
-	m.fill = fill
-	m.temp = temp
-	m.flags = flags
-	m.priority = priority
-	_pending_mutations.append(m)
-
-
-func submit_batch(mutations: Array) -> void:
-	_pending_mutations.append_array(mutations)
-
-
-func submit_mutation(world_pos: Vector3i, mat_id: int, fill: int = 255,
-		temp: int = 0, flags: int = 0, priority: int = 0) -> void:
-	var cm := _chunk_manager
-	var chunk_pos := cm.voxel_to_chunk_position(world_pos)
-	if not cm.chunks.has(chunk_pos):
-		return
-	var local_pos := cm.global_to_local(world_pos)
-	var m := VoxelMutation.new()
-	m.world_pos = world_pos
-	m.chunk_pos = chunk_pos
-	m.local_idx = (local_pos.z * cm.chunk_size * cm.chunk_size + local_pos.y * cm.chunk_size + local_pos.x) * Chunk.VOXEL_STRIDE
-	m.material_id = mat_id
-	m.fill = fill
-	m.temp = temp
-	m.flags = flags
-	m.priority = priority
-	_pending_mutations.append(m)
-
-
-# --- Commit ---
-
-func commit() -> void:
-	if _pending_mutations.is_empty():
-		return
-
-	var best: Dictionary = {}  # Vector3i -> VoxelMutation
-	for m in _pending_mutations:
-		if not best.has(m.world_pos) or m.priority > best[m.world_pos].priority:
-			best[m.world_pos] = m
-	_pending_mutations.clear()
-
-	# Drop conditional clears whose paired place mutation lost the destination.
-	# This prevents the losing grain from being deleted when two grains compete
-	# for the same empty cell in the same frame.
-	var to_drop: Array[Vector3i] = []
-	for pos in best:
-		var m: VoxelMutation = best[pos]
-		if m.material_id == 0 and m.move_partner != Vector3i.ZERO:
-			var dest_winner: VoxelMutation = best.get(m.move_partner)
-			if dest_winner == null or dest_winner.move_partner != pos:
-				to_drop.append(pos)
-	for pos in to_drop:
-		best.erase(pos)
-
-	var affected_chunks: Dictionary = {}
-
-	for m in best.values():
-		var chunk = _chunk_manager.chunks.get(m.chunk_pos)
-		if not chunk:
-			continue
-		var old_sim := _material_simulation[chunk.block_data[m.local_idx]]
-		var new_sim := _material_simulation[m.material_id]
-		if chunk.apply_mutation(m.local_idx, m.material_id, m.fill, m.temp, m.flags, old_sim, new_sim):
-			affected_chunks[m.chunk_pos] = true
-
-	if affected_chunks.is_empty():
-		return
-
-	# One full-chunk upload per affected chunk — passes block_data by ref, no GDScript copy.
-	for chunk_pos in affected_chunks:
-		_update_chunk_in_grid(chunk_pos)
-
-	var positions: Array[Vector3i] = []
-	for pos in affected_chunks:
-		positions.append(pos)
-	chunks_committed.emit(positions)

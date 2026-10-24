@@ -42,13 +42,12 @@ changelog); rendering and collision read from it. Nothing else is shared.
 - 32³ chunks, `VOXEL_STRIDE = 4`: `[material_id, fill, temperature, flags]`.
 - **AIR is exactly `0u` in all four bytes** — the empty-voxel invariant (a 32-bit zero test).
 - **Effective usage is 1 of 4 bytes.** `material_id` is the only field the engine needs. `fill` is
-  written by `readout.comp` (mass → quantised fill) and has exactly one remaining consumer: the
-  raymarcher's LIQUID tint (`raymarch.comp` — "partial fill = darker, reads as shallow").
+  written by `readout.comp` (mass → quantised fill) but is now **read by nothing** — the LIQUID
+  fill tint was removed 2026-08-13, along with `edit_apply.comp`'s "top up fill" behaviour.
   `temperature` and `flags` are **unused** — only the generic edit path passes them through, and
   `readout.comp` zeroes both.
-  Removing `fill` (and re-deciding the liquid tint) would let `VOXEL_STRIDE` drop to 1 byte — a 4×
-  reduction in the raymarcher's per-sample bandwidth, the biggest per-frame cost (§9.2). **Planned,
-  not done.**
+  Retiring the write side (and `VOXEL_STRIDE` 4 → 1) is the next step: a 4× reduction in the
+  raymarcher's per-sample bandwidth, the biggest per-frame cost (`§9.2`).
 - `_voxel_buf_a` is the persistent world: the renderer binds it, collision extracts from it, MPM
   writes to it (see §10.2 for what "persistent" means versus particles).
 - Per-chunk `_simulation_mask` (a bitmask of which material *classes* are present) and
@@ -96,12 +95,15 @@ plugin. There is no plug-in interface and no mode switch.
 | `_chunk_table` | `chunk_coord → slot` for the voxel array (persistent) |
 | `_changelog_buf` | `[u32 count \| (flat_idx, new_value) × count]`; simulation → voxels |
 | `_surface_*` | surface-extraction outputs for `VoxelMover` |
-| `_material_sim_buf` | 256 u32: material_id → class (edit path + MPM chunk discovery) |
 
-`_voxel_buf_b`, `_sim_active_buf`, `_material_flow_buf`, `_material_density_buf`, and
-`swap_voxel_bufs()` are leftovers of the deleted CA solvers. They are still allocated but have no
-remaining consumer (dead-code cleanup follow-up; they were kept out of the CA-deletion commit to
-avoid an untested buffer-lifecycle change).
+**CA-era buffer subsystem removed (2026-08-13).** `_voxel_buf_b` (granular CAS scratch),
+`_sim_active_buf` (granular in-flight-grain flag), `_material_flow_buf` / `_material_density_buf`
+(fluid flux density sorting), and `_material_sim_buf` (a GPU mirror only `surface_extract.comp`
+read) are gone — each was allocated at full voxel-buffer size and never written. With them went
+`swap_voxel_bufs()`, `sync_block_data_from_buf()`, the `VoxelMutation`/`submit_mutation*`/
+`submit_batch`/`commit()` API (zero callers since `EditDispatcher`), `debug_dump_fluid_stats()`
+(an 82-line full-buffer readback), and `Chunk.has_simulation()`. `surface_extract.comp` also lost
+its "skip in-flight granular grains" filter (bindings 3/4), which had been permanently inert.
 
 ### 3.2 The write path
 
@@ -516,11 +518,9 @@ Also open:
   phase 2 deferred).
 - **Fill-aware promotion** — §4.5's lossy sleep/wake bridge; either read `fill` in
   `promote_existing_voxels()` or measure and bound the drift.
-- **Voxel word shrink (4 → 1 byte)** — `fill` is render-only (liquid tint) and `temperature`/`flags`
-  are unused (§2.1). Removing the tint dependency buys a 4× raymarcher bandwidth cut (§9.2).
+- **Voxel word shrink (4 → 1 byte)** — `fill`'s last reader (the liquid tint) is gone; only the
+  write side and `VOXEL_STRIDE = 4` remain (§2.1). This is the 4× raymarcher bandwidth win.
 - **Sand repose validation** alongside water.
-- **Dead CA buffers** in `WorldOrchestrator` (`_voxel_buf_b`, `_sim_active_buf`,
-  `_material_flow_buf`, `_material_density_buf`, `swap_voxel_bufs()`) — remove the dead subsystem.
 - **Optimization pass** (§9) — re-derive; the CA-derived costs are gone.
 
 **Orthogonal, deliberately deferred:** resolution LOD (coarsen grid + particle size together, 2×

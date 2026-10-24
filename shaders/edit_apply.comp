@@ -93,12 +93,7 @@ void main() {
             // Air → place new voxel at full fill.
             new_voxel = new_mat | (255u << 8u);
         } else if (mat_id == new_mat) {
-            // Same material already here — top up fill to 255.
-            // This lets holding left-click continuously add volume to low-fill liquid cells
-            // instead of silently skipping them (which caused dark, shallow-looking water).
-            uint old_fill = (current >> 8u) & 0xFFu;
-            if (old_fill >= 255u) return;
-            new_voxel = (current & 0xFFFF00FFu) | (255u << 8u);
+            return;  // Same material already here — nothing to do.
         } else {
             return;  // occupied by a different material — skip
         }

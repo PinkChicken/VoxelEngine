@@ -72,7 +72,7 @@ const uint MAX_CHANGELOG = 524288u;  // must match WorldOrchestrator.MAX_CHANGEL
 
 uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
 
-// Ported 1:1 from shaders/granular_sim.comp's world_to_flat() (same chunk_table scheme) —
+// Chunk-table world-to-flat addressing (same scheme as the voxel buffer) —
 // duplicated here rather than shared across files, matching this project's existing
 // convention (grid_op.comp already duplicates it rather than using a #include, which GLSL
 // compute shaders in this codebase don't use).

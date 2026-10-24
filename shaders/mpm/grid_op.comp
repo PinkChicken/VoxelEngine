@@ -10,10 +10,10 @@ layout(local_size_x = 64) in;
 // wood) would promote into a particle, so this must key off MaterialDB's table, not a hardcoded
 // material check).
 //
-// Addressing mirrors shaders/granular_sim.comp's world_to_flat()/read_a() exactly — same
-// chunk_table/grid_min/grid_span scheme, same packed-uint voxel format (material id in the low
-// byte) — so this reads the real _voxel_buf_a/chunk_table once MPMSimulation.bind_voxel_world()
-// is pointed at WorldOrchestrator's real RIDs instead of a synthetic test buffer.
+// Addressing matches the voxel buffer's chunk_table/grid_min/grid_span scheme, with the same
+// packed-uint voxel format (material id in the low byte) — so this reads the real
+// _voxel_buf_a/chunk_table once MPMSimulation.bind_voxel_world() is pointed at
+// WorldOrchestrator's real RIDs instead of a synthetic test buffer.
 
 layout(set = 0, binding = 0, std430) readonly buffer Params {
 	// Rectangular region grid (2026-08-13) — was a single cube edge `n_grid`. Must match
@@ -49,7 +49,7 @@ const uint MODEL_STATIC = 1u;
 const uint MAT_STRIDE_U32 = 8u;
 uint mat_model(uint mat_id) { return mat_table.data[mat_id * MAT_STRIDE_U32 + 0u]; }
 
-// Ported 1:1 from shaders/granular_sim.comp's world_to_flat() (same chunk_table scheme).
+// Chunk-table world-to-flat addressing (same scheme as the voxel buffer).
 int world_to_flat(ivec3 gpos) {
 	int cs = VP.chunk_size;
 	int vpc = cs * cs * cs;

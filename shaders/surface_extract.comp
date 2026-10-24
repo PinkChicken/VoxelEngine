@@ -2,7 +2,7 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
 // Batch surface extractor: processes N chunks in one dispatch.
-// Dispatch: (N * 4, 4, 4) workgroups -- identical encoding to granular_sim.comp.
+// Dispatch: (N * 4, 4, 4) workgroups.
 // Each thread derives its chunk from gl_WorkGroupID.x / 4.
 //
 // Output buffer is a flat uint[] split into per-chunk sub-ranges of stride
@@ -21,11 +21,7 @@ layout(set = 0, binding = 2, std430) readonly buffer ExtractParams {
     int chunk_count;
     int _pad;
 } params;
-layout(set = 0, binding = 3, std430) readonly buffer MaterialSim  { uint data[256]; } material_sim;
-layout(set = 0, binding = 4, std430) readonly buffer SimActiveBuf { uint data[]; } sim_active;
-layout(set = 0, binding = 5, std430) readonly buffer SlotList     { int  data[]; } slot_list;
-
-const uint SIM_GRANULAR = 1u;
+layout(set = 0, binding = 3, std430) readonly buffer SlotList     { int  data[]; } slot_list;
 
 void main() {
     int chunk_idx  = int(gl_WorkGroupID.x) / 4;
@@ -48,12 +44,6 @@ void main() {
     uint voxel     = voxels.data[slot * vpc + local_flat];
     uint mat_id    = voxel & 0xFFu;
     if (mat_id == 0u) return;
-
-    // Granular voxels that moved this simulation tick are in-flight particles -- skip.
-    if (material_sim.data[mat_id] == SIM_GRANULAR) {
-        if (sim_active.data[slot * vpc + local_flat] != 0u)
-            return;
-    }
 
     bool exposed = false;
     int ndx[6] = int[6]( 1,-1, 0, 0, 0, 0);

@@ -114,10 +114,9 @@ func _unhandled_input(event: InputEvent) -> void:
 			simulation_runtime.step_once()
 			print("[SimStep] advanced 1 tick")
 		elif event.keycode == KEY_T:
-			# MPM time-scale probe (2026-08-13). T used to be the CA buoyancy tint, which does
-			# nothing now that the CA sims are disabled, so the key is reused for the experiment
-			# that actually matters: is the fluid meta-stable because the substep is too coarse?
-			# Watch whether the body still expands to fill its container as dt gets finer.
+			# MPM time-scale probe. T cycles the simulated-seconds-per-tick ladder so you can see
+			# whether the body is metastable because the substep is too coarse: watch whether it
+			# still expands to fill its container as dt gets finer.
 			print("[MPM] %s" % mpm_simulation.cycle_timescale(simulation_runtime.mpm_substeps_per_tick))
 		elif event.keycode == KEY_O:
 			# Material parameter sweep (2026-08-13). Cycles WATER's MPM physics through a ladder of

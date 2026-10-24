@@ -14,10 +14,6 @@ var _simulation_counts := PackedInt32Array()
 var _simulation_mask: int = 0
 
 
-# sim_class is a SimulationClass index (1-4). Bit index = sim_class - 1.
-func has_simulation(sim_class: int) -> bool:
-	return (_simulation_mask & MaterialDef.SIM_BITS[sim_class]) != 0
-
 func active_simulation_mask() -> int:
 	return _simulation_mask
 

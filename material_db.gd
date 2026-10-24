@@ -88,8 +88,6 @@ func _default_materials() -> Array[MaterialDef]:
 	water.simulation = MaterialDef.SimulationClass.LIQUID
 	water.gravity = MaterialDef.GravityMode.DOWN
 	water.color = Color(0.2, 0.4, 0.9, 0.7)
-	water.flow = 1.0  # thin — the viscosity baseline every other liquid is scaled against
-	water.density = 1.0  # baseline every other liquid's density is set relative to
 	water.mpm_model = MaterialDef.MPMModel.FLUID
 	water.mpm_density = 1.0  # baseline every other MPM material's mpm_density is set relative to
 	water.mpm_stiffness = 8000.0  # swept and re-defaulted in the retired prototype (brief §34.3) — tight J, stable to 300K
@@ -130,8 +128,6 @@ func _default_materials() -> Array[MaterialDef]:
 	oil.simulation = MaterialDef.SimulationClass.LIQUID
 	oil.gravity = MaterialDef.GravityMode.DOWN
 	oil.color = Color(0.2, 0.15, 0.05, 0.85)
-	oil.flow = 0.69  # thicker than water — runs through the same viscosity formula (fluid_flux.comp)
-	oil.density = 0.85  # lighter than water (1.0) — floats on top when density-stacking is on
 	oil.mpm_model = MaterialDef.MPMModel.FLUID
 	oil.mpm_density = 0.85  # lighter than water — floats via emergent MPM sorting, no bespoke code
 	oil.mpm_stiffness = 6000.0  # slightly softer than water; untuned, a starting point
