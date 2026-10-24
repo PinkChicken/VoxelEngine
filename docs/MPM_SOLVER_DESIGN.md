@@ -568,3 +568,44 @@ Two conclusions:
 Remaining known gaps, none blocking: under-damped sloshing (viscosity 3 is low, no surface
 tension), and the momentum-clamp fix must actually be loaded before the "ping" is judged.
 
+### S0 CLOSED (basin test)
+
+The missing case was "does water HOLD DEPTH in a container", which flat-ground tests cannot
+measure. A rock basin (≈30×30) filled and then run:
+
+```
+alive=13648 mass=1706.00 depth=27.0 footprint=30x30 max_speed=0.0000 compactness=0.90
+```
+
+`compactness 0.90` (depth ≈ footprint) and `max_speed 0.0000` (at rest) is a body holding
+depth and settling — exactly the discriminator S0 asked for. It then levels into the basin
+floor (compactness → 0.20) and re-settles as more is added, holding compactness 0.5–0.9 at
+rest. **The formulation represents a compact, resting, contained water body.** §9.1 is
+resolved: there is no dispersion defect; it was the overflow all along.
+
+### The scale wall is PARTICLES, not the buffer
+
+Adding material to the basin exposes the real limit. Cost per tick vs particle count
+(nodes fixed at 262,144, 24 substeps):
+
+| particles | ms/tick |
+|---|---|
+| 8,900 | 2.8 |
+| 22,778 | 4.2 |
+| 34,717 | 5.0 |
+| 48,863 | 6.2 |
+| 63,010 | 8.2 |
+| 78,385 | 9.2 |
+| 100,000 | 13.4 |
+
+Cost is ~linear in particles, and 100,000 ≈ 13 ms is ~80% of a 60 Hz frame before rendering.
+A larger `max_particles` only removes the cap; it does not buy volume. The levers for "more
+water per tick" are, in order:
+
+1. **`promote_stride`** (already implemented): 1 particle per stride³ voxels. stride 2 = 8× the
+   water volume at the same particle count and cost, at coarser detail. This is S3/LOD in embryo.
+2. **Fewer substeps** (24 → 12) halves particle cost, trading the stiffness stability ceiling.
+3. **S1 sparse grid trims only NODE cost (~2.4 ms of the total)**, so it is NOT the answer to
+   "way more water" — particles dominate now. S1 matters when the node box is the cost, e.g.
+   scattered small bodies, not one dense basin.
+
