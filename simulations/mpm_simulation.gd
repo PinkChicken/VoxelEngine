@@ -164,6 +164,26 @@ var _timescale_index: int = 0
 		_apply_water_override(false)
 
 
+# Per-particle rest volume, and the fixed-point scale derived from it.
+#
+# MUST be recomputed whenever promote_stride or particle_subdiv changes. p2g.comp computes its
+# pressure impulse as -dt * 4E * P.p_vol * (J-1) * inv_dx^2, using THIS value — so if particles are
+# subdivided and only their MASS is divided, each particle still claims a full voxel's worth of
+# pressure response while carrying 1/sub^3 of the mass. Total pressure momentum then comes out
+# sub^3 times too high against the same total mass, and the fluid behaves as though its stiffness
+# were multiplied by sub^3 (subdiv 2 turned E=8000 into an effective 64,000: over-pressurised to
+# the point where the max_speed clamp engaged and the body froze mid-air).
+#
+# Dividing p_vol by sub^3 keeps mass, volume and stiffness consistent: each particle owns 1/sub^3
+# of the voxel's volume and the matching share of both its mass and its pressure response.
+# fp_scale compensates automatically — g_mass ends up as density*weight*NODE_BUDGET regardless.
+func _refresh_scales() -> void:
+	var st := maxi(promote_stride, 1)
+	var sub := maxi(particle_subdiv, 1)
+	p_vol = pow(dx * 0.5, 3.0) * float(st * st * st) / float(sub * sub * sub)
+	fp_scale = NODE_BUDGET / p_vol
+
+
 func _apply_water_override(reseed: bool) -> void:
 	# Setters fire during scene load, before _ready has resolved the material DB.
 	if not is_setup or not is_instance_valid(_material_db):
@@ -288,8 +308,7 @@ func setup() -> bool:
 	setup_error = ""
 	dx = 1.0
 	inv_dx = 1.0
-	p_vol = pow(dx * 0.5, 3.0)
-	fp_scale = NODE_BUDGET / p_vol
+	_refresh_scales()
 
 	_clear   = _compute.compile_shader(_load_shader("res://shaders/mpm/clear_grid.comp"))
 	_p2g     = _compute.compile_shader(_load_shader("res://shaders/mpm/p2g.comp"))
@@ -676,6 +695,7 @@ func _active_signature() -> int:
 
 
 func _build_region(origin: Vector3i, dims: Vector3i, chunks: Array[Vector3i], prev: ChunkRegion = null) -> ChunkRegion:
+	_refresh_scales()  # pick up any promote_stride / particle_subdiv change
 	var w := ChunkRegion.new()
 	w.origin = origin
 	w.dims = dims
@@ -807,8 +827,6 @@ func promote_existing_voxels(w: ChunkRegion, chunks: Array[Vector3i]) -> int:
 	var mats: Array[int] = []
 	var mss: Array[float] = []
 	var st_v := float(st)
-	var st_vol := float(st * st * st)
-	var sub_vol := float(sub * sub * sub)
 	for cp in chunks:
 		var origin := cp * n_grid
 		_orchestrator.sync_chunk_to_cpu(cp)  # block_data is stale-by-design (CLAUDE.md)
@@ -820,9 +838,9 @@ func promote_existing_voxels(w: ChunkRegion, chunks: Array[Vector3i]) -> int:
 					if not _is_mpm_material(mat):
 						continue
 					var def := _material_db.get_def(mat)
-					# Split the sampled block's mass across sub^3 particles, so total mass and total
-					# volume are unchanged. See particle_subdiv's declaration.
-					var mass_each := def.mpm_density * p_vol * st_vol / sub_vol
+					# p_vol already carries the stride^3 / subdiv^3 factors (see _refresh_scales),
+					# so this is the particle's own mass with no extra scaling.
+					var mass_each := def.mpm_density * p_vol
 					for sz in sub:
 						for sy in sub:
 							for sx in sub:
@@ -965,7 +983,6 @@ func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> 
 	var add_mat: Array[int] = []
 	var add_mass: Array[float] = []
 	var sub := maxi(particle_subdiv, 1)
-	var sub_vol := float(sub * sub * sub)
 	for idx in positions.size():
 		var mat_id: int = material_ids[idx]
 		if not _is_mpm_material(mat_id):
@@ -979,7 +996,7 @@ func _on_voxels_placed(positions: Array[Vector3i], material_ids: Array[int]) -> 
 			continue
 		var def := _material_db.get_def(mat_id)
 		var local := _region_local(wp) - Vector3(0.5, 0.5, 0.5)  # voxel corner, for subdivision
-		var mass_each := def.mpm_density * p_vol / sub_vol
+		var mass_each := def.mpm_density * p_vol  # p_vol already divided by subdiv^3
 		for sz in sub:
 			for sy in sub:
 				for sx in sub:
